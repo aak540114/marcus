@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "marcus-ai"
-version = "0.3.7"
+version = "0.3.8"
 description = "Multi-Agent Resource Coordination and Understanding System"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,11 +34,18 @@ classifiers = [
 
 dependencies = [
     "mcp>=1.10.0",
+    # Transitive pins forced by mcp 1.10's streamable_http transport.
+    # Without anyio>=4.5 the server raises TypeError on every HTTP MCP
+    # request (PEP 585 subscript on a non-generic function in anyio 3.x)
+    # and clients see 500 responses. pydantic-settings and python-multipart
+    # are mcp 1.10's own minimums.
+    "anyio>=4.5",
+    "pydantic-settings>=2.5.2",
+    "python-multipart>=0.0.9",
     "anthropic>=0.18.0,<1.0.0",
     "httpx>=0.25.0",
     "aiohttp>=3.9.0",
     "aiofiles>=0.8.0",
-    "asyncio>=3.4.3",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
@@ -52,10 +59,15 @@ dependencies = [
     "pyyaml>=6.0.0",
     "uvicorn>=0.25.0",
     "python-dateutil>=2.8.0",
-    "sentence-transformers>=2.2.0",
 ]
 
 [project.optional-dependencies]
+# Embedding-based cross-parent dependency matching.
+# Pulls torch (+ CUDA wheels on Linux). Without this extra, Marcus falls back
+# to LLM-only matching.
+embeddings = [
+    "sentence-transformers>=2.2.0",
+]
 test = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",

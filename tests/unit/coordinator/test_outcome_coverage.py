@@ -28,7 +28,6 @@ from src.marcus_mcp.coordinator.outcome_coverage import (
     _build_recoverage_description,
     _enrich_acceptance_criteria_with_signals,
     _normalize_gap_task_name,
-    _translate_stub_ids_to_real_ids,
     apply_outcome_coverage,
     compute_coverage,
     compute_coverage_with_llm,
@@ -484,14 +483,30 @@ class TestFillGaps:
         assert new_tasks[0]["requires"] is None
 
     @pytest.mark.asyncio
-    async def test_non_string_provides_is_rejected(self, llm_returning: Any) -> None:
-        """A list or int for provides is malformed — must be string or null."""
+    async def test_non_string_optional_field_coerced_not_rejected(
+        self, llm_returning: Any
+    ) -> None:
+        """A list/int for an optional contract field coerces to None, not a raise.
+
+        The LLM commonly returns ``requires`` as a LIST of upstream task
+        ids. A hard raise here was stricter than the downstream handling
+        (which coerces non-strings to None anyway) and silently no-opped
+        the ENTIRE outcome-coverage pass — gap-fill, signal enrichment,
+        and #680 gotcha enumeration — for the whole project. So a
+        malformed optional field must degrade gracefully, not abort.
+        """
         gaps = [_outcome("o1", "user can do X", "X observable")]
         llm = llm_returning(
-            '{"tasks": [{' '"name": "X", "description": "Y", "provides": ["bad"]' "}]}"
+            '{"tasks": [{'
+            '"name": "X", "description": "Y", '
+            '"provides": ["bad"], "requires": ["a", "b"]'
+            "}]}"
         )
-        with pytest.raises(ValueError, match=r"'provides'.*string"):
-            await fill_gaps(spec="x", gaps=gaps, existing_tasks=[], llm_client=llm)
+        new_tasks = await fill_gaps(
+            spec="x", gaps=gaps, existing_tasks=[], llm_client=llm
+        )
+        assert new_tasks[0]["provides"] is None
+        assert new_tasks[0]["requires"] is None
 
     # ----- Existing task graph as prompt context -----
 
@@ -639,24 +654,29 @@ class TestFillGaps:
         assert "responsibility" not in new_tasks[0]
 
     @pytest.mark.asyncio
-    async def test_responsibility_validated_as_string_or_null(
+    async def test_non_string_responsibility_coerced_not_rejected(
         self, llm_returning: Any
     ) -> None:
-        """Non-string responsibility raises (same shape check as provides)."""
+        """Non-string responsibility coerces to None (same as provides/requires).
+
+        Tolerant degradation, not a hard raise — a malformed optional
+        field must not abort the whole coverage pass (see
+        ``test_non_string_optional_field_coerced_not_rejected``).
+        """
         llm = llm_returning(
             '{"tasks": [{'
             '"name": "X", "description": "Y",'
             '"responsibility": 42'
             "}]}"
         )
-        with pytest.raises(ValueError, match=r"'responsibility'.*string"):
-            await fill_gaps(
-                spec="x",
-                gaps=[_outcome("o1", "user can do X", "X observable")],
-                existing_tasks=[],
-                llm_client=llm,
-                contract_artifacts={"d": {"artifacts": []}},
-            )
+        new_tasks = await fill_gaps(
+            spec="x",
+            gaps=[_outcome("o1", "user can do X", "X observable")],
+            existing_tasks=[],
+            llm_client=llm,
+            contract_artifacts={"d": {"artifacts": []}},
+        )
+        assert new_tasks[0]["responsibility"] is None
 
     @pytest.mark.asyncio
     async def test_existing_tasks_is_required_kwarg(self, llm_returning: Any) -> None:
@@ -1684,58 +1704,8 @@ class TestEnrichAcceptanceCriteriaWithSignals:
         ), f"No-op re-runs must not emit the enrichment log line — got: {msgs}"
 
 
-class TestTranslateStubIdsToRealIds:
-    """``_translate_stub_ids_to_real_ids`` rewrites recoverage stub ids
-    (``_synth_for_coverage_<idx>``) to the real ``gap_fill_<uuid>`` ids
-    produced by the caller's task factory.  Without this rewrite, the
-    enrichment pass cannot match the recoverage mapping against the
-    real task list and gap-fill tasks silently miss the success_signal.
-    """
-
-    def test_none_mapping_returns_none(self) -> None:
-        assert _translate_stub_ids_to_real_ids(None, []) is None
-
-    def test_empty_mapping_returns_empty(self) -> None:
-        assert _translate_stub_ids_to_real_ids({}, []) == {}
-
-    def test_stub_ids_get_translated_to_real(self) -> None:
-        synthesized = [
-            _task("gap_fill_abc123", "Render"),
-            _task("gap_fill_def456", "Score"),
-        ]
-        mapping = {
-            "o_render": [f"{STUB_TASK_ID_PREFIX}0"],
-            "o_score": [f"{STUB_TASK_ID_PREFIX}1"],
-        }
-        translated = _translate_stub_ids_to_real_ids(mapping, synthesized)
-        assert translated == {
-            "o_render": ["gap_fill_abc123"],
-            "o_score": ["gap_fill_def456"],
-        }
-
-    def test_real_ids_pass_through_unchanged(self) -> None:
-        """Mapping entries that already reference real (non-stub) task
-        ids are left alone — those are organically-decomposed covering
-        tasks, not gap-fill synthesis."""
-        synthesized = [_task("gap_fill_abc123", "Render")]
-        mapping = {"o1": ["t_existing_real"]}
-        translated = _translate_stub_ids_to_real_ids(mapping, synthesized)
-        assert translated == {"o1": ["t_existing_real"]}
-
-    def test_mixed_stub_and_real_ids_in_one_list(self) -> None:
-        synthesized = [_task("gap_fill_abc123", "Render")]
-        mapping = {
-            "o1": ["t_existing_real", f"{STUB_TASK_ID_PREFIX}0"],
-        }
-        translated = _translate_stub_ids_to_real_ids(mapping, synthesized)
-        assert translated == {"o1": ["t_existing_real", "gap_fill_abc123"]}
-
-    def test_stub_id_for_nonexistent_index_passes_through(self) -> None:
-        """If the recoverage LLM hallucinates a stub id beyond the
-        synthesized list, the translator passes the unmatched stub id
-        through unchanged.  The enrichment pass will then skip it
-        because no task has that id."""
-        synthesized = [_task("gap_fill_abc123", "Render")]
-        mapping = {"o1": [f"{STUB_TASK_ID_PREFIX}99"]}
-        translated = _translate_stub_ids_to_real_ids(mapping, synthesized)
-        assert translated == {"o1": [f"{STUB_TASK_ID_PREFIX}99"]}
+# ``TestTranslateStubIdsToRealIds`` removed in #607 step 4: the
+# rewrite-stub-to-real path no longer exists because gap-fill no
+# longer materializes real ``gap_fill_<uuid>`` tasks. Stub→anchor
+# routing for criterion + signal placement is tested directly in
+# ``tests/unit/coordinator/test_gap_fill_criteria_rollup.py``.

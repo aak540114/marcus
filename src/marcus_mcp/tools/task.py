@@ -11,6 +11,7 @@ This module contains tools for task operations in the Marcus system:
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,6 +19,12 @@ from typing import Any, Dict, List, Optional
 
 from src.core.ai_powered_task_assignment import find_optimal_task_for_agent_ai_powered
 from src.core.models import Priority, Task, TaskAssignment, TaskStatus
+from src.core.task_classification import get_task_type
+from src.integrations.behavior_evidence import (
+    behavior_evidence_contract,
+    has_behavior_contract,
+    judge_behavior_evidence,
+)
 from src.logging.agent_events import log_agent_event
 from src.logging.conversation_logger import conversation_logger, log_thinking
 from src.marcus_mcp.utils import serialize_for_mcp
@@ -43,6 +50,265 @@ MAX_VALIDATION_RETRIES = 3
 _singleton_lock = threading.Lock()  # Thread-safe initialization
 
 
+# Smoke-gate missing-verifications retry ceiling (issue #676). The product
+# smoke gate rejects an integration completion that declares no
+# ``verifications`` for its in-scope outcomes. That rejection is retryable
+# (the agent can add verifications and re-report), but with NO ceiling an
+# agent that keeps re-sending the same incomplete report loops forever ->
+# lease expiry -> BLOCKED -> project gridlock (snake-pr667-5 hit 6 identical
+# rejections). After this many identical rejections the rejection is
+# converted to a TERMINAL escalation so the agent stops retrying and the
+# failure is surfaced with its remediation payload instead of looping.
+MAX_SMOKE_MISSING_VERIFICATION_ATTEMPTS = 2
+_smoke_missing_verification_attempts: Dict[str, int] = {}
+
+
+# Smoke-gate behavior-evidence retry ceiling (issue #677). The product smoke
+# gate rejects an integration completion whose project has a behavior-evidence
+# contract (web/pipeline/cli/…) when the agent submits no ``evidence`` or
+# evidence that fails the per-type bar. Like the missing-verifications
+# rejection above, this is retryable but loops forever without a ceiling.
+# Observed failure (snake-composition-verification-loop, 2026-05-30): the agent
+# CAPTURED real rendered HTML but wrote it into the free-text ``message`` field
+# instead of ``evidence``, so the gate saw nothing and rejected 10 times ->
+# gridlock at 81.8%. After this many identical rejections the rejection becomes
+# a TERMINAL escalation so the agent stops and the failure surfaces with its
+# remediation payload.
+MAX_SMOKE_BEHAVIOR_EVIDENCE_ATTEMPTS = 2
+_smoke_behavior_evidence_attempts: Dict[str, int] = {}
+
+
+def _capture_baseline_commit(assignment: "TaskAssignment", project_root: str) -> None:
+    """Snapshot the current git HEAD into the assignment for validation scoping.
+
+    Stored on TaskAssignment.baseline_commit so that WorkAnalyzer can later
+    run ``git diff <baseline>..HEAD --name-only`` to collect only the files
+    this agent changed, rather than the entire merged worktree (issue #696).
+
+    Parameters
+    ----------
+    assignment : TaskAssignment
+        The assignment object to update in-place
+    project_root : str
+        Any directory inside the git repo to run git commands from
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            assignment.baseline_commit = result.stdout.strip()
+            logger.debug(
+                f"Captured baseline commit {assignment.baseline_commit[:8]} "
+                f"for task {assignment.task_id}"
+            )
+        else:
+            logger.warning(
+                f"git rev-parse HEAD failed for task {assignment.task_id}: "
+                f"{result.stderr.strip()}"
+            )
+    except Exception as exc:
+        logger.warning(
+            f"Could not capture baseline commit for task {assignment.task_id}: {exc}"
+        )
+
+
+def _record_missing_verification_attempt(task_id: str) -> int:
+    """Increment and return the missing-verifications rejection count.
+
+    Parameters
+    ----------
+    task_id : str
+        The integration task being rejected for missing verifications.
+
+    Returns
+    -------
+    int
+        The cumulative number of missing-verifications rejections seen for
+        this task (1 on the first call).
+    """
+    count = _smoke_missing_verification_attempts.get(task_id, 0) + 1
+    _smoke_missing_verification_attempts[task_id] = count
+    return count
+
+
+def _record_behavior_evidence_attempt(task_id: str) -> int:
+    """Increment and return the behavior-evidence rejection count.
+
+    Parameters
+    ----------
+    task_id : str
+        The integration/composition task being rejected for missing or
+        failing behavior evidence (issue #677).
+
+    Returns
+    -------
+    int
+        The cumulative number of behavior-evidence rejections seen for
+        this task (1 on the first call).
+    """
+    count = _smoke_behavior_evidence_attempts.get(task_id, 0) + 1
+    _smoke_behavior_evidence_attempts[task_id] = count
+    return count
+
+
+def _clear_smoke_attempts(task_id: str) -> None:
+    """Reset the missing-verifications and behavior-evidence counts for a task."""
+    _smoke_missing_verification_attempts.pop(task_id, None)
+    _smoke_behavior_evidence_attempts.pop(task_id, None)
+
+
+def _escalate_missing_verifications_response(
+    smoke_response: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert a repeatable missing-verifications rejection into a terminal one.
+
+    After ``MAX_SMOKE_MISSING_VERIFICATION_ATTEMPTS`` identical rejections the
+    agent is plainly not going to add verifications by re-sending the same
+    call, so we stop the loop (issue #676): re-tag the rejection with a
+    distinct, non-retryable ``error`` plus ``terminal``/``escalated`` flags
+    while preserving the remediation payload (``blocker``,
+    ``missing_outcome_ids``) so the failure is actionable rather than a silent
+    gridlock. The input dict is not mutated.
+
+    Parameters
+    ----------
+    smoke_response : Dict[str, Any]
+        The ``verifications_required_but_missing`` rejection to escalate.
+
+    Returns
+    -------
+    Dict[str, Any]
+        A new dict tagged terminal/escalated, remediation fields intact.
+    """
+    escalated = dict(smoke_response)
+    escalated["status"] = "smoke_verification_escalated"
+    escalated["error"] = "verifications_required_escalated"
+    escalated["terminal"] = True
+    escalated["escalated"] = True
+    escalated["message"] = (
+        "Marcus has rejected this completion "
+        f"{MAX_SMOKE_MISSING_VERIFICATION_ATTEMPTS} times for the same "
+        "reason: no ``verifications`` for the task's required in-scope "
+        "outcomes. Do NOT retry the same call. This integration task is "
+        "escalated for remediation -- the outcome IDs that need coverage are "
+        "in ``missing_outcome_ids`` and the fix is in ``blocker``."
+    )
+    return escalated
+
+
+def _escalate_behavior_evidence_response(
+    smoke_response: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert a repeatable behavior-evidence rejection into a terminal one.
+
+    After ``MAX_SMOKE_BEHAVIOR_EVIDENCE_ATTEMPTS`` identical rejections the
+    agent is plainly not going to satisfy the behavior-evidence bar by
+    re-sending the same call (issue #677), so we stop the loop: re-tag the
+    rejection with a distinct, non-retryable ``error`` plus
+    ``terminal``/``escalated`` flags while preserving the remediation payload
+    (``blocker``, ``structural_category``) so the failure surfaces with its
+    fix instead of gridlocking the project. The input dict is not mutated.
+
+    Parameters
+    ----------
+    smoke_response : Dict[str, Any]
+        The ``behavior_evidence_missing`` / ``behavior_evidence_failed``
+        rejection to escalate.
+
+    Returns
+    -------
+    Dict[str, Any]
+        A new dict tagged terminal/escalated, remediation fields intact.
+    """
+    escalated = dict(smoke_response)
+    escalated["status"] = "smoke_verification_escalated"
+    escalated["error"] = "behavior_evidence_escalated"
+    escalated["terminal"] = True
+    escalated["escalated"] = True
+    escalated["message"] = (
+        "Marcus has rejected this completion "
+        f"{MAX_SMOKE_BEHAVIOR_EVIDENCE_ATTEMPTS} times for the same reason: "
+        "the submitted behavior evidence is missing or does not meet the bar. "
+        "Do NOT retry the same call. This task is escalated for remediation -- "
+        "the fix (and the exact ``evidence`` payload to submit) is in "
+        "``blocker``."
+    )
+    return escalated
+
+
+async def _terminalize_escalated_smoke_task(
+    state: Any, task_id: str, agent_id: str, blocker: str
+) -> None:
+    """Move an escalated smoke-gate task to a terminal BOARD state.
+
+    Issue #676 (Codex P1 on PR #678): the escalation helpers above only re-tag
+    the MCP *response* — no code in the repo consumes the ``*_escalated`` error
+    to change kanban state.  So after the ceiling fires, an agent that obeys
+    "do NOT retry" simply stops calling back and the task stays IN_PROGRESS
+    with its lease held until timeout — the project idles on the active task
+    instead of surfacing a terminal board state immediately, the exact gridlock
+    these ceilings set out to end.
+
+    This mirrors ``report_blocker``: mark the kanban task BLOCKED and release
+    all coordination state (agent assignment + lease) so the board reflects the
+    terminal state at once and the agent's slot is freed.  Best-effort — any
+    failure is logged, never raised, so escalation reporting is never lost.
+
+    Parameters
+    ----------
+    state : Any
+        Marcus server state (``kanban_client``, ``lease_manager``, …).
+    task_id : str
+        The escalated task.
+    agent_id : str
+        Agent that held the task.
+    blocker : str
+        Blocker text recorded on the board.
+    """
+    try:
+        if getattr(state, "kanban_client", None):
+            await state.kanban_client.update_task(
+                task_id, {"status": TaskStatus.BLOCKED, "blocker": blocker}
+            )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "Smoke-gate escalation: failed to mark task %s BLOCKED: %s",
+            task_id,
+            e,
+        )
+
+    # Release coordination state — same decoupling as report_blocker (a
+    # terminal status must free the agent's slot independently of any
+    # correctness check, Simon decision 011b3fad).
+    try:
+        if getattr(state, "agent_status", None) and agent_id in state.agent_status:
+            state.agent_status[agent_id].current_tasks = []
+        if getattr(state, "agent_tasks", None) and agent_id in state.agent_tasks:
+            del state.agent_tasks[agent_id]
+        if getattr(state, "assignment_persistence", None):
+            await state.assignment_persistence.remove_assignment(agent_id)
+        if getattr(state, "lease_manager", None):
+            if task_id in state.lease_manager.active_leases:
+                del state.lease_manager.active_leases[task_id]
+                logger.info(
+                    "Released lease for escalated (terminal) task %s (agent %s)",
+                    task_id,
+                    agent_id,
+                )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "Smoke-gate escalation: failed to release coordination state "
+            "for task %s: %s",
+            task_id,
+            e,
+        )
+
+
 def clear_validation_retry(task_id: str) -> None:
     """Clear the validation retry history for a task.
 
@@ -61,6 +327,9 @@ def clear_validation_retry(task_id: str) -> None:
     if _retry_tracker is not None:
         _retry_tracker.clear_task(task_id)
         logger.debug("Cleared validation retry history for recovered task %s", task_id)
+    # Issue #676: also reset the smoke-gate missing-verifications counter so a
+    # recovered/reassigned task gets a fresh set of attempts.
+    _clear_smoke_attempts(task_id)
 
 
 async def get_project_board_context(state: Any) -> Dict[str, Optional[str]]:
@@ -116,47 +385,25 @@ async def get_project_board_context(state: Any) -> Dict[str, Optional[str]]:
 
 
 def _get_task_type(task: Task) -> str:
-    """
-    Determine task type using the same logic as AI instruction generation.
+    """Determine task type ("implementation" / "design" / "testing").
 
-    This function mirrors the task type determination logic from
-    ai_analysis_engine.generate_task_instructions() to ensure consistency
-    between instruction generation and workflow enforcement.
+    Thin wrapper over the shared :func:`src.core.task_classification.
+    get_task_type` so instruction layering here and #680 gotcha
+    placement in the coordinator read from one source of truth. Kept as
+    a module-level name because existing callers and tests import
+    ``_get_task_type`` from this module.
 
     Parameters
     ----------
     task : Task
-        Task to check
+        Task to classify.
 
     Returns
     -------
     str
-        Task type: "implementation", "design", or "testing"
-
-    Notes
-    -----
-    Task type priority:
-    1. _parent_task_type attribute (for subtasks)
-    2. Inference from name/labels
-    3. Defaults to "implementation"
-
-    This matches the logic in src/integrations/ai_analysis_engine.py:460-473
+        ``"implementation"``, ``"design"``, or ``"testing"``.
     """
-    # CRITICAL: Check parent task type first for subtasks (same as ai_analysis_engine)
-    if hasattr(task, "_parent_task_type"):
-        parent_type = getattr(task, "_parent_task_type")
-        return str(parent_type)
-
-    # Fall back to inferring from name or labels (same logic as ai_analysis_engine)
-    task_type = "implementation"  # default
-    task_labels = getattr(task, "labels", []) or []
-
-    if "design" in task.name.lower() or "type:design" in task_labels:
-        task_type = "design"
-    elif "test" in task.name.lower() or "type:testing" in task_labels:
-        task_type = "testing"
-
-    return task_type
+    return get_task_type(task)
 
 
 def _build_mandatory_workflow_prompt(task: Task) -> str:
@@ -241,6 +488,48 @@ def _is_integration_task(task: Task) -> bool:
         return "type:integration" in labels
     except TypeError:
         return False
+
+
+def _is_composition_task(task: Task) -> bool:
+    """Detect whether a task is a Marcus-synthesized composition task.
+
+    Composition tasks are produced by
+    :func:`src.integrations.composition_synthesis.build_composition_task`
+    when a multi-domain contract-first project needs an explicit
+    entry-point wiring step.  They carry the ``"composition"`` label
+    and ``source_type == "composition_synthesis"``.
+
+    Detection accepts either signal so kanban round-trips that strip
+    labels (preserving ``source_type`` in ``source_context``) still
+    surface as composition tasks.  Mirror of the existing
+    ``_has_existing_composition_task`` detection in
+    ``src/integrations/composition_synthesis.py``.
+
+    Parameters
+    ----------
+    task : Task
+        Task to inspect.
+
+    Returns
+    -------
+    bool
+        True if the task is a composition task.
+
+    Notes
+    -----
+    Used by ``report_task_progress`` to stamp composition-task
+    completions as self-reported (issue #677 self-verify mode: Marcus
+    no longer runs an independent build check on these — verification
+    lives with the agent; see the honesty stamp at the completion
+    site).
+    """
+    labels = getattr(task, "labels", None) or []
+    try:
+        if "composition" in labels:
+            return True
+    except TypeError:
+        pass
+    return getattr(task, "source_type", None) == "composition_synthesis"
 
 
 def _missing_verifications_for_required_outcomes_response(
@@ -430,6 +719,145 @@ def _missing_coverage_response(
     }
 
 
+# Markers that strongly indicate rendered HTML / a captured DOM is present in
+# a free-text string (used to detect the "agent narrated the proof into
+# ``message`` instead of submitting ``evidence``" misfiling, issue #677).
+_RENDER_MARKUP_MARKERS = (
+    "<!doctype",
+    "<html",
+    "<body",
+    "<div",
+    "<canvas",
+    "<span",
+    "<svg",
+    "<main",
+    "<section",
+)
+
+
+def _text_contains_render_markup(text: Optional[str]) -> bool:
+    """Return True if free text appears to embed rendered HTML / a DOM.
+
+    Heuristic used only to make the behavior-evidence rejection *diagnostic*
+    (issue #677): when the agent captured render proof but put it in the
+    free-text ``message`` field instead of the structured ``evidence`` field
+    the gate reads, the rejection can tell it precisely what went wrong
+    instead of repeating a generic "submit evidence" that it has already
+    ignored.  This does NOT accept the markup as evidence — it only steers
+    the correction (the structured ``evidence`` field stays the only judged
+    channel, keeping the gate ungameable).
+
+    Parameters
+    ----------
+    text : Optional[str]
+        The agent-supplied free text (typically ``message``).
+
+    Returns
+    -------
+    bool
+        ``True`` if at least one HTML element marker is present.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _RENDER_MARKUP_MARKERS)
+
+
+def _behavior_evidence_rejection(
+    *,
+    task: Task,
+    agent_id: str,
+    structural_category: str,
+    reason: str,
+    evidence_missing: bool,
+    misfiled_in_message: bool = False,
+) -> Dict[str, Any]:
+    """Build a smoke-gate rejection for failing/absent behavior evidence.
+
+    Issue #677: for app types with a behavior-evidence contract, Marcus
+    judges the *evidence the agent captured by running the assembled
+    product* — not a build exit code or an HTTP 200.  This helper renders
+    the rejection the agent receives when the evidence is missing or does
+    not meet the per-type bar, telling it exactly what evidence to capture
+    and resubmit in the ``evidence`` field of ``report_task_progress``.
+
+    Parameters
+    ----------
+    task : Task
+        The integration/composition task being completed.
+    agent_id : str
+        Agent reporting completion.
+    structural_category : str
+        Marcus's setup-time classification, used to surface the
+        per-type contract text in the blocker message.
+    reason : str
+        Human-readable reason the evidence failed (from the judge) or a
+        "no evidence submitted" message.
+    evidence_missing : bool
+        ``True`` when no ``evidence`` payload was submitted at all (vs.
+        submitted-but-failed-the-bar).  Distinguishes the two error
+        strings so the agent knows whether to start capturing evidence
+        or to fix the product.
+    misfiled_in_message : bool
+        ``True`` when no ``evidence`` was submitted but the agent's
+        free-text ``message`` appears to contain the render proof
+        (issue #677 forcing function).  When set, the blocker LEADS with a
+        targeted correction — "you put your proof in ``message``; I only
+        read ``evidence``; re-send it as ``evidence={...}``" — because a
+        generic "submit evidence" has demonstrably been ignored (the agent
+        narrated real HTML into ``message`` 10× in one run).
+
+    Returns
+    -------
+    Dict[str, Any]
+        A rejection dict the caller returns directly to the agent.
+    """
+    contract = behavior_evidence_contract(structural_category)
+    error = (
+        "behavior_evidence_missing" if evidence_missing else "behavior_evidence_failed"
+    )
+    # Forcing function (issue #677): when the proof is sitting in ``message``,
+    # lead the blocker with the exact correction so the captured HTML lands in
+    # the field the gate actually judges.  A worked instruction ("move it to
+    # evidence={...}") beats repeating the generic ask that was ignored.
+    misfile_prefix = ""
+    if misfiled_in_message:
+        misfile_prefix = (
+            "STOP — you put your render proof (HTML/output) in the ``message`` "
+            "field. Marcus does NOT read ``message`` for verification; it only "
+            "judges the structured ``evidence`` field, which you left empty. "
+            "Do not re-describe the proof in prose. Re-call report_task_progress "
+            "with the SAME proof in ``evidence`` instead, e.g. "
+            '``evidence={"dom": "<paste the rendered HTML you captured>", '
+            '"console_errors": []}``. '
+        )
+    return {
+        "success": False,
+        "status": "smoke_verification_failed",
+        "error": error,
+        "agent_id": agent_id,
+        "task_id": task.id,
+        "structural_category": structural_category,
+        "failure_summary": reason,
+        "evidence_misfiled_in_message": misfiled_in_message,
+        "blocker": (
+            f"{misfile_prefix}"
+            f"Marcus rejected this completion: the product did not pass the "
+            f"behavior-evidence bar for a {structural_category!r} project. "
+            f"{reason}. A build that exits 0 and a server that returns 200 "
+            f"do NOT prove the product behaves. {contract} Capture this "
+            f"evidence by actually running the assembled product and submit "
+            f"it in the ``evidence`` field of report_task_progress."
+        ),
+        "message": (
+            f"Marcus rejected this integration-task completion: behavior "
+            f"evidence "
+            f"{'was not submitted' if evidence_missing else 'did not meet the bar'}"
+            f". {reason}. See the ``blocker`` field for what to capture."
+        ),
+    }
+
+
 async def _run_product_smoke_gate(
     task: Task,
     agent_id: str,
@@ -437,6 +865,8 @@ async def _run_product_smoke_gate(
     start_command: Optional[str],
     readiness_probe: Optional[str],
     verifications: Optional[List[Dict[str, Any]]] = None,
+    evidence: Optional[Dict[str, Any]] = None,
+    message: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Run deliverable verification for a completing integration task.
 
@@ -481,6 +911,17 @@ async def _run_product_smoke_gate(
         means the outcome's success_signal was observed.  Empty list
         is rejected upstream (caller should pass ``None`` for legacy
         mode); non-empty list takes precedence over ``start_command``.
+    evidence : Optional[Dict[str, Any]]
+        Issue #677: behavior evidence the agent captured by running the
+        assembled product.  When ``task.source_context`` carries a
+        ``structural_category`` with a behavior contract
+        (:func:`has_behavior_contract`), this payload is judged against
+        the per-type bar via :func:`judge_behavior_evidence` before any
+        subprocess runs.  Missing or failing evidence rejects the
+        completion.  A passing behavior judgment satisfies the gate on
+        its own (no legacy ``start_command`` additionally required),
+        while outcome-bearing tasks still run their ``verifications``
+        coverage path.  Ignored for app types with no behavior contract.
 
     Returns
     -------
@@ -501,7 +942,6 @@ async def _run_product_smoke_gate(
 
     from src.integrations.product_smoke import (
         VerificationSpec,
-        verify_deliverable,
         verify_verification_specs,
     )
 
@@ -563,47 +1003,58 @@ async def _run_product_smoke_gate(
         )
         return _gate_unavailable(f"project_root {project_root!r} is not a directory")
 
-    # Slice B (#523) escape-hatch closure (Kaia review on PR #525):
-    # when the integration task was created with in-scope outcomes,
-    # the agent MUST use the ``verifications`` path — the legacy
-    # ``start_command`` alone cannot prove signal coverage.  Without
-    # this check an agent could send ``verifications=None`` plus a
-    # working ``start_command``, fall through to the legacy path
-    # below, and ship the snake-game class of failure that Slice B
-    # was designed to prevent.
-    #
-    # Defensive ``isinstance``: when a kanban provider rehydrates
-    # ``source_context`` from JSON, malformed values could in theory
-    # come back as a non-list (e.g. a string).  ``list("o_play")``
-    # would silently become ``['o', '_', ...]`` and corrupt the
-    # required-outcome set.  Treat non-list values as "wiring absent"
-    # rather than raising.
-    raw_required = (task.source_context or {}).get("in_scope_outcome_ids")
-    required_outcome_ids_for_task: List[str] = (
-        list(raw_required) if isinstance(raw_required, list) else []
+    # ---- Self-verify-mode gate (issue #677 rework) ----
+    # Marcus is NOT a tool-using agent harness — its only executor is this
+    # Python process (subprocess), and it has no browser.  We deliberately do
+    # NOT run our own build here: a Marcus-authored build command is BOTH
+    # tech-specific (``npm run build`` etc. — Marcus owning a language ontology
+    # it should not) AND less capable than the agent (the snake-skeptic-1 run
+    # gridlocked because Marcus's fixed ``npm install`` failed on a peer-dep
+    # conflict the agent had already worked around with ``--legacy-peer-deps``).
+    # A floor that is tech-specific, weaker than the agent, and uncorrelated
+    # with "the product works" (every shipped-broken run still *built*) is a
+    # net-negative tripwire.  So verification lives with the agent: it runs the
+    # assembled product with whatever tools it needs and fixes until the
+    # outcomes work (see ``_generate_integration_description``).  Marcus only
+    # checks the agent-VOLUNTEERED proof if any is submitted, and stamps the
+    # completion as self-reported (caller surfaces ``independently_verified``).
+    # The eventual objective check is a separate, stack-discovering "borrow
+    # hands" verifier agent — not a hardcoded build command bolted on here.
+    structural_category_raw = (task.source_context or {}).get("structural_category")
+    structural_category = (
+        structural_category_raw
+        if isinstance(structural_category_raw, str)
+        else "unknown"
     )
-    if required_outcome_ids_for_task and not verifications:
-        logger.warning(
-            "PRODUCT SMOKE GATE: Integration task %s has %d in-scope "
-            "outcome(s) but the agent did not declare ``verifications``. "
-            "Rejecting completion — legacy ``start_command`` alone "
-            "cannot prove signal coverage.",
+
+    # Optional agent-volunteered checks (NOT required in self-verify mode).
+    # If the agent chose to declare verification commands or capture behavior
+    # evidence, Marcus still runs/judges them as a bonus catch — but their
+    # ABSENCE never blocks completion, because the agent's own run is the
+    # outcome verification for now.
+    if evidence and has_behavior_contract(structural_category):
+        passed, judge_reason = judge_behavior_evidence(structural_category, evidence)
+        if not passed:
+            logger.warning(
+                "PRODUCT SMOKE GATE: volunteered behavior evidence FAILED for "
+                "%s (%s): %s. Rejecting.",
+                task.id,
+                structural_category,
+                judge_reason,
+            )
+            return _behavior_evidence_rejection(
+                task=task,
+                agent_id=agent_id,
+                structural_category=structural_category,
+                reason=judge_reason,
+                evidence_missing=False,
+            )
+        logger.info(
+            "PRODUCT SMOKE GATE: volunteered behavior evidence PASSED for " "%s (%s).",
             task.id,
-            len(required_outcome_ids_for_task),
-        )
-        return _missing_verifications_for_required_outcomes_response(
-            task=task,
-            agent_id=agent_id,
-            required_outcome_ids=required_outcome_ids_for_task,
+            structural_category,
         )
 
-    # Slice B (#523): if the agent declared a non-empty ``verifications``
-    # list, that is the canonical path — run each spec via the
-    # multi-spec runner.  ``start_command`` is ignored when
-    # ``verifications`` is provided; the legacy single-command path
-    # is preserved only as a backward-compat fallback for completions
-    # that omit ``verifications`` entirely AND the task carries no
-    # declared outcomes (escape-hatch closure above).
     if verifications:
         specs = [
             VerificationSpec(
@@ -616,148 +1067,43 @@ async def _run_product_smoke_gate(
             )
             for v in verifications
         ]
-
-        # Slice B (#523) coverage check: when the integration task
-        # was created with ``outcomes`` (commit 228ca479 stores
-        # ``in_scope_outcome_ids`` on ``source_context``), every
-        # declared in-scope outcome must have at least one
-        # ``VerificationSpec`` with a matching ``signal_id``.
-        #
-        # We apply the check ONLY when the source_context carries
-        # the field — legacy integration tasks created without
-        # outcomes have ``source_context is None`` and bypass the
-        # rule.  An empty list means "outcomes were wired but none
-        # were in scope" → coverage trivially satisfied, no check
-        # needed.  The missing-outcome rejection fires BEFORE any
-        # subprocess runs so an agent that forgot a signal_id gets
-        # immediate feedback without paying the verify-deliverable
-        # latency cost.
-        # Same defensive ``isinstance`` as the escape-hatch check
-        # above — kanban providers that round-trip ``source_context``
-        # through JSON could in theory rehydrate this field as a
-        # non-list; treat malformed values as absent rather than
-        # silently iterating characters of a string.
-        raw_required_inner = (task.source_context or {}).get("in_scope_outcome_ids")
-        required_outcome_ids: List[str] = (
-            list(raw_required_inner) if isinstance(raw_required_inner, list) else []
-        )
-        if required_outcome_ids:
-            declared_signal_ids: set[str] = {
-                spec.signal_id for spec in specs if spec.signal_id
-            }
-            missing_outcome_ids = [
-                oid for oid in required_outcome_ids if oid not in declared_signal_ids
-            ]
-            if missing_outcome_ids:
-                logger.warning(
-                    "PRODUCT SMOKE GATE: Coverage check FAILED for %s. "
-                    "Missing verifications for outcomes: %s. "
-                    "Rejecting completion.",
-                    task.id,
-                    missing_outcome_ids,
-                )
-                return _missing_coverage_response(
-                    task=task,
-                    agent_id=agent_id,
-                    required_outcome_ids=required_outcome_ids,
-                    declared_signal_ids=sorted(declared_signal_ids),
-                    missing_outcome_ids=missing_outcome_ids,
-                )
-
         logger.info(
-            "PRODUCT SMOKE GATE: Running %d declared verification(s) for "
-            "integration task %s at %s",
+            "PRODUCT SMOKE GATE: running %d volunteered verification(s) for %s",
             len(specs),
             task.id,
-            project_root_path,
         )
         specs_result = await verify_verification_specs(
             specs=specs, cwd=project_root_path
         )
-        if specs_result.success:
-            logger.info(
-                "PRODUCT SMOKE GATE: All %d verification(s) passed for %s",
-                len(specs),
+        if not specs_result.success:
+            logger.warning(
+                "PRODUCT SMOKE GATE: volunteered verification FAILED for %s: "
+                "%s. Rejecting.",
                 task.id,
+                specs_result.failure_summary,
             )
-            return None
-        logger.warning(
-            "PRODUCT SMOKE GATE: Verification FAILED for %s. "
-            "Failure: %s. Rejecting completion.",
-            task.id,
-            specs_result.failure_summary,
-        )
-        return {
-            "success": False,
-            "status": "smoke_verification_failed",
-            "error": "verifications_failed",
-            "agent_id": agent_id,
-            "task_id": task.id,
-            "failure_summary": specs_result.failure_summary,
-            "blocker": specs_result.blocker_message,
-            "smoke_result": specs_result.to_dict(),
-            "message": (
-                "Marcus rejected this integration-task completion: one "
-                "or more declared verifications did not observe their "
-                "user-outcome success_signal in the running deliverable. "
-                "See the `blocker` field for the failing spec's "
-                "signal_id, command, exit code, and stderr.  Fix the "
-                "deliverable and re-call report_task_progress with the "
-                "same verifications list.  If the product is genuinely "
-                "broken and cannot be fixed, call report_blocker — "
-                "repeated retries without fixing the root cause will "
-                "exhaust your lease."
-            ),
-        }
+            return {
+                "success": False,
+                "status": "smoke_verification_failed",
+                "error": "verifications_failed",
+                "agent_id": agent_id,
+                "task_id": task.id,
+                "failure_summary": specs_result.failure_summary,
+                "blocker": specs_result.blocker_message,
+                "smoke_result": specs_result.to_dict(),
+                "message": (
+                    "Marcus rejected this integration-task completion: a "
+                    "verification command you declared did not pass. See the "
+                    "``blocker`` field. Fix the deliverable and re-report."
+                ),
+            }
 
-    # Legacy backward-compat path: no ``verifications`` declared, fall
-    # back to the single ``start_command`` contract.  Removed by v0.4.
     logger.info(
-        f"PRODUCT SMOKE GATE: Running deliverable verification for "
-        f"integration task {task.id} at {project_root_path}. "
-        f"start_command={start_command!r} "
-        f"readiness_probe={readiness_probe!r}"
+        "PRODUCT SMOKE GATE: %s passed (build floor + self-verify; "
+        "outcome behavior verified by the agent's own run).",
+        task.id,
     )
-    result = await verify_deliverable(
-        start_command=start_command,
-        readiness_probe=readiness_probe,
-        cwd=project_root_path,
-    )
-
-    if result.success:
-        logger.info(
-            f"PRODUCT SMOKE GATE: Verification passed for {task.id} "
-            f"({len(result.steps)} step(s))"
-        )
-        return None
-
-    # Verification failed — reject the completion and surface the
-    # blocker message.
-    logger.warning(
-        f"PRODUCT SMOKE GATE: Verification FAILED for {task.id}. "
-        f"Failure: {result.failure_summary}. Rejecting completion."
-    )
-    return {
-        "success": False,
-        "status": "smoke_verification_failed",
-        "error": "product_smoke_failed",
-        "agent_id": agent_id,
-        "task_id": task.id,
-        "failure_summary": result.failure_summary,
-        "blocker": result.blocker_message,
-        "smoke_result": result.to_dict(),
-        "message": (
-            "Marcus rejected this integration-task completion. Either "
-            "the declared start_command failed, the readiness_probe "
-            "never passed, or the start_command was not declared at "
-            "all. See the `blocker` field for details. "
-            "Fix the issue and re-call report_task_progress with the "
-            "correct start_command. If the product is genuinely broken "
-            "and cannot be fixed, call report_blocker to surface the "
-            "issue — do NOT keep retrying without fixing the root cause, "
-            "as repeated retries will exhaust your lease."
-        ),
-    }
+    return None
 
 
 def _parse_contract_metadata(task: Task) -> Dict[str, str]:
@@ -866,6 +1212,46 @@ def _parse_contract_metadata(task: Task) -> Dict[str, str]:
     }
 
 
+def _resolve_scaffold_path(task: Task) -> str:
+    """Return the scaffold anchor path for ``task``, or empty string.
+
+    Priority order, mirroring the contract-metadata resolver above so
+    the path survives any kanban provider:
+
+    1. ``task.source_context["scaffold_path"]`` — set by SQLite's
+       ``update_task`` source_context-merge code (#660). The default
+       SQLite provider persists this directly.
+    2. ``MARCUS_SCAFFOLD_PATH`` marker in the task description —
+       fallback for non-SQLite providers (Planka, GitHub, Linear)
+       that round-trip the description verbatim but don't have a
+       native ``source_context`` column. Same approach
+       ``_parse_contract_metadata`` uses for contract data.
+
+    Returns an empty string when neither source carries a path —
+    legacy / pre-#659 tasks render normally without the anchor section.
+    """
+    source_context = getattr(task, "source_context", None) or {}
+    if isinstance(source_context, dict):
+        sc_path = source_context.get("scaffold_path")
+        if sc_path:
+            return str(sc_path).strip()
+
+    description = getattr(task, "description", "") or ""
+    marker_start = description.find("<!-- MARCUS_SCAFFOLD_PATH:")
+    if marker_start == -1:
+        return ""
+    marker_end = description.find("-->", marker_start)
+    if marker_end == -1:
+        return ""
+
+    marker_body = description[marker_start:marker_end]
+    # Marker body shape: ``<!-- MARCUS_SCAFFOLD_PATH: src/foo.js``
+    # Strip the prefix and any whitespace.
+    prefix = "<!-- MARCUS_SCAFFOLD_PATH:"
+    raw = marker_body[len(prefix) :].strip()
+    return raw
+
+
 def build_tiered_instructions(
     base_instructions: str,
     task: Task,
@@ -958,6 +1344,31 @@ def build_tiered_instructions(
     # Layer 1: Base instructions
     instructions_parts.append(base_instructions)
 
+    # Layer 1.2: Acceptance criteria (#664).
+    # Marcus's setup-time pipeline (outcome-coverage enrichment, and
+    # later the #680 gotcha-enumeration step) writes the concrete,
+    # checkable conditions a task must satisfy into
+    # ``Task.acceptance_criteria``. Until this layer existed,
+    # ``request_next_task`` delivered ``completion_criteria`` but
+    # dropped ``acceptance_criteria`` entirely, so every criterion the
+    # pipeline enriched landed in a field no agent ever read. Surface
+    # the criteria explicitly and frame them as the contract the
+    # agent's work will be VERIFIED against — not optional guidance.
+    # These are part of the task contract (authored by Marcus at
+    # setup), distinct from the implementation HOW the agent owns.
+    criteria = getattr(task, "acceptance_criteria", None) or []
+    if criteria:
+        criteria_lines = "\n".join(f"  - {c}" for c in criteria)
+        instructions_parts.append(
+            "\n\n✅ ACCEPTANCE CRITERIA (you will be verified against these):\n"
+            f"{criteria_lines}\n\n"
+            "These are the concrete conditions your work MUST satisfy. "
+            "Marcus's verifier checks them when you report completion — "
+            "treat them as the definition of done, not suggestions. They "
+            "constrain WHAT must be true, not HOW you build it; the "
+            "implementation is still yours to design."
+        )
+
     # Layer 1.1: Recovery Handoff (if task was recovered from another agent)
     recovery = getattr(task, "recovery_info", None)
     if recovery is not None:
@@ -1044,6 +1455,52 @@ def build_tiered_instructions(
                 "writing code. Conform to them at the boundary; design "
                 "everything else yourself."
             )
+
+        # Stay-in-scope boundary instruction. Without it, contract-first
+        # impl agents routinely reach into shared infrastructure files
+        # (entry points, manifests, build configs) to make their module
+        # "callable" or "integrated" — and collide on those files when
+        # another impl agent does the same thing. Observed across
+        # snake-baton-1, snake-scaffold-2, snake-decomposer-1, and
+        # snake-overfrag-1: every run produced BLOCKED tasks from
+        # parallel writes to the project entry-point file.
+        #
+        # Stack-agnostic by design — no file names, no package
+        # manifests, no language assumptions. The contract names the
+        # scope; the agent stays in it. Integration into the broader
+        # system is a separate downstream task (the Compose step on
+        # the contract-first path, or whatever the DAG provides).
+        #
+        # IMPORTANT: skip this layer for composition tasks (Codex P1).
+        # ``build_composition_task()`` in
+        # ``src/integrations/composition_synthesis.py`` sets
+        # ``source_type="composition_synthesis"`` and a non-empty
+        # responsibility ("Wires the application entry point"), so
+        # ``_parse_contract_metadata`` reports it as a
+        # responsibility-bearing task too. The composition agent's
+        # entire JOB is the wiring — telling it "integration is not
+        # yours; stop after logging an artifact" would block the run.
+        if not _is_composition_task(task):
+            contract_notice += (
+                "\n\n🎯 STAY IN YOUR CONTRACT'S SCOPE:\n"
+                "Your contract IS the coordination surface. Implement what "
+                "your contract specifies; do NOT modify code outside your "
+                "contract's scope to make your module 'callable' or "
+                "'integrated' with other parts of the system.\n\n"
+                "Integration is a separate, downstream concern. If your "
+                "work cannot be invoked by other code without modifying "
+                "their files, that is an integration concern handled by a "
+                "later task — not yours. Log a decision or artifact "
+                "describing the integration point you would have wired, "
+                "then stop. The downstream integration agent will pick it "
+                "up from your artifact.\n\n"
+                "Reaching outside your contract's scope to wire your "
+                "module into shared infrastructure is the #1 cause of "
+                "merge conflicts in contract-first runs — the next "
+                "agent's branch touched the same file you did. Stay in "
+                "your lane and let the integration step do its job."
+            )
+
         # GH-356: surface scope_annotation semantics so agents know
         # how to interpret the field on each dependency artifact.
         contract_notice += (
@@ -1070,6 +1527,35 @@ def build_tiered_instructions(
             "other agents might consume"
         )
         instructions_parts.append(contract_notice)
+
+    # Layer 1.35: Scaffold-path anchor (#659). When Marcus's pre-fork
+    # scaffold generated a placeholder file for this task, surface the
+    # exact path so the agent fills the scaffold instead of inventing a
+    # sibling path (the ``src/core/gameEngine.js`` orphan failure
+    # observed in ``snake-baton-1``). This is a STANDALONE layer, NOT
+    # gated on ``responsibility`` — scaffolds are generated for both the
+    # contract-first AND feature-based decomposition paths
+    # (``_run_design_phase`` runs whenever the project has design tasks
+    # and a project_root), but the anchor previously lived inside the
+    # contract-first ``if responsibility:`` block, so feature-based
+    # agents got the path persisted on their task yet never saw it —
+    # exactly the invent-your-own-path failure #659 is about, just on
+    # the other decomposer. ``_resolve_scaffold_path`` checks
+    # ``source_context`` first (SQLite has a native column) then the
+    # ``MARCUS_SCAFFOLD_PATH`` description marker that round-trips
+    # through Planka / GitHub / Linear. Naming the path is coordination
+    # (it is the public import address downstream agents use), not
+    # control — the agent still owns HOW the file is filled.
+    scaffold_path_raw = _resolve_scaffold_path(task)
+    if scaffold_path_raw:
+        instructions_parts.append(
+            f"\n\n📂 IMPLEMENTATION FILE: {scaffold_path_raw}\n"
+            f"Marcus pre-created a placeholder at this path. Fill it with "
+            f"your implementation — do NOT create a sibling file "
+            f"elsewhere. Other agents will import from this exact path. "
+            f"If the file is missing when you start, the scaffold step may "
+            f"have failed; create the file at this path."
+        )
 
     # Layer 1.4: Feature-based design artifact framing
     # Mirrors Layer 1.3 for the opposite decomposer mode.  When a
@@ -1586,6 +2072,30 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
         optimal_task = await find_optimal_task_for_agent(agent_id, state)
         _mark("task_selection")
 
+        # Bug #651 follow-up — before declaring "no task ready" and
+        # letting the runner spawn another ephemeral agent that will
+        # rediscover the same state, sweep any BLOCKED-by-merge-conflict
+        # tasks and try to recover them via rebase.  If recovery
+        # unblocks a downstream task, the CURRENT agent can claim it
+        # instead of forcing a fresh spawn-poll cycle.
+        #
+        # Eliminates verify-snake-8's spawn-thrash failure mode where
+        # 49 ephemeral agents spawned chasing an unrecoverable BLOCKED
+        # task before the 20-min stall watchdog fired (~$25-50 wasted
+        # spawn cost from one recoverable conflict).
+        if not optimal_task:
+            recovered_count = await _sweep_blocked_merge_conflicts(state)
+            if recovered_count > 0:
+                logger.info(
+                    "[recovery] sweep recovered %d task(s); refreshing state "
+                    "and re-selecting for agent %s",
+                    recovered_count,
+                    agent_id,
+                )
+                await state.refresh_project_state()
+                optimal_task = await find_optimal_task_for_agent(agent_id, state)
+                _mark("task_selection_after_recovery")
+
         if optimal_task:
             try:
                 # Get implementation context if using GitHub
@@ -1603,21 +2113,11 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
                 context_data = None
                 dependency_awareness = None
 
-                # Skip context building during project creation to avoid blocking
-                # Context can be built asynchronously after task assignment
+                # Issue #605: context is delivered IN this response, so it
+                # must never be skipped. The old ">5 TODO tasks" guard
+                # dropped context exactly when a large backlog made
+                # coordination matter most — it has been removed.
                 build_context = hasattr(state, "context") and state.context
-
-                # Check if we're in project creation mode (many tasks being
-                # created)
-                if build_context and hasattr(state, "project_tasks"):
-                    # If more than 5 tasks in TODO state, likely creating
-                    # a project
-                    todo_count = sum(
-                        1 for t in state.project_tasks if t.status == TaskStatus.TODO
-                    )
-                    if todo_count > 5:
-                        # Skip context during bulk creation
-                        build_context = False
 
                 if build_context:
                     # Add any GitHub implementations to context first
@@ -1794,11 +2294,81 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
                     due_date=optimal_task.due_date,
                 )
 
-                # Update kanban FIRST (fail fast if kanban is down)
-                await state.kanban_client.update_task(
-                    optimal_task.id,
-                    {"status": TaskStatus.IN_PROGRESS, "assigned_to": agent_id},
+                # #206 MVP: atomically claim file locks JUST BEFORE
+                # the kanban write commits the assignment. The earlier
+                # filter in ``_find_optimal_task_original_logic``
+                # prevents most contention; this acquire catches the
+                # race where two agents passed the filter on the same
+                # poll and both reached the commit. On failure we bail
+                # before kanban write — the task goes back to TODO and
+                # the agent receives the standard no-task response
+                # shape so its existing 30s polling re-asks shortly.
+                # On success the locks are released in
+                # ``report_task_progress`` when the task reaches DONE
+                # or BLOCKED (Phase 4).
+                declared_files: List[str] = []
+                _acquire_project_id: str = (
+                    getattr(state, "agent_project_map", {}).get(agent_id, "")
+                    if hasattr(state, "agent_project_map")
+                    else ""
                 )
+                if hasattr(state, "file_lock_registry"):
+                    declared_files = list(
+                        (optimal_task.source_context or {}).get("declared_files", [])
+                        or []
+                    )
+                    if declared_files:
+                        acquire_result = await state.file_lock_registry.try_acquire(
+                            task_id=optimal_task.id,
+                            agent_id=agent_id,
+                            files=declared_files,
+                            project_id=_acquire_project_id,
+                        )
+                        if not acquire_result.success:
+                            blocker = acquire_result.blocker
+                            logger.info(
+                                "[#206] Acquire race lost for task %s "
+                                "(agent %s) — file %s (project %s) just "
+                                "claimed by task %s (agent %s); returning "
+                                "no_task_ready",
+                                optimal_task.id,
+                                agent_id,
+                                acquire_result.blocker_file,
+                                _acquire_project_id or "<default>",
+                                blocker.task_id if blocker else "?",
+                                blocker.agent_id if blocker else "?",
+                            )
+                            state.tasks_being_assigned.discard(optimal_task.id)
+                            # Match the standard no-task response shape
+                            # so the agent's existing polling loop
+                            # interprets this the same as any other
+                            # transient unavailability (Kaia review).
+                            return {
+                                "success": False,
+                                "message": (
+                                    "Task was claimed by another agent — "
+                                    "retry shortly."
+                                ),
+                                "retry_after_seconds": 30,
+                                "retry_reason": "file_lock_race",
+                            }
+
+                # Update kanban FIRST (fail fast if kanban is down)
+                try:
+                    await state.kanban_client.update_task(
+                        optimal_task.id,
+                        {
+                            "status": TaskStatus.IN_PROGRESS,
+                            "assigned_to": agent_id,
+                        },
+                    )
+                except Exception:
+                    # Kanban write failed AFTER we acquired file locks.
+                    # Release them so the task doesn't stay locked by a
+                    # phantom assignment that never actually committed.
+                    if declared_files and hasattr(state, "file_lock_registry"):
+                        await state.file_lock_registry.release(optimal_task.id)
+                    raise
 
                 _mark("kanban_update")
 
@@ -1820,6 +2390,29 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
 
                 # If kanban update succeeded, track assignment
                 state.agent_tasks[agent_id] = assignment
+
+                # Capture git HEAD as baseline for validation delta scoping
+                # (issue #696). Allows WorkAnalyzer to later compute
+                # git diff <baseline>..HEAD --name-only and load only the
+                # files this agent changed, not the entire merged codebase.
+                _project_root_for_baseline: Optional[str] = None
+                if hasattr(state, "kanban_client") and state.kanban_client:
+                    _ws = state.kanban_client._load_workspace_state()
+                    if _ws and "project_root" in _ws:
+                        _project_root_for_baseline = _ws["project_root"]
+                if not _project_root_for_baseline and (
+                    hasattr(state, "workspace_manager")
+                    and state.workspace_manager
+                    and hasattr(state.workspace_manager, "project_config")
+                    and state.workspace_manager.project_config
+                ):
+                    _project_root_for_baseline = (
+                        str(state.workspace_manager.project_config.main_workspace or "")
+                        or None
+                    )
+                if _project_root_for_baseline:
+                    _capture_baseline_commit(assignment, _project_root_for_baseline)
+
                 agent = state.agent_status[agent_id]
                 agent.current_tasks = [optimal_task]
 
@@ -1907,6 +2500,15 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
                             if hasattr(optimal_task, "completion_criteria")
                             else []
                         ),
+                        # #664: deliver acceptance_criteria to the agent.
+                        # This is the checkable contract the agent's work is
+                        # verified against; previously omitted, stranding every
+                        # criterion the setup-time pipeline enriched.
+                        "acceptance_criteria": (
+                            optimal_task.acceptance_criteria
+                            if hasattr(optimal_task, "acceptance_criteria")
+                            else []
+                        ),
                     },
                 }
 
@@ -1917,6 +2519,37 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
                     response["task"]["full_context"] = context_data
                 if predictions:
                     response["task"]["predictions"] = predictions
+
+                # Issue #605: deliver task context IN this response. The
+                # agent pulls a task; the three-tier context bundle —
+                # project_contract (project-global), dependency_artifacts
+                # (direct deps, in_scope), and transitive_context
+                # (ancestor artifacts + all upstream decisions,
+                # reference_only) — comes with it. This is always
+                # attached, never skipped, so an agent that never calls
+                # the optional get_task_context tool still has full
+                # context to build against.
+                try:
+                    from src.marcus_mcp.tools.context import assemble_task_context
+
+                    delivered_context = await assemble_task_context(
+                        optimal_task.id, optimal_task, state
+                    )
+                    response["task"]["project_contract"] = delivered_context[
+                        "project_contract"
+                    ]
+                    response["task"]["dependency_artifacts"] = delivered_context[
+                        "dependency_artifacts"
+                    ]
+                    response["task"]["transitive_context"] = delivered_context[
+                        "transitive_context"
+                    ]
+                except Exception as ctx_err:
+                    # Context delivery must never break task assignment.
+                    logger.warning(
+                        "Failed to assemble delivered context for task "
+                        f"{optimal_task.id}: {ctx_err}"
+                    )
 
                 # Log task assignment to conversation (CRITICAL for debugging)
                 conversation_logger.log_worker_message(
@@ -2398,6 +3031,367 @@ def _verify_agent_has_commits(
         return None  # git unavailable or unexpected error — skip check
 
 
+def _apply_merge_failure_to_update_data(
+    *,
+    update_data: Dict[str, Any],
+    task: Task,
+    merge_result: Dict[str, Any],
+    agent_id: str,
+) -> Dict[str, Any]:
+    """Translate a merge-conflict result into a BLOCKED kanban state.
+
+    Helper that converts a failure dict from
+    :func:`_merge_agent_branch_to_main` into the kanban-update
+    mutations and structured failure response the caller needs.
+
+    Bug #651: previously a merge conflict left ``update_data["status"]``
+    as :data:`TaskStatus.DONE` (set unconditionally by the
+    ``status == "completed"`` branch at ``report_task_progress`` line
+    3397), and the failure was "deferred" for return after the kanban
+    update.  Under the ephemeral one-agent-per-task lifecycle (PR #600)
+    the agent that would have received the deferred message has already
+    exited, so the kanban records DONE while the filesystem is missing
+    the work.
+
+    This helper closes that divergence: the kanban status flips to
+    BLOCKED, ``completed_at`` is cleared (the task is not actually
+    done), and a ``merge_conflict`` record is stamped on
+    ``source_context`` carrying the info a recovery surface needs to
+    fix the conflict — which branch, which agent, the git stderr, and
+    a timestamp.
+
+    Parameters
+    ----------
+    update_data : Dict[str, Any]
+        The kanban update dict being built inside
+        ``report_task_progress``.  Mutated in place: status flips to
+        BLOCKED, ``completed_at`` is removed, ``source_context`` gains
+        a ``merge_conflict`` entry (existing keys preserved).
+    task : Task
+        The completing task, used to read any pre-existing
+        ``source_context`` so this helper merges into it rather than
+        overwriting.
+    merge_result : Dict[str, Any]
+        The failure dict returned by :func:`_merge_agent_branch_to_main`.
+        Not mutated.  Carries the underlying git error in ``message``.
+    agent_id : str
+        Id of the agent whose branch failed to merge.  Used to derive
+        ``branch=marcus/{agent_id}`` and to surface in the response.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Failure response the caller surfaces to its caller.  Shape:
+        ``{"success": False, "status": "merge_conflict",
+        "task_id": ..., "agent_id": ..., "blocker": ..., "message": ...}``.
+
+    Notes
+    -----
+    Recovery surface (separate work): a CLI command, follow-up
+    "Resolve merge conflict" task, or human-in-the-loop console takes
+    the ``merge_conflict`` source_context entry and re-attempts the
+    merge after the conflict is resolved in the worktree.  This helper
+    does not implement recovery — it makes the BLOCKED state
+    actionable downstream.
+
+    See Also
+    --------
+    _merge_agent_branch_to_main : The merge primitive whose failure
+        result this helper translates.
+    """
+    # Flip status: DONE was set optimistically at line 3397; merge
+    # failure means the task is NOT actually done.
+    update_data["status"] = TaskStatus.BLOCKED
+    # Clear completed_at — leaving it populated alongside BLOCKED
+    # would corrupt downstream telemetry (Cato completion latency).
+    update_data.pop("completed_at", None)
+
+    # Build the merge_conflict record stamped onto source_context.
+    branch = f"marcus/{agent_id}"
+    conflict_record = {
+        "agent_id": agent_id,
+        "branch": branch,
+        "conflict_stderr": str(merge_result.get("message", "")),
+        "blocked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Merge into existing source_context.  Tasks already carry
+    # in_scope_outcome_ids (#523), responsibility (contract-first),
+    # and other meaningful fields — preserve them.  A task with
+    # source_context=None initializes to a fresh dict.
+    existing_ctx = task.source_context if task.source_context is not None else {}
+    new_ctx = {**existing_ctx, **(update_data.get("source_context") or {})}
+    new_ctx["merge_conflict"] = conflict_record
+    update_data["source_context"] = new_ctx
+
+    blocker_message = (
+        f"Branch {branch} failed to merge to main: "
+        f"{merge_result.get('message', 'merge_conflict')}. "
+        "Task marked BLOCKED — resolve the conflict in the worktree "
+        "(git merge main; resolve; commit) and re-run completion, or "
+        "use `marcus resolve-conflict` (when available)."
+    )
+
+    return {
+        "success": False,
+        "status": "merge_conflict",
+        "task_id": task.id,
+        "agent_id": agent_id,
+        "branch": branch,
+        "blocker": blocker_message,
+        "message": (
+            f"Marcus did not mark task {task.id} done because branch "
+            f"{branch} could not be merged to main.  The work is still "
+            "on the branch; the kanban shows BLOCKED so the conflict is "
+            "visible rather than silently dropped (bug #651)."
+        ),
+    }
+
+
+async def _attempt_merge_recovery(
+    *,
+    task: Task,
+    state: Any,
+) -> Optional[Dict[str, Any]]:
+    """Recover a BLOCKED-by-merge-conflict task via worktree rebase.
+
+    Bug #651 follow-up.  PR #653 marked tasks BLOCKED on merge fail
+    (closed the kanban/filesystem divergence) but left them
+    unrecoverable.  verify-snake-8 (test71, 2026-05-25) hit one
+    such conflict and the runner spawned 49 ephemeral agents
+    chasing the unclaimed downstream task before the 20-minute
+    stall watchdog gave up — roughly $25-50 of wasted spawn cost.
+
+    Most "conflicts" in DAG-based parallel work are stale-base
+    false conflicts: another agent merged main while this agent's
+    worktree was on the old base; the actual code changes don't
+    overlap.  Rebase resolves these mechanically.  Real content
+    conflicts (overlapping line edits) abort the rebase and leave
+    the task BLOCKED for human intervention.
+
+    Recovery flow:
+
+    1. Read ``source_context.merge_conflict`` from the BLOCKED task.
+    2. Resolve the worktree path
+       (``<project_root>/../worktrees/<agent_id>``, the Marcus
+       convention set by ``spawn_agents.py``).
+    3. Run ``git rebase main`` in the worktree.
+    4. On clean rebase: ``git checkout main`` in the main repo,
+       ``git merge --ff-only <branch>``, transition task to DONE
+       on the kanban, clear ``merge_conflict`` from source_context.
+    5. On rebase conflict: ``git rebase --abort`` to clean state;
+       leave task BLOCKED; return None.
+
+    Parameters
+    ----------
+    task : Task
+        The BLOCKED task whose source_context carries the
+        ``merge_conflict`` record from
+        :func:`_apply_merge_failure_to_update_data`.
+    state : Any
+        Marcus server state.  ``kanban_client._load_workspace_state()``
+        provides the ``project_root``; ``kanban_client.update_task``
+        applies the BLOCKED→DONE transition on success.
+
+    Returns
+    -------
+    Optional[Dict[str, Any]]
+        Success dict ``{"success": True, "task_id": ...,
+        "method": "rebase"}`` when the task recovered.  ``None`` for
+        any failure path.  Callers treat ``None`` as "task stays
+        BLOCKED."
+
+    Notes
+    -----
+    Bright-line: Marcus rebasing the agent's branch onto main is
+    environment shaping, not HOW dictation.  Same primitive as
+    ``git pull --rebase`` that any developer runs daily.
+    """
+    import subprocess as _sp
+    from pathlib import Path as _Path
+
+    ctx = task.source_context or {}
+    merge_conflict = ctx.get("merge_conflict")
+    if not isinstance(merge_conflict, dict):
+        return None
+
+    agent_id = merge_conflict.get("agent_id")
+    branch = merge_conflict.get("branch") or (
+        f"marcus/{agent_id}" if agent_id else None
+    )
+    if not agent_id or not branch:
+        return None
+
+    project_root: Optional[str] = None
+    if hasattr(state, "kanban_client") and state.kanban_client:
+        load_state = getattr(state.kanban_client, "_load_workspace_state", None)
+        if callable(load_state):
+            try:
+                ws = load_state()
+                if isinstance(ws, dict):
+                    project_root = ws.get("project_root")
+            except Exception:
+                project_root = None
+    if not project_root:
+        return None
+
+    repo = _Path(project_root)
+    if not repo.is_dir():
+        return None
+
+    worktree = repo.parent / "worktrees" / agent_id
+    if not worktree.is_dir():
+        logger.info(
+            "[recovery] %s: worktree %s missing; cannot auto-recover",
+            task.id,
+            worktree,
+        )
+        return None
+
+    logger.info(
+        "[recovery] %s: attempting rebase of %s onto main in %s",
+        task.id,
+        branch,
+        worktree,
+    )
+    try:
+        rebase = _sp.run(
+            ["git", "rebase", "main"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (_sp.SubprocessError, OSError) as exc:
+        logger.warning("[recovery] %s: rebase subprocess error: %s", task.id, exc)
+        return None
+
+    if rebase.returncode != 0:
+        logger.warning(
+            "[recovery] %s: rebase failed (real content conflict?): %s",
+            task.id,
+            rebase.stderr.strip() if rebase.stderr else "(no stderr)",
+        )
+        try:
+            _sp.run(
+                ["git", "rebase", "--abort"],
+                cwd=worktree,
+                capture_output=True,
+                timeout=30,
+            )
+        except (_sp.SubprocessError, OSError):
+            pass
+        return None
+
+    try:
+        _sp.run(
+            ["git", "checkout", "main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        _sp.run(
+            ["git", "reset", "--hard", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            timeout=30,
+        )
+        merge = _sp.run(
+            ["git", "merge", "--ff-only", branch],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if merge.returncode != 0:
+            logger.warning(
+                "[recovery] %s: post-rebase fast-forward failed: %s",
+                task.id,
+                merge.stderr.strip() if merge.stderr else "(no stderr)",
+            )
+            return None
+    except (_sp.SubprocessError, OSError) as exc:
+        logger.warning("[recovery] %s: post-rebase merge error: %s", task.id, exc)
+        return None
+
+    new_ctx = dict(ctx)
+    new_ctx.pop("merge_conflict", None)
+    update_data: Dict[str, Any] = {
+        "status": TaskStatus.DONE,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "source_context": new_ctx,
+    }
+    try:
+        await state.kanban_client.update_task(task.id, update_data)
+    except Exception as exc:
+        logger.warning(
+            "[recovery] %s: kanban update failed after rebase+merge: %s",
+            task.id,
+            exc,
+        )
+        return None
+
+    logger.info(
+        "[recovery] %s: recovered via rebase; branch %s merged to main",
+        task.id,
+        branch,
+    )
+    return {
+        "success": True,
+        "task_id": task.id,
+        "branch": branch,
+        "method": "rebase",
+    }
+
+
+async def _sweep_blocked_merge_conflicts(state: Any) -> int:
+    """Sweep BLOCKED-by-merge-conflict tasks and attempt recovery on each.
+
+    Called from :func:`request_next_task` before returning
+    ``no_task_ready``.  Iterates :attr:`state.project_tasks`, picks
+    out tasks that are BLOCKED with a ``merge_conflict`` record in
+    ``source_context``, and runs :func:`_attempt_merge_recovery` on
+    each.  Returns the count of successfully recovered tasks so
+    the caller can decide whether to refresh project state and
+    retry task selection.
+
+    Bug #651 follow-up — eliminates verify-snake-8's spawn-thrash
+    failure mode where 49 ephemeral agents spawned chasing an
+    unrecoverable BLOCKED task before the 20-min stall watchdog
+    fired.
+
+    Parameters
+    ----------
+    state : Any
+        Marcus server state.  Needs ``project_tasks`` and
+        ``kanban_client``.
+
+    Returns
+    -------
+    int
+        Number of BLOCKED tasks recovered to DONE.
+    """
+    project_tasks = getattr(state, "project_tasks", None) or []
+    recovered = 0
+    for task in project_tasks:
+        if getattr(task, "status", None) != TaskStatus.BLOCKED:
+            continue
+        ctx = getattr(task, "source_context", None) or {}
+        if not isinstance(ctx, dict) or "merge_conflict" not in ctx:
+            continue
+        try:
+            result = await _attempt_merge_recovery(task=task, state=state)
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - never let one bad task block the sweep
+            logger.warning("[recovery] sweep: unexpected error on %s: %s", task.id, exc)
+            continue
+        if result and result.get("success"):
+            recovered += 1
+    return recovered
+
+
 async def _merge_agent_branch_to_main(
     agent_id: str,
     task_id: str,
@@ -2480,6 +3474,54 @@ async def _merge_agent_branch_to_main(
             check=True,
             capture_output=True,
         )
+
+        # Bug #651 — defensive working-tree cleanup before merge.
+        #
+        # The verify-snake-4 run (test66, 2026-05-24) surfaced that
+        # the composer smoke gate ran ``npm install --silent && npm
+        # run build`` directly in ``project_root``.  The ``npm
+        # install`` step writes to ``package-lock.json``, leaving
+        # the main repo's working tree dirty.  The subsequent merge
+        # then fails with:
+        #
+        #     error: Your local changes to the following files would
+        #     be overwritten by merge: package-lock.json
+        #     Aborting
+        #
+        # Two consecutive merges (composer task ``a7d5bbe7`` and
+        # integration verifier ``8ff99c5b``) hit this exact pattern,
+        # dropping the composer's wiring and the integration
+        # verifier's renderer implementation despite both tasks
+        # reporting build-verified.  The kanban marked DONE, the
+        # filesystem missed the work, and the user saw a blank
+        # snake game.
+        #
+        # The proper architectural fix is #652 (gates run in agent
+        # worktree or scratch dir, never in ``project_root``).  This
+        # defensive reset is the surgical safety net: discard any
+        # uncommitted changes in ``main``'s working tree before
+        # attempting the merge.  Safe by design — merging only
+        # cares about committed state in ``main``; any uncommitted
+        # changes in ``project_root`` are gate-test side effects
+        # that should not influence merge outcomes.
+        try:
+            _sp.run(
+                ["git", "reset", "--hard", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+        except _sp.CalledProcessError as reset_err:
+            # Rare — git reset failed.  Log and proceed to merge
+            # attempt anyway; the merge will surface the underlying
+            # problem more concretely than a half-recovered reset.
+            logger.warning(
+                "[worktree] Pre-merge reset --hard failed for %s: %s. "
+                "Continuing to merge attempt — the merge will surface "
+                "any concrete blocker.",
+                branch,
+                reset_err.stderr,
+            )
 
         # Attempt merge
         merge = _sp.run(
@@ -2611,6 +3653,7 @@ async def report_task_progress(
     start_command: Optional[str] = None,
     readiness_probe: Optional[str] = None,
     verifications: Optional[List[Dict[str, Any]]] = None,
+    evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Agents report their task progress.
@@ -2688,14 +3731,49 @@ async def report_task_progress(
         ``start_command`` is provided, the legacy single-command
         smoke gate runs unchanged.  When both are provided,
         ``verifications`` wins and ``start_command`` is ignored.
+    evidence : Optional[Dict[str, Any]]
+        Issue #677: behavior evidence captured by actually RUNNING the
+        assembled product.  Required when completing an integration or
+        composition task whose project Marcus classified with a
+        behavior-evidence contract (web, data pipeline, CLI tool,
+        library, API service, ML/AI).  The expected keys depend on the
+        app type and are stated in the task description:
+
+        - web app / game → ``dom`` (rendered HTML of the body) +
+          ``console_errors`` (list)
+        - data pipeline → ``output`` (produced output) or
+          ``output_rows`` (int)
+        - CLI tool → ``exit_code`` (int) + ``stdout`` (str)
+        - library → ``import_ok`` (bool) + ``call_result``
+        - API service → ``status`` (int) + ``body``
+        - ML/AI → ``prediction``
+
+        Marcus judges this evidence against the per-type bar — a build
+        that exits 0 and a server that returns 200 do not pass.  Unlike
+        ``verifications`` (where the agent chooses the command and
+        Marcus trusts exit 0), Marcus judges the *evidence itself*,
+        which is what keeps the behavior check ungameable.  App types
+        with no behavior contract (``other``/``automation``/unknown)
+        ignore this field and fall back to ``verifications``/
+        ``start_command``.
 
     Returns
     -------
     Dict[str, Any]
         Dict with success status
     """
+    # Phase timing for performance monitoring (issue: where does the
+    # 4-min-per-task cost come from?). Mirrors the inline _mark
+    # pattern in ``request_next_task`` so all Marcus timing log lines
+    # can be grepped together. Marks fire on the success path only —
+    # error returns skip the log, matching ``request_next_task``.
+    from src.core.perf_instrumentation import PhaseTimer
+
+    _timer = PhaseTimer()
+
     # Get project/board context
     project_context = await get_project_board_context(state)
+    _timer.mark("ctx_setup")
 
     # Log progress update
     conversation_logger.log_worker_message(
@@ -2717,6 +3795,22 @@ async def report_task_progress(
         },
     )
 
+    # Record the progress heartbeat in the active experiment monitor so
+    # the runner's spawn-thrash detector sees a claimed task advancing
+    # (report_task_progress at 25/50/75%) as real progress, not only
+    # completions. Counted on every report — a report arriving at all
+    # proves the agent is alive and working its task.
+    from src.experiments.live_experiment_monitor import get_active_monitor
+
+    _progress_monitor = get_active_monitor()
+    if _progress_monitor and _progress_monitor.is_running:
+        _progress_monitor.record_progress(
+            agent_id=agent_id,
+            task_id=task_id,
+            progress=progress,
+            status=status,
+        )
+
     # Escalation flag — set when the retry ceiling is hit during
     # validation. The task is routed through the normal completion
     # path (kanban update, lease cleanup, branch merge) but the
@@ -2726,9 +3820,21 @@ async def report_task_progress(
     validation_escalated: bool = False
     escalation_payload: Optional[Dict[str, Any]] = None
 
+    # #206 MVP Phase 4 (Kaia review fix): flag-driven release so EVERY
+    # early-return path that puts the task in a terminal state (DONE or
+    # BLOCKED in kanban) frees its file locks. The function has several
+    # early returns inside the outer ``try:`` — gate-rejection paths
+    # (smoke / composer / validation failure) leave the task IN_PROGRESS
+    # and must NOT release; terminal-state paths (deferred merge
+    # failure, validation-escalated success, stub-warning success,
+    # normal success) MUST release. The ``finally:`` at the bottom of
+    # the function reads this flag and releases under ``asyncio`` safely.
+    _release_locks_on_exit: bool = False
+
     try:
         # Initialize kanban if needed
         await state.initialize_kanban()
+        _timer.mark("kanban_init")
 
         # Log Marcus thinking
         log_thinking(
@@ -2810,6 +3916,82 @@ async def report_task_progress(
                             f"Falling through to default rejection."
                         )
 
+                # Issue #667 Fix 2: transactional late-completion accept.
+                #
+                # Before the final rejection, check whether the task is
+                # actually uncontested — no replacement lease, no other
+                # agent's assignment, no in-flight assignment. If
+                # nothing else is touching the task, the late
+                # completion is safe to accept and the agent's work
+                # (verification artifacts, remediation, etc.) is
+                # preserved instead of discarded.
+                #
+                # This preserves Issue #343's two-agent-race protection
+                # for the cases where ANY replacement signal exists
+                # (in-flight assignment, another agent's
+                # ``agent_tasks`` entry, a new active lease).
+                #
+                # Three replacement signals checked in order of
+                # cheapness:
+                #
+                # 1. ``active_leases.get(task_id)`` exists — a new
+                #    lease has been created. If the lease holder is
+                #    NOT this agent (already verified above), reject.
+                # 2. Any other agent in ``state.agent_tasks``
+                #    references this task — a new assignment has
+                #    landed. Reject.
+                # 3. ``tasks_being_assigned`` contains the task —
+                #    Marcus is mid-assignment. Reject (race case).
+                #
+                # If all three are clear, accept by flipping
+                # ``lease_holder_matches`` to True. The completion
+                # path proceeds as if the original lease was still
+                # valid.
+                if not lease_holder_matches:
+                    uncontested = False
+                    try:
+                        no_active_lease = True
+                        if (
+                            hasattr(state, "lease_manager")
+                            and state.lease_manager is not None
+                        ):
+                            no_active_lease = (
+                                state.lease_manager.active_leases.get(task_id) is None
+                            )
+
+                        no_other_agent = all(
+                            getattr(a, "task_id", None) != task_id
+                            for a in state.agent_tasks.values()
+                        )
+
+                        no_in_flight = task_id not in getattr(
+                            state, "tasks_being_assigned", set()
+                        )
+
+                        if no_active_lease and no_other_agent and no_in_flight:
+                            uncontested = True
+                    except Exception as race_err:
+                        # Defensive: if the uncontested check raises
+                        # (corrupt state, mid-mutation race), fall
+                        # through to the existing rejection. Safer
+                        # to reject than to accept under uncertainty.
+                        logger.warning(
+                            f"Issue #667 Fix 2: uncontested-task check "
+                            f"raised for {task_id}: {race_err}. "
+                            f"Falling through to default rejection."
+                        )
+
+                    if uncontested:
+                        lease_holder_matches = True
+                        logger.info(
+                            f"Issue #667 Fix 2: accepting late "
+                            f"completion from {agent_id} on task "
+                            f"{task_id} — no replacement lease, no "
+                            f"other agent assignment, no in-flight "
+                            f"assignment. Agent's work preserved "
+                            f"instead of discarded."
+                        )
+
                 if not lease_holder_matches:
                     logger.warning(
                         f"Rejecting stale completion: agent {agent_id} "
@@ -2834,6 +4016,34 @@ async def report_task_progress(
                             f"— request your next task to continue."
                         ),
                     }
+
+        _timer.mark("stale_guard")
+
+        # Issue #667 Fix 1: extend the lease into the validation
+        # window BEFORE the validation/smoke gates run. Codex P1 on
+        # PR #668: if this fires after the gates, the smoke gate has
+        # already run under the prior lease (which expires mid-gate
+        # for slow integration tasks), and on a successful completion
+        # the lease has been deleted by the time we'd attempt to
+        # extend it. Both Fix 1 paths must be anchored before the
+        # downstream completion machinery so the entire
+        # validation + remediation cycle runs under the validation
+        # window.
+        if (
+            status == "completed"
+            and hasattr(state, "lease_manager")
+            and state.lease_manager
+        ):
+            extended = await state.lease_manager.extend_for_validation(task_id)
+            if extended:
+                logger.info(
+                    f"Extended lease for task {task_id} into "
+                    f"validation window before smoke gate "
+                    f"(expires: {extended.lease_expires.isoformat()})"
+                )
+            # If extension returned None, the lease was already
+            # expired or missing — Fix 2's transactional
+            # late-accept path handles that case separately.
 
         # Update task in kanban
         update_data: Dict[str, Any] = {"progress": progress}
@@ -2982,8 +4192,52 @@ async def report_task_progress(
                         start_command=start_command,
                         readiness_probe=readiness_probe,
                         verifications=verifications,
+                        evidence=evidence,
+                        message=message,
                     )
                     if smoke_response is not None:
+                        # Self-verify mode (#677 rework) no longer rejects for
+                        # missing agent-authored proof, so the original
+                        # gridlock sources (verifications_required_but_missing,
+                        # behavior_evidence_missing) can't occur. The remaining
+                        # rejections — ``build_failed`` and a failed
+                        # agent-VOLUNTEERED check — are all fixable by the agent
+                        # (fix the build / fix the deliverable), so they stay
+                        # retryable; persistent failure is handled by the lease.
+                        # We keep one ceiling: a volunteered behavior-evidence
+                        # check that keeps failing escalates cleanly rather than
+                        # looping to lease expiry.
+                        smoke_error = smoke_response.get("error")
+                        if smoke_error == "behavior_evidence_failed":
+                            attempts = _record_behavior_evidence_attempt(task_id)
+                            if attempts > MAX_SMOKE_BEHAVIOR_EVIDENCE_ATTEMPTS:
+                                logger.warning(
+                                    "Smoke gate: task %s rejected for behavior "
+                                    "evidence %d times; escalating to a "
+                                    "terminal response (issue #677).",
+                                    task_id,
+                                    attempts,
+                                )
+                                escalated = _escalate_behavior_evidence_response(
+                                    smoke_response
+                                )
+                                # Codex P1 (#678): terminalize the board + release
+                                # the lease, so an agent that obeys "do NOT retry"
+                                # doesn't leave the task IN_PROGRESS idling until
+                                # lease timeout.
+                                await _terminalize_escalated_smoke_task(
+                                    state,
+                                    task_id,
+                                    agent_id,
+                                    str(
+                                        escalated.get("blocker")
+                                        or escalated.get("message")
+                                        or "Smoke gate escalated: behavior "
+                                        "evidence never met the bar."
+                                    ),
+                                )
+                                _clear_smoke_attempts(task_id)
+                                return escalated
                         return smoke_response
                 except Exception as smoke_err:
                     # Smoke verification system error (not a smoke
@@ -2997,6 +4251,33 @@ async def report_task_progress(
                         f"for task {task_id}: {smoke_err}"
                     )
                     logger.exception("Smoke verification exception details:")
+
+            # Self-verify-mode honesty stamp (#677, Kaia review).  Marcus no
+            # longer runs an independent build/behavior check on composition or
+            # integration tasks — the old composer build gate was tech-specific
+            # (``npm run build``: Marcus owning a language ontology), weaker than
+            # the agent (it gridlocked snake-skeptic-1 on a peer-dep conflict the
+            # agent had already worked around), and uncorrelated with "the
+            # product works" (every shipped-broken run still built).  So
+            # verification lives with the agent.  We accept the completion on the
+            # agent's self-report, but we do NOT let "done" silently read as
+            # "independently verified" — that would erode the observability
+            # Marcus competes on.  Stamp it: a WARNING log + a response flag the
+            # caller propagates.  The objective check, when we add it, is a
+            # separate stack-discovering verifier agent ("borrow hands").
+            if task is not None and (
+                _is_composition_task(task) or _is_integration_task(task)
+            ):
+                logger.warning(
+                    "ACCEPTED ON SELF-REPORT: task %s (%s) completed with NO "
+                    "independent Marcus verification — the agent ran and "
+                    "verified the product; Marcus did not (self-verify mode, "
+                    "#677). independently_verified=False.",
+                    task_id,
+                    ("composition" if _is_composition_task(task) else "integration"),
+                )
+
+        _timer.mark("validation")
 
         # Sentinel: holds a failed merge result to be returned AFTER the
         # kanban update. The task must always be finalized on the board
@@ -3077,15 +4358,16 @@ async def report_task_progress(
                     duration_seconds=duration_seconds,
                 )
 
-            # Record completion in Memory if available
-            if hasattr(state, "memory") and state.memory:
-                await state.memory.record_task_completion(
-                    agent_id=agent_id,
-                    task_id=task_id,
-                    success=True,
-                    actual_hours=actual_hours,
-                    blockers=[],
-                )
+            # Memory recording moved to post-merge for #651 honesty
+            # (Kaia review on PR #653).  Pre-fix, this block recorded
+            # ``success=True`` before the merge had been attempted —
+            # so merge-failed tasks (now marked BLOCKED, not DONE)
+            # would have memory falsely showing success.  The
+            # ``actual_hours`` value is computed above and stays in
+            # scope; the recording itself happens in the merge
+            # outcome branches below (success branch records
+            # success=True; failure branch records success=False
+            # with the merge-conflict blocker text).
 
             # Commit verification gate (dashboard-v88 post-mortem):
             # Reject completions from agents whose worktree branch has
@@ -3145,44 +4427,118 @@ async def report_task_progress(
                         logger.info(f"Removed lease for completed task {task_id}")
 
             # Merge agent's worktree branch to main (GH-250).
-            # Do NOT return early on conflict — the kanban card must be
-            # updated to DONE before this function exits so the task is
-            # never left orphaned as IN_PROGRESS with no owner
-            # (Codex review P1). A failed merge is deferred and returned
-            # after the kanban updates below.
+            # Do NOT return early on conflict — the kanban card must
+            # still be finalized before this function exits so the
+            # task is never left orphaned as IN_PROGRESS with no
+            # owner (Codex review P1).
+            #
+            # Bug #651 update (2026-05-24): a conflict no longer
+            # marks the kanban DONE.  The completed-status
+            # update_data is rewritten in place by
+            # ``_apply_merge_failure_to_update_data`` to BLOCKED with
+            # the conflict info stamped on ``source_context``.  The
+            # later ``state.kanban_client.update_task(task_id,
+            # update_data)`` call (line ~3772) therefore records
+            # BLOCKED rather than DONE, closing the
+            # filesystem/kanban divergence.  Deferred-failure
+            # response is still returned to the caller at the end
+            # of the function so the runner sees the merge_conflict
+            # error explicitly.
             merge_result = await _merge_agent_branch_to_main(agent_id, task_id, state)
             if merge_result and not merge_result.get("success"):
-                _deferred_merge_failure = merge_result
+                # Bug #651: don't mark the kanban DONE on merge fail.
+                # Helper flips update_data["status"] from DONE to
+                # BLOCKED, removes ``completed_at``, and stamps
+                # ``source_context.merge_conflict`` so a recovery
+                # surface (CLI command, follow-up agent, human-in-
+                # the-loop) can resolve.  Returned response is
+                # propagated to the caller via
+                # ``_deferred_merge_failure`` at the end of this
+                # function so the runner sees BLOCKED rather than
+                # interpreting silence as success.
+                if task is not None:
+                    _deferred_merge_failure = _apply_merge_failure_to_update_data(
+                        update_data=update_data,
+                        task=task,
+                        merge_result=merge_result,
+                        agent_id=agent_id,
+                    )
+                else:
+                    # Defensive: task lookup at line 3308 should have
+                    # populated ``task`` for any status="completed"
+                    # path.  If it didn't, preserve the legacy
+                    # deferred-failure behavior so the runner still
+                    # sees an error rather than nothing.
+                    _deferred_merge_failure = merge_result
 
-            # Increment completed count only after merge attempt so a
-            # failed merge doesn't inflate the counter (Codex review P2).
+            # completed_tasks_count tracks AGENT WORK OUTPUT, not git
+            # outcomes — increment after the merge attempt regardless
+            # of whether the merge succeeded (Codex P2 from
+            # ``f2286c21``; locked by ``TestCompletionReleasesLeaseEven
+            # OnMergeFailure.test_completed_tasks_count_incremented_
+            # after_merge_not_before``).  PR #653's earlier attempt
+            # to gate this on merge success violated the existing
+            # invariant; restored here.
             if agent_id in state.agent_status:
                 agent = state.agent_status[agent_id]
                 agent.completed_tasks_count += 1
 
-            if agent_id in state.agent_status:
-                agent = state.agent_status[agent_id]
-
-                # Code analysis for GitHub
-                if state.provider == "github" and state.code_analyzer:
-                    owner = os.getenv("GITHUB_OWNER")
-                    repo = os.getenv("GITHUB_REPO")
-
-                    # Get task details
-                    task = await state.kanban_client.get_task_by_id(task_id)
-
-                    # Analyze completed work
-                    analysis = await state.code_analyzer.analyze_task_completion(
-                        task, agent, owner, repo
+            # Memory recording, however, DOES reflect merge outcome.
+            # Pre-#651, this recorded ``success=True`` regardless of
+            # merge result, falsely inflating the agent's success
+            # rate in the learned profile (Kaia review concern #2 on
+            # PR #653).  Branched on merge outcome below so the
+            # learned profile gets honest feedback.
+            if hasattr(state, "memory") and state.memory:
+                if merge_result and not merge_result.get("success"):
+                    _merge_blocker = (
+                        merge_result.get("message")
+                        or merge_result.get("error")
+                        or "merge_conflict"
+                    )
+                    await state.memory.record_task_completion(
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        success=False,
+                        actual_hours=actual_hours,
+                        blockers=[f"merge_conflict: {_merge_blocker}"],
+                    )
+                else:
+                    await state.memory.record_task_completion(
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        success=True,
+                        actual_hours=actual_hours,
+                        blockers=[],
                     )
 
-                    if analysis and analysis.get("findings"):
-                        # Store findings for future tasks
-                        findings_str = json.dumps(analysis["findings"], indent=2)
-                        await state.kanban_client.add_comment(
-                            task_id,
-                            f"🤖 Code Analysis:\n{findings_str}",
+            # Code analysis runs ONLY on real merge success — analyzing
+            # work that didn't land in main is meaningless (the code
+            # the analyzer would inspect doesn't exist on main yet).
+            if not (merge_result and not merge_result.get("success")):
+                if agent_id in state.agent_status:
+                    agent = state.agent_status[agent_id]
+
+                    # Code analysis for GitHub
+                    if state.provider == "github" and state.code_analyzer:
+                        owner = os.getenv("GITHUB_OWNER")
+                        repo = os.getenv("GITHUB_REPO")
+
+                        # Get task details
+                        task = await state.kanban_client.get_task_by_id(task_id)
+
+                        # Analyze completed work
+                        analysis = await state.code_analyzer.analyze_task_completion(
+                            task, agent, owner, repo
                         )
+
+                        if analysis and analysis.get("findings"):
+                            # Store findings for future tasks
+                            findings_str = json.dumps(analysis["findings"], indent=2)
+                            await state.kanban_client.add_comment(
+                                task_id,
+                                f"🤖 Code Analysis:\n{findings_str}",
+                            )
 
         elif status == "in_progress":
             update_data["status"] = TaskStatus.IN_PROGRESS
@@ -3267,13 +4623,52 @@ async def report_task_progress(
 
         # Update Kanban card
         await state.kanban_client.update_task(task_id, update_data)
+        _timer.mark("kanban_update")
 
-        # Update task progress (including checklist items)
+        # Update task progress (including checklist items).
+        #
+        # Bug #651 (Codex P1 on PR #653): when the merge failed,
+        # ``update_data["status"]`` was just rewritten to BLOCKED by
+        # ``_apply_merge_failure_to_update_data``.  But this
+        # ``update_task_progress`` call sends the LOCAL ``status``
+        # variable — which is still ``"completed"`` (the agent's
+        # original report).  Every kanban provider's
+        # ``update_task_progress`` reads ``status`` and re-applies
+        # it (sqlite_kanban:963-970, github_kanban:444-446,
+        # linear_kanban:355-357, planka_kanban:600-601), so without
+        # the override below the second call would clobber the
+        # BLOCKED state and re-introduce the DONE/merge-conflict
+        # divergence this PR is fixing.
+        _effective_status = "blocked" if _deferred_merge_failure is not None else status
+        _effective_message = message
+        if _deferred_merge_failure is not None:
+            _effective_message = (
+                f"Marcus blocked completion: branch merge failed. "
+                f"{_deferred_merge_failure.get('blocker', '')}".strip()
+            )
         await state.kanban_client.update_task_progress(
-            task_id, {"progress": progress, "status": status, "message": message}
+            task_id,
+            {
+                "progress": progress,
+                "status": _effective_status,
+                "message": _effective_message,
+            },
         )
 
-        # Renew lease on progress update (except for completed tasks)
+        # Lease renewal on progress update.
+        #
+        # ``status == "completed"`` — handled earlier (right after
+        # the stale-completion guard) by ``extend_for_validation``
+        # so the validation/smoke gates and any rejection-driven
+        # remediation run under lease coverage. Codex P1 on PR #668:
+        # this used to live here, after the smoke gate had already
+        # run and ``active_leases[task_id]`` had been deleted by the
+        # completion path. Moved upstream so the window actually
+        # covers the work it's meant to cover.
+        #
+        # ``status != "completed"`` — normal progress milestone.
+        # Call ``renew_lease`` which uses the progressive-timeout
+        # curve based on progress%.
         if (
             hasattr(state, "lease_manager")
             and state.lease_manager
@@ -3294,15 +4689,16 @@ async def report_task_progress(
                 # reopen the lease; doing so creates an orphaned watchdog
                 # that expires and turns the finished task into a zombie.
                 task_obj = next(
-                    (t for t in state.project_tasks if t.id == task_id), None
+                    (t for t in state.project_tasks if t.id == task_id),
+                    None,
                 )
                 if task_obj is not None and task_obj.status in {
                     "done",
                     "completed",
                 }:
                     logger.warning(
-                        f"Stale agent {agent_id} reported progress on task "
-                        f"{task_id} which is already DONE. "
+                        f"Stale agent {agent_id} reported progress on "
+                        f"task {task_id} which is already DONE. "
                         "Skipping lease recreation to prevent zombie."
                     )
                 else:
@@ -3334,6 +4730,10 @@ async def report_task_progress(
         # All state updates (kanban DONE, lease cleared, memory recorded) have
         # completed — safe to surface the merge error to the caller.
         if _deferred_merge_failure is not None:
+            # PR #653 path — the task was just marked BLOCKED in kanban
+            # because the worktree merge to main failed. Release file
+            # locks so a future task can claim the same file.
+            _release_locks_on_exit = True
             return _deferred_merge_failure
 
         # If the validation retry ceiling was hit, surface the
@@ -3344,6 +4744,9 @@ async def report_task_progress(
         # annotation tells observers the validator's complaints
         # were overridden.
         if validation_escalated and escalation_payload is not None:
+            # Task is DONE in kanban (escalation routes through the
+            # full completion path). Release file locks.
+            _release_locks_on_exit = True
             return {
                 "success": True,
                 "message": ("Progress updated successfully (validation escalated)"),
@@ -3364,6 +4767,9 @@ async def report_task_progress(
                     _task_obj.output_paths, _ScanPath(_project_root)
                 )
                 if _stub_findings:
+                    # Task is DONE in kanban — warnings are non-blocking.
+                    # Release file locks.
+                    _release_locks_on_exit = True
                     return {
                         "success": True,
                         "message": "Progress updated successfully",
@@ -3395,6 +4801,25 @@ async def report_task_progress(
             )
             fire_task_completed(completed_task)
 
+        # #206 MVP Phase 4: normal success path. ``status == "completed"``
+        # routes through the full completion pipeline (kanban DONE);
+        # ``"blocked"`` writes BLOCKED to kanban earlier in the
+        # function. Either way the task is terminal and locks should
+        # release. Actual release is in the ``finally:`` block so the
+        # SAME path covers early returns (deferred merge failure,
+        # validation escalation, stub warnings) and the outer except.
+        if status in ("completed", "blocked"):
+            _release_locks_on_exit = True
+
+        _timer.mark("completion_processing")
+        _timer.mark("total")
+        logger.info(
+            "report_task_progress timing: "
+            f"agent={agent_id} task_id={task_id} status={status} "
+            f"progress={progress} "
+            f"total_ms={_timer.total_ms()} "
+            f"phases={_timer.to_phase_durations()}"
+        )
         return {"success": True, "message": "Progress updated successfully"}
 
     except Exception as e:
@@ -3408,6 +4833,17 @@ async def report_task_progress(
         # tracker has already recorded the escalation attempt, so
         # the next completion request will hit the ceiling again
         # and re-run the pipeline.
+
+        # #206 MVP Phase 4 (Kaia review fix): if the agent reported a
+        # terminal status and we got an exception partway through,
+        # release the locks. A briefly-orphaned lock is a worse trade
+        # than a permanently-leaked one — the task is already in an
+        # ambiguous kanban state and a future caller can re-acquire
+        # if needed. For non-terminal statuses (in_progress) keep
+        # locks held; the agent will retry.
+        if status in ("completed", "blocked"):
+            _release_locks_on_exit = True
+
         if validation_escalated and escalation_payload is not None:
             logger.error(
                 f"Completion pipeline error AFTER escalation for "
@@ -3417,6 +4853,27 @@ async def report_task_progress(
             )
             return _build_escalation_error_response(e, escalation_payload)
         return {"success": False, "error": str(e)}
+    finally:
+        # #206 MVP Phase 4 (Kaia review fix): single release site for
+        # ALL exits — normal success, early returns at terminal-state
+        # points, and the outer except. ``_release_locks_on_exit`` is
+        # set True at each path where the task is now in DONE or
+        # BLOCKED state in kanban; gate-rejection paths (smoke /
+        # composer / validation rejection) leave the flag False so
+        # the agent's in-progress lock holdings are preserved across
+        # the retry. Release is idempotent (FileLockRegistry.release
+        # returns 0 for a task that held nothing) and wrapped in a
+        # try/except so a release failure can never break completion
+        # reporting — at worst a lock leaks until Marcus restarts.
+        if _release_locks_on_exit and hasattr(state, "file_lock_registry"):
+            try:
+                await state.file_lock_registry.release(task_id)
+            except Exception as _release_err:  # noqa: BLE001
+                logger.warning(
+                    "[#206] release failed for task %s: %s",
+                    task_id,
+                    _release_err,
+                )
 
 
 def _build_escalation_error_response(
@@ -3864,38 +5321,10 @@ async def _find_optimal_task_original_logic(
                 )
 
                 # CRITICAL DEBUG: Log subtask check for every task
-                logger.info(
+                logger.debug(
                     f"🔍 SUBTASK CHECK for task '{t.name}' (ID: {t.id}): "
                     f"has_subtasks={has_subtasks_result}"
                 )
-
-                # DEBUG: If this is "Design Display Game Board", log detailed info
-                if "Display Game Board" in t.name:
-                    subtasks_in_unified = [
-                        st
-                        for st in state.project_tasks
-                        if st.is_subtask and st.parent_task_id == t.id
-                    ]
-                    subtasks_in_legacy = (
-                        t.id in state.subtask_manager.parent_to_subtasks
-                    )
-                    legacy_count = (
-                        len(state.subtask_manager.parent_to_subtasks.get(t.id, []))
-                        if subtasks_in_legacy
-                        else 0
-                    )
-
-                    logger.critical(
-                        f"🚨 CRITICAL DEBUG - 'Design Display Game Board':\n"
-                        f"  Task ID: {t.id}\n"
-                        f"  has_subtasks() returned: {has_subtasks_result}\n"
-                        f"  Subtasks in unified storage: {len(subtasks_in_unified)}\n"
-                        f"  Subtasks in legacy storage: {legacy_count}\n"
-                        f"  Unified subtasks: {[st.id for st in subtasks_in_unified]}\n"
-                        f"  Total tasks in project_tasks: {len(state.project_tasks)}\n"
-                        f"  Total with is_subtask=True: "
-                        f"{sum(1 for t in state.project_tasks if t.is_subtask)}"
-                    )
 
                 if has_subtasks_result:
                     logger.debug(
@@ -3964,6 +5393,51 @@ async def _find_optimal_task_original_logic(
                         )
                         filtering_stats["incomplete_dependencies"] += 1
                         continue
+
+            # #206 MVP: skip tasks whose declared write files are
+            # currently held by another in-progress task. The
+            # registry's ``any_held`` is read-only and lock-free —
+            # used here as a pre-filter so the more expensive
+            # instruction generation and ``try_acquire`` step only
+            # runs for tasks that look claimable. The final
+            # commit-time ``try_acquire`` (see request_next_task)
+            # serves as the atomic claim against a race with another
+            # agent who passed the same filter on the same poll.
+            if hasattr(state, "file_lock_registry"):
+                declared = (t.source_context or {}).get("declared_files", []) or []
+                if declared and state.file_lock_registry.any_held(
+                    declared, project_id=agent_project_id
+                ):
+                    blocker_file = next(
+                        (
+                            f
+                            for f in declared
+                            if state.file_lock_registry.held_by(
+                                f, project_id=agent_project_id
+                            )
+                            is not None
+                        ),
+                        None,
+                    )
+                    if blocker_file:
+                        holder = state.file_lock_registry.held_by(
+                            blocker_file, project_id=agent_project_id
+                        )
+                        if holder is not None:
+                            logger.info(
+                                "[#206] Skipping task %s for %s — file %s "
+                                "(project %s) held by task %s (agent %s)",
+                                t.id,
+                                agent_id,
+                                blocker_file,
+                                agent_project_id or "<default>",
+                                holder.task_id,
+                                holder.agent_id,
+                            )
+                    filtering_stats["file_lock_blocked"] = (
+                        filtering_stats.get("file_lock_blocked", 0) + 1
+                    )
+                    continue
 
             available_tasks.append(t)
 

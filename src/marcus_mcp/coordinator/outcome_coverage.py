@@ -28,12 +28,22 @@ import re
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set
-from uuid import uuid4
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from src.ai.advanced.prd.outcome_extractor import UserOutcome
 from src.config.outcome_coverage_config import is_outcome_coverage_enabled
 from src.core.models import Priority, Task, TaskStatus
+from src.core.task_classification import TASK_TYPE_IMPLEMENTATION, get_task_type
 from src.marcus_mcp.coordinator.graph_augmentation import AugmentationResult
 
 if TYPE_CHECKING:
@@ -492,6 +502,116 @@ async def compute_coverage_with_llm(
     return coverage
 
 
+_CORE_FEATURE_PROMPT = """\
+You are reviewing the feature list a planner generated for a software \
+project, deciding which features are CORE (required for the product to \
+satisfy what the user asked for) versus scope-creep the planner added on \
+its own.
+
+A feature is CORE when it is needed to deliver at least one of the \
+user-visible outcomes below. A feature is NON-CORE when no listed outcome \
+depends on it (nice-to-have, gold-plating, or tangential).
+
+User-visible outcomes (the ground truth of what the product must do):
+{outcomes_block}
+
+Features the planner generated:
+{features_block}
+
+For each feature id, decide whether it is core. Judge by MEANING, not \
+shared words — a feature and an outcome can use the same nouns yet be \
+unrelated, and can be related with no shared words.
+
+Return strict JSON, no preamble, no markdown fences:
+
+{{
+  "core_feature_ids": ["<id of each CORE feature>"]
+}}
+"""
+
+
+async def map_core_feature_ids_with_llm(
+    *,
+    requirements: List[Dict[str, Any]],
+    outcomes: Iterable[UserOutcome],
+    llm_client: Any,
+    max_tokens: int = 1500,
+) -> Set[str]:
+    """Return the ids of functional requirements that serve an in-scope outcome.
+
+    Issue #683 Cause 1. One batched LLM call decides which AI-generated
+    features are CORE (needed for an in-scope user outcome) so the
+    capacity filter can keep them and trim only genuine scope-creep —
+    instead of dropping features by list position. Uses semantic mapping,
+    not keyword overlap (which fails both directions on shared domain
+    nouns; see :func:`keyword_overlap_mapper`'s own warning).
+
+    Cost is attributed to the ``core_feature_mapping`` operation
+    (registered in ``src/cost_tracking/operations.py``) via
+    :func:`safe_structured_call`.
+
+    The requirement id is ``req["id"]`` when present, else ``req["name"]``
+    — the same identity the filter logs as Kept/Dropped.
+
+    Graceful degradation contract: callers must treat any raised
+    exception as "protect everything" (return all ids) so a mapping
+    failure never drops a required feature. This function itself returns
+    only the ids the LLM marked core; the all-ids fallback lives in the
+    caller alongside its flag/empty checks.
+
+    Returns
+    -------
+    set of str
+        Requirement ids judged core. Unknown ids in the response are
+        dropped; out-of-scope outcomes are never sent.
+
+    Raises
+    ------
+    ValueError
+        On malformed JSON or a missing ``core_feature_ids`` key.
+    """
+
+    def _req_id(req: Dict[str, Any]) -> str:
+        return str(req.get("id") or req.get("name") or "")
+
+    in_scope = [o for o in outcomes if o.scope == "in_scope"]
+    valid_ids = {_req_id(r) for r in requirements if _req_id(r)}
+    # No outcomes to protect against, or no identifiable requirements →
+    # caller should keep everything; signal that by returning all ids.
+    if not in_scope or not valid_ids:
+        return set(valid_ids)
+
+    outcomes_block = "\n".join(
+        f"- {o.id}: {o.action} (signal: {o.success_signal})" for o in in_scope
+    )
+    features_block = "\n".join(
+        f"- {_req_id(r)}: {r.get('name', '')} — {r.get('description', '')}"
+        for r in requirements
+        if _req_id(r)
+    )
+    prompt = _CORE_FEATURE_PROMPT.format(
+        outcomes_block=outcomes_block, features_block=features_block
+    )
+
+    from src.utils.structured_llm import safe_structured_call
+
+    try:
+        payload = await safe_structured_call(
+            llm=llm_client,
+            prompt=prompt,
+            operation="core_feature_mapping",
+            initial_max_tokens=max_tokens,
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Core-feature mapping: malformed JSON: {exc}") from exc
+
+    raw = payload.get("core_feature_ids")
+    if not isinstance(raw, list):
+        raise ValueError("Core-feature mapping: response missing 'core_feature_ids'")
+
+    return {rid for rid in raw if isinstance(rid, str) and rid in valid_ids}
+
+
 _GAP_FILL_PROMPT_HEADER = """\
 The following user-visible outcomes are required by the specification
 but the current task graph does not cover them.  Generate the minimum
@@ -764,16 +884,23 @@ async def fill_gaps(
                     f"{type(value).__name__}: {value!r}"
                 )
 
-        # Optional contract fields must be string or null.  Anything
-        # else is malformed.
+        # Optional contract fields should be string or null. When the
+        # LLM returns something else (commonly ``requires`` as a LIST of
+        # upstream task ids), do NOT abort the whole coverage pass — the
+        # handler below already coerces any non-string to ``None``, so a
+        # hard raise here was stricter than the handling and silently
+        # no-opped gap-fill, signal enrichment, AND gotcha enumeration
+        # (#680) for the entire project. Log and tolerate instead.
         for optional_field in optional_contract_fields:
             if optional_field in item:
                 value = item[optional_field]
                 if value is not None and not isinstance(value, str):
-                    raise ValueError(
-                        f"Outcome gap-fill: task at index {idx} field "
-                        f"{optional_field!r} must be a string or null, got "
-                        f"{type(value).__name__}: {value!r}"
+                    logger.debug(
+                        "Outcome gap-fill: task at index %d field %r was "
+                        "%s, not a string; coercing to null",
+                        idx,
+                        optional_field,
+                        type(value).__name__,
                     )
 
         name = item["name"].strip()
@@ -1144,155 +1271,6 @@ async def apply_outcome_coverage(
 # ---------------------------------------------------------------------------
 
 
-def _build_feature_gap_fill_task(
-    *,
-    idx: int,
-    gap_dict: Dict[str, Any],
-    sibling_tasks: List[Task],
-) -> Task:
-    """Convert a feature-based gap-fill output dict into a Task.
-
-    Inherits defaults from sibling tasks so synthesized tasks fit
-    naturally into the existing graph:
-
-    - ``estimated_hours``: median of sibling estimates (4.0 fallback)
-    - ``priority``: ``Priority.MEDIUM``
-    - ``project_id`` / ``project_name``: copied from any sibling
-    - ``status``: ``TaskStatus.TODO``
-    - ``provides`` / ``requires``: from the gap-fill dict so downstream
-      wiring integrates synthesized tasks via the existing contract
-      mechanism
-    - ``labels``: ``["gap_fill", "intent_fidelity"]`` so audits can
-      identify synthesized tasks distinctly
-    """
-    now = datetime.now(timezone.utc)
-
-    sibling_hours = sorted(
-        t.estimated_hours for t in sibling_tasks if t.estimated_hours > 0
-    )
-    median = sibling_hours[len(sibling_hours) // 2] if sibling_hours else 4.0
-
-    project_id = next((t.project_id for t in sibling_tasks if t.project_id), None)
-    project_name = next((t.project_name for t in sibling_tasks if t.project_name), None)
-
-    return Task(
-        id=f"gap_fill_{uuid4().hex[:12]}",
-        name=_normalize_gap_task_name(gap_dict["name"]),
-        description=gap_dict["description"],
-        status=TaskStatus.TODO,
-        priority=Priority.MEDIUM,
-        assigned_to=None,
-        created_at=now,
-        updated_at=now,
-        due_date=None,
-        estimated_hours=median,
-        labels=["gap_fill", "intent_fidelity"],
-        project_id=project_id,
-        project_name=project_name,
-        provides=gap_dict.get("provides"),
-        requires=gap_dict.get("requires"),
-    )
-
-
-def _build_contract_gap_fill_task(
-    *,
-    idx: int,
-    gap_dict: Dict[str, Any],
-    sibling_tasks: List[Task],
-) -> Task:
-    """Convert a contract-first gap-fill dict into a full Task.
-
-    Differs from :func:`_build_feature_gap_fill_task` by setting
-    ``Task.responsibility`` from the gap-fill output's
-    ``responsibility`` field — that's how contract-first tasks carry
-    the "build this side of the contract" framing in the agent prompt
-    at ``build_tiered_instructions`` time.
-
-    The ``"contract"`` label is added ONLY when ``responsibility`` is
-    present.  When the gap-fill helper falls back to feature-based
-    output (because contract artifacts were filtered to empty),
-    responsibility is None and the task is no different from a
-    feature-based gap-fill — labeling it ``"contract"`` would lie
-    about the synthesis context.
-
-    ``source_context["contract_file"]`` is parsed from the
-    canonical ``"implements <Iface> from <path>"`` responsibility
-    string when the regex matches a path-separator-bearing token, so
-    Layer 1.3 of :func:`build_tiered_instructions` can render the full
-    "Read() the contract file at..." prompt.
-    """
-    now = datetime.now(timezone.utc)
-
-    sibling_hours = sorted(
-        t.estimated_hours for t in sibling_tasks if t.estimated_hours > 0
-    )
-    median = sibling_hours[len(sibling_hours) // 2] if sibling_hours else 4.0
-
-    project_id = next((t.project_id for t in sibling_tasks if t.project_id), None)
-    project_name = next((t.project_name for t in sibling_tasks if t.project_name), None)
-
-    responsibility = gap_dict.get("responsibility")
-
-    labels = ["gap_fill", "intent_fidelity"]
-    if responsibility:
-        labels.append("contract")
-
-    # Best-effort parse of contract_file from the responsibility
-    # string; the gap-fill prompt requests
-    # ``"implements <Iface> from <relative_path>"``.  The path-separator
-    # guard rejects method names ("from RenderingAgent.draw") and
-    # dotted namespaces ("from src.module.thing") — a real relative
-    # path will always contain '/' or '\\'.
-    source_context: Dict[str, Any] = {}
-    if isinstance(responsibility, str):
-        match = re.search(r"\bfrom\s+(\S+\.\S+)\b", responsibility)
-        if match:
-            candidate = match.group(1)
-            if "/" in candidate or "\\" in candidate:
-                source_context["contract_file"] = candidate
-        # Belt-and-braces: stash responsibility itself so providers
-        # that don't round-trip Task.responsibility (Planka) still
-        # surface the contract framing.
-        source_context["responsibility"] = responsibility
-
-    # Embed MARCUS_CONTRACT_FIRST marker so contract metadata
-    # survives round-trip through providers that don't persist
-    # Task.responsibility OR source_context.  Mirrors the native
-    # contract-first task path; ``_parse_contract_metadata`` reads
-    # this marker as priority-3 fallback.
-    description = gap_dict["description"]
-    if isinstance(responsibility, str) and responsibility:
-        contract_file_for_marker = source_context.get("contract_file", "")
-        marker_lines = [
-            "<!-- MARCUS_CONTRACT_FIRST",
-            f"responsibility: {responsibility}",
-            f"contract_file: {contract_file_for_marker}",
-            "-->",
-        ]
-        description = f"{description}\n\n" + "\n".join(marker_lines)
-
-    return Task(
-        id=f"gap_fill_{uuid4().hex[:12]}",
-        name=_normalize_gap_task_name(gap_dict["name"]),
-        description=description,
-        status=TaskStatus.TODO,
-        priority=Priority.MEDIUM,
-        assigned_to=None,
-        created_at=now,
-        updated_at=now,
-        due_date=None,
-        estimated_hours=median,
-        labels=labels,
-        project_id=project_id,
-        project_name=project_name,
-        provides=gap_dict.get("provides"),
-        requires=gap_dict.get("requires"),
-        responsibility=responsibility,
-        source_type="gap_fill_contract",
-        source_context=source_context if source_context else None,
-    )
-
-
 def _coverage_to_telemetry(
     coverage: OutcomeCoverageResult,
 ) -> Dict[str, Any]:
@@ -1320,60 +1298,548 @@ def _coverage_to_telemetry(
 #: enrichment is idempotent without parsing the success_signal text.
 SIGNAL_CRITERION_PREFIX: str = "User outcome verifiable: "
 
+#: Prefix stamped on every gap-fill-derived ``completion_criteria``
+#: string. Mirrors :data:`SIGNAL_CRITERION_PREFIX` in spirit: lets the
+#: rollup pass be idempotent (re-runs see the prefix and skip) and lets
+#: audits identify which criteria came from the #607-step-4 rollup vs
+#: which were authored by the decomposer's per-task path.
+OUTCOME_GAP_CRITERION_PREFIX: str = "Implementation must cover: "
 
-def _translate_stub_ids_to_real_ids(
-    mapping: Optional[Dict[str, List[str]]],
-    synthesized_tasks: List[Task],
-) -> Optional[Dict[str, List[str]]]:
-    """Rewrite ``coverage_after_fill`` to use real gap-fill task IDs.
+#: Prefix stamped on every acceptance-criterion appended by the #680
+#: gotcha-enumeration pass. Distinct from :data:`SIGNAL_CRITERION_PREFIX`
+#: so audits / WorkAnalyzer / the self-verify skeptic can tell a known
+#: failure mode ("reversal is a no-op") apart from a user-outcome signal
+#: ("snake moves when arrow pressed"). The prefix also keeps the pass
+#: idempotent: a re-run sees the stamp and skips the duplicate.
+GOTCHA_CRITERION_PREFIX: str = "Known failure mode to handle: "
 
-    The recoverage check in :func:`apply_outcome_coverage` runs against
-    stub tasks whose IDs follow ``_synth_for_coverage_<idx>``; the
-    callers (``apply_outcome_coverage_to_feature_graph`` and
-    ``apply_outcome_coverage_to_contract_graph``) materialize each stub
-    into a real ``Task`` with a ``gap_fill_<uuid>`` id.  The mapping
-    keeps the stub ids — useful for telemetry parity with the score
-    computation, but unusable for cross-referencing against the
-    augmented task list.
 
-    Returns a new mapping where each occurrence of
-    ``_synth_for_coverage_<idx>`` is replaced with
-    ``synthesized_tasks[idx].id``.  Real task IDs already in the
-    mapping (the originals) pass through unchanged.
+def _gap_dict_to_criterion(gap_dict: Dict[str, Any]) -> str:
+    """Convert a gap-fill output dict to a single criterion string.
+
+    Issue #607 step 4 helper. The criterion names the user-outcome
+    behavior that the anchor task's implementation must cover; it does
+    NOT prescribe HOW the behavior is implemented (no framework, no
+    pattern, no internal code structure). Two agents reading the same
+    criterion are free to write legitimately different code.
+
+    Contract-first gap dicts carry an additional ``responsibility``
+    field ("implements <Iface> from <path>") that the pre-step-4
+    ``_build_contract_gap_fill_task`` projected onto
+    ``Task.responsibility`` / contract source_context. The rollup path
+    no longer materializes that Task field, so when ``responsibility``
+    is present it is appended to the criterion text — the only channel
+    that surfaces contract ownership for gap-driven contract work
+    after the rollup (Codex P2 on PR #611). Agents reading the
+    criterion still see the contract framing even though Task-field
+    rendering (Layer 1.3 of ``build_tiered_instructions``) no longer
+    fires for these gaps.
 
     Parameters
     ----------
-    mapping
-        ``coverage_after_fill`` (or ``coverage_before_fill``) from
-        :class:`OutcomeCoverageResult`.  ``None`` short-circuits.
-    synthesized_tasks
-        The real gap-fill tasks built in the caller, in the same order
-        as the stubs they replaced (caller iterates
-        ``result.synthesized_tasks`` to build these).
+    gap_dict : dict
+        One entry from :attr:`OutcomeCoverageResult.synthesized_tasks`,
+        shape ``{"name": str, "description": str,
+        "responsibility"?: str, ...}``.
 
     Returns
     -------
-    dict or None
-        New mapping with stub ids rewritten.  ``None`` when input is
-        ``None``.
+    str
+        Criterion string starting with
+        :data:`OUTCOME_GAP_CRITERION_PREFIX`. Idempotent re-runs find
+        this stamp and skip duplicates.
+    """
+    name = (gap_dict.get("name") or "").strip()
+    description = (gap_dict.get("description") or "").strip()
+    responsibility = (gap_dict.get("responsibility") or "").strip()
+    if name and description:
+        body = f"{name} — {description}"
+    else:
+        body = name or description
+    if responsibility:
+        body = f"{body} (contract: {responsibility})"
+    return f"{OUTCOME_GAP_CRITERION_PREFIX}{body}"
+
+
+#: Cap on implementation tasks synthesized from core gaps in a single
+#: run (#683 Cause 2). #607-step-4 moved away from synthesizing a task
+#: per gap to fight ATOMIZATION (too many tiny tasks). We reinstate
+#: synthesis only for *core* gaps with no implementation home, and cap
+#: the count so a pathological gap list cannot re-atomize the graph —
+#: excess gaps beyond the cap fall back to the completion_criteria
+#: rollup and are logged.
+GAP_SYNTH_CAP: int = 8
+
+
+def _gap_contract_round_trip(
+    gap: Dict[str, Any], description: str
+) -> Tuple[str, Dict[str, Any]]:
+    """Make a synthesized gap task's contract ownership survive the board.
+
+    Codex P1 on PR #687. A contract-first gap carries ``responsibility``.
+    Setting it only on the top-level ``Task.responsibility`` field is not
+    enough: that field is the SQLite-native column, but the kanban
+    conversion path (``TaskBuilder.build_task_data``) persists
+    ``source_context`` and the description, NOT arbitrary top-level
+    fields. So on the production round-trip the synthesized task loses
+    its contract ownership before ``request_next_task`` and the
+    contract-responsibility instruction layer never fires for exactly
+    these tasks.
+
+    ``_parse_contract_metadata`` in ``marcus_mcp/tools/task.py`` reads
+    contract metadata from three sources in priority order: the native
+    attribute, ``source_context["responsibility"]``, then the
+    ``<!-- MARCUS_CONTRACT_FIRST: responsibility | contract_file -->``
+    description marker. We populate sources 2 and 3 here so the metadata
+    round-trips through every provider (source_context for JSON-capable
+    providers, the marker as the universal fallback for ones like Planka
+    that drop arbitrary fields).
+
+    Returns ``(description_with_marker, source_context)``. When the gap
+    has no ``responsibility`` both are returned unchanged/empty.
+    """
+    responsibility = gap.get("responsibility")
+    if not responsibility:
+        return description, {}
+    contract_file = gap.get("contract_file") or ""
+    source_context: Dict[str, Any] = {"responsibility": responsibility}
+    if contract_file:
+        source_context["contract_file"] = contract_file
+    marker = f"<!-- MARCUS_CONTRACT_FIRST: {responsibility} | {contract_file} -->"
+    description = f"{description}\n\n{marker}" if description else marker
+    return description, source_context
+
+
+def _build_impl_task_from_gap(gap: Dict[str, Any]) -> Optional[Task]:
+    """Materialize one gap-fill dict into an implementation Task (#683).
+
+    Mirrors :func:`_materialize_gap_dicts_as_rescue_tasks` but labels the
+    task ``"implementation"`` (not ``"rescue"``) and is used on the
+    NORMAL (non-empty-graph) path for core gaps that have no existing
+    implementation task to host them. The normalized name (``Implement
+    …`` / a readable verb phrase) classifies as ``implementation`` via
+    :func:`~src.core.task_classification.get_task_type`, so #680 gotcha
+    placement will treat it as a valid host.
+
+    Returns ``None`` when the gap has no usable name.
+    """
+    from uuid import uuid4
+
+    name = _normalize_gap_task_name(gap.get("name") or "")
+    if not name:
+        return None
+    now = datetime.now(timezone.utc)
+    responsibility = gap.get("responsibility")
+    labels = ["gap_fill", "intent_fidelity", "implementation"]
+    if responsibility:
+        labels.append("contract")
+    # Round-trip contract ownership via source_context + description
+    # marker so it survives the kanban conversion (Codex P1 on PR #687).
+    description, source_context = _gap_contract_round_trip(
+        gap, gap.get("description", "")
+    )
+    return Task(
+        id=f"gap_fill_{uuid4().hex[:12]}",
+        name=name,
+        description=description,
+        status=TaskStatus.TODO,
+        priority=Priority.MEDIUM,
+        assigned_to=None,
+        created_at=now,
+        updated_at=now,
+        due_date=None,
+        estimated_hours=4.0,
+        labels=labels,
+        provides=gap.get("provides"),
+        requires=gap.get("requires"),
+        responsibility=responsibility,
+        source_context=source_context or None,
+    )
+
+
+def _materialize_gap_dicts_as_rescue_tasks(
+    gap_dicts: List[Dict[str, Any]],
+) -> List[Task]:
+    """Materialize gap-fill dicts into Tasks for the empty-graph case.
+
+    Codex P1 on PR #611. ``_create_detailed_tasks`` can return ``[]``
+    when AI decomposition fails entirely; before step 4 the gap-fill
+    output rescued those projects by materializing tasks even with no
+    siblings. Step 4's rollup needs an anchor task to route criteria
+    onto — with zero native tasks there is no anchor, so gaps would be
+    silently dropped. This helper restores the pre-step-4 rescue path
+    scoped narrowly to the empty-native-graph case.
+
+    The atomization concern that motivated #607 step 4 does not apply
+    here: there are no native tasks to atomize against, the gap-fill
+    output IS the entire graph.
+
+    Parameters
+    ----------
+    gap_dicts
+        :attr:`OutcomeCoverageResult.synthesized_tasks` — the gap-fill
+        LLM's output dicts.
+
+    Returns
+    -------
+    list of Task
+        One :class:`Task` per gap dict, labeled ``["gap_fill",
+        "intent_fidelity", "rescue"]`` so audits can identify rescue-
+        path synthesized tasks distinctly from the (now-removed)
+        atomization-path synthesized tasks. The ``"rescue"`` label
+        marks the empty-graph fallback.
+    """
+    from uuid import uuid4
+
+    now = datetime.now(timezone.utc)
+    tasks: List[Task] = []
+    for gap in gap_dicts:
+        name = _normalize_gap_task_name(gap.get("name") or "")
+        if not name:
+            continue
+        responsibility = gap.get("responsibility")
+        labels = ["gap_fill", "intent_fidelity", "rescue"]
+        if responsibility:
+            labels.append("contract")
+        # Round-trip contract ownership via source_context + description
+        # marker so it survives the kanban conversion (Codex P1 on PR
+        # #687) — the top-level responsibility field alone is dropped by
+        # TaskBuilder.build_task_data on non-SQLite providers.
+        description, source_context = _gap_contract_round_trip(
+            gap, gap.get("description", "")
+        )
+        tasks.append(
+            Task(
+                id=f"gap_fill_{uuid4().hex[:12]}",
+                name=name,
+                description=description,
+                status=TaskStatus.TODO,
+                priority=Priority.MEDIUM,
+                assigned_to=None,
+                created_at=now,
+                updated_at=now,
+                due_date=None,
+                # 4.0h matches the pre-step-4 sibling-median fallback
+                # when sibling list was empty.
+                estimated_hours=4.0,
+                labels=labels,
+                provides=gap.get("provides"),
+                requires=gap.get("requires"),
+                responsibility=responsibility,
+                source_context=source_context or None,
+            )
+        )
+    return tasks
+
+
+def _find_integration_verification_task_id(
+    tasks: List[Task],
+) -> Optional[str]:
+    """Return the id of an integration-verification task, or ``None``.
+
+    Issue #607 step 4 helper. Used as the routing anchor for cross-
+    cutting gaps (outcomes with no native task that almost-covered
+    them pre-fill). Detection precedence:
+
+    1. Task carrying any of the canonical integration labels
+       (``"integration"``, ``"verification"``, ``"type:integration"``)
+       — these are stamped by ``integration_verification.py`` when the
+       task is generated.
+    2. Task whose name begins with ``"Integration verification"`` —
+       fallback for older task generators that label-skipped.
+    """
+    for t in tasks:
+        labels = set(t.labels or [])
+        if labels & {"integration", "verification", "type:integration"}:
+            return t.id
+    for t in tasks:
+        if (t.name or "").startswith("Integration verification"):
+            return t.id
+    return None
+
+
+def _resolve_gap_anchor_ids(
+    *,
+    tasks: List[Task],
+    gap_dicts: List[Dict[str, Any]],
+    coverage_after_fill: Optional[Dict[str, List[str]]],
+) -> Dict[str, str]:
+    """Map each gap stub id to its routed anchor task id.
+
+    Issue #607 step 4 helper. Encapsulates the routing precedence so
+    both the criterion-rollup path and the signal-enrichment path can
+    address the same anchor.
+
+    Returns
+    -------
+    Dict[str, str]
+        ``{stub_id: anchor_task_id}`` for every gap_dict (by index).
+        Empty when ``gap_dicts`` is empty or no anchor can be found.
+        ``stub_id`` is ``f"{STUB_TASK_ID_PREFIX}{idx}"`` matching
+        ``coverage_after_fill`` convention.
+    """
+    if not gap_dicts:
+        return {}
+
+    integration_anchor_id = _find_integration_verification_task_id(tasks)
+    fallback_anchor_id = tasks[0].id if tasks else None
+    task_by_id: Dict[str, Task] = {t.id: t for t in tasks}
+
+    stub_for_idx: Dict[str, int] = {
+        f"{STUB_TASK_ID_PREFIX}{idx}": idx for idx in range(len(gap_dicts))
+    }
+    gap_to_outcomes: Dict[int, List[str]] = {}
+    if coverage_after_fill:
+        for outcome_id, covering_task_ids in coverage_after_fill.items():
+            for tid in covering_task_ids:
+                idx = stub_for_idx.get(tid)
+                if idx is not None:
+                    gap_to_outcomes.setdefault(idx, []).append(outcome_id)
+
+    stub_to_anchor: Dict[str, str] = {}
+    for idx in range(len(gap_dicts)):
+        anchor_id: Optional[str] = None
+        if coverage_after_fill:
+            for outcome_id in gap_to_outcomes.get(idx, []):
+                for tid in coverage_after_fill.get(outcome_id, []):
+                    if tid in task_by_id:
+                        anchor_id = tid
+                        break
+                if anchor_id:
+                    break
+        if not anchor_id:
+            anchor_id = integration_anchor_id
+        if not anchor_id:
+            anchor_id = fallback_anchor_id
+        if anchor_id:
+            stub_to_anchor[f"{STUB_TASK_ID_PREFIX}{idx}"] = anchor_id
+
+    return stub_to_anchor
+
+
+def _translate_stub_ids_to_anchor_ids(
+    mapping: Optional[Dict[str, List[str]]],
+    stub_to_anchor: Dict[str, str],
+) -> Optional[Dict[str, List[str]]]:
+    """Rewrite stub IDs in a coverage mapping to their routed anchor IDs.
+
+    Issue #607 step 4. Mirrors :func:`_translate_stub_ids_to_real_ids`
+    (which existed for the pre-step-4 model where stubs became real
+    ``gap_fill_<uuid>`` tasks). Under step 4 stubs never materialize;
+    instead each stub's outcome rolls up onto an anchor task. To keep
+    :func:`_enrich_acceptance_criteria_with_signals` working for the
+    cross-cutting case (mapping entries with only a stub id), we
+    rewrite stub ids to the routed anchor id so the
+    ``success_signal`` text follows the criterion to the same task.
+
+    Duplicate anchor ids that arise from multiple stubs routing to one
+    task are deduplicated per outcome — the enricher itself is
+    idempotent, but reducing duplication here keeps the mapping shape
+    clean for downstream consumers.
     """
     if mapping is None:
         return None
-
-    # idx → real_id.  Defensive: pull the integer suffix off the stub
-    # prefix and look up the real task by list index.  An IndexError
-    # here would indicate a mismatched stub count from the LLM (off-by
-    # one against the synthesized_dicts list); silently skip the
-    # unmatched entry rather than raise.
-    real_ids_by_stub: Dict[str, str] = {}
-    for idx, task in enumerate(synthesized_tasks):
-        real_ids_by_stub[f"{STUB_TASK_ID_PREFIX}{idx}"] = task.id
+    if not stub_to_anchor:
+        return mapping
 
     translated: Dict[str, List[str]] = {}
     for outcome_id, task_ids in mapping.items():
-        translated_ids = [real_ids_by_stub.get(tid, tid) for tid in task_ids]
-        translated[outcome_id] = translated_ids
+        rewritten: List[str] = []
+        seen: Set[str] = set()
+        for tid in task_ids:
+            new_tid = stub_to_anchor.get(tid, tid)
+            if new_tid in seen:
+                continue
+            rewritten.append(new_tid)
+            seen.add(new_tid)
+        translated[outcome_id] = rewritten
     return translated
+
+
+def _route_gap_fill_to_criteria(
+    *,
+    tasks: List[Task],
+    gap_dicts: List[Dict[str, Any]],
+    coverage_before_fill: Dict[str, List[str]],
+    coverage_after_fill: Optional[Dict[str, List[str]]],
+) -> Tuple[List[Task], List[Task], Dict[int, str]]:
+    """Route gap-fill outcomes to existing tasks or synthesized impl tasks.
+
+    Issue #607 step 4 — replaces the previous behavior of materializing
+    one ``gap_fill_<uuid>`` :class:`Task` per uncovered outcome (which
+    was atomization mechanism #1 from #607). The intent-fidelity check
+    in :func:`apply_outcome_coverage` still runs and its score /
+    coverage maps are unchanged; only the OUTPUT FORM is different —
+    gaps become criteria on existing tasks.
+
+    Routing precedence per gap (by ``gap_dicts`` index, which matches
+    ``_synth_for_coverage_<idx>`` in ``coverage_after_fill``):
+
+    1. Look at the outcomes this gap stub covers in
+       ``coverage_after_fill``. For each such outcome,
+       ``coverage_after_fill[outcome]`` may also list NATIVE task IDs
+       alongside the stub — that means the post-fill LLM judged those
+       native tasks to co-cover the outcome with the new gap-fill
+       task. Pick the first such native co-anchor — that's the
+       natural home for the gap's criterion.
+    2. If no native co-anchor (the post-fill LLM thinks only the gap
+       task covers this outcome — i.e., truly cross-cutting), find an
+       integration-verification task. Cross-cutting behaviors
+       (end-to-end flows, performance, accessibility) belong on the
+       project's verification surface, not on a single feature
+       implementation.
+    3. Else, fall back to the first task in the input list — degraded
+       but functional. Only reached when the project has neither a
+       native co-anchor nor an integration-verification task.
+
+    Note that ``coverage_before_fill`` is accepted in the signature
+    for parity with the OutcomeCoverageResult contract and future
+    routing heuristics (e.g., picking the anchor with highest pre-fill
+    coverage strength), but it is intentionally NOT consulted in this
+    precedence: outcomes that produce a gap have empty
+    ``coverage_before_fill`` entries by definition (that is what
+    ``find_gaps`` means), so anchor selection has to read from
+    post-fill.
+
+    Parameters
+    ----------
+    tasks : list of Task
+        Native task list (post-decomposition, pre-rollup). Not mutated;
+        tasks that gain criteria are returned as new ``Task`` copies.
+    gap_dicts : list of dict
+        :attr:`OutcomeCoverageResult.synthesized_tasks` — the
+        gap-fill LLM's output dicts.
+    coverage_before_fill : dict
+        ``{outcome_id: [task_id, ...]}`` from the pre-fill coverage
+        pass. Drives anchor selection in precedence step 1.
+    coverage_after_fill : dict or None
+        ``{outcome_id: [task_id, ...]}`` from the post-fill coverage
+        pass. Includes stub IDs that key which gap covers which
+        outcome. ``None`` is treated as "no coverage attribution"; the
+        rollup still runs and falls through to anchor steps 2-3.
+
+    Returns
+    -------
+    tuple of (list of Task, list of Task, dict)
+        ``(augmented_tasks, synthesized_tasks, stub_idx_to_synth_id)``:
+
+        * ``augmented_tasks`` — the input tasks (anchor tasks replaced
+          with copies whose ``completion_criteria`` gained gap-fill
+          criterion strings) followed by any synthesized impl tasks.
+          Idempotent on the :data:`OUTCOME_GAP_CRITERION_PREFIX` stamp.
+        * ``synthesized_tasks`` — implementation tasks materialized for
+          core gaps whose resolved anchor was a non-implementation task
+          (#683 Cause 2); empty when no synthesis fired.
+        * ``stub_idx_to_synth_id`` — ``{gap_index: synth_task_id}`` so
+          the caller can route the gap's outcome coverage (and thus the
+          signal + #680 gotcha enrichment) onto the synthesized task.
+    """
+    if not gap_dicts:
+        return tasks, [], {}
+
+    tasks_by_id: Dict[str, Task] = {t.id: t for t in tasks}
+    integration_id = _find_integration_verification_task_id(tasks)
+
+    # Shared anchor-resolution logic so the signal-enrichment path
+    # routes outcomes the same way.
+    stub_to_anchor = _resolve_gap_anchor_ids(
+        tasks=tasks,
+        gap_dicts=gap_dicts,
+        coverage_after_fill=coverage_after_fill,
+    )
+
+    # #683 Cause 2: per gap, decide between rolling the criterion onto an
+    # existing anchor (the #607-step-4 behavior) and SYNTHESIZING an
+    # implementation task. A gotcha (#680) is a failure mode in running
+    # code, so the outcome's work must live on an implementation task. We
+    # synthesize ONLY when the resolved anchor is a non-implementation
+    # (design/testing) task — the snake-run failure where collision /
+    # game-over / restart rolled onto "Design Game Core Mechanics" and
+    # never got built. When the anchor is already an implementation task
+    # (or the integration-verification task for cross-cutting outcomes),
+    # we keep the rollup — that is the anti-atomization guard: no new task
+    # is created when an existing one can host the criterion.
+    criteria_per_task: Dict[str, List[str]] = {}
+    synthesized: List[Task] = []
+    stub_idx_to_synth_id: Dict[int, str] = {}
+    n_over_cap = 0
+    for idx, gap in enumerate(gap_dicts):
+        anchor_id = stub_to_anchor.get(f"{STUB_TASK_ID_PREFIX}{idx}")
+        anchor = tasks_by_id.get(anchor_id) if anchor_id else None
+
+        anchor_is_non_impl = (
+            anchor is not None
+            and anchor_id != integration_id
+            and get_task_type(anchor) != TASK_TYPE_IMPLEMENTATION
+        )
+
+        if anchor_is_non_impl:
+            # Core gap with no implementation home → synthesize one impl
+            # task (capped to bound atomization). Over the cap, fall back
+            # to the rollup on the resolved (design) anchor and log it.
+            if len(synthesized) < GAP_SYNTH_CAP:
+                synth = _build_impl_task_from_gap(gap)
+                if synth is not None:
+                    synthesized.append(synth)
+                    stub_idx_to_synth_id[idx] = synth.id
+                    continue
+            n_over_cap += 1
+
+        if anchor_id:
+            criteria_per_task.setdefault(anchor_id, []).append(
+                _gap_dict_to_criterion(gap)
+            )
+
+    # Rebuild the task list, replacing anchor tasks with copies that
+    # carry the new criteria. Idempotent on the criterion-prefix stamp.
+    n_tasks_enriched = 0
+    n_criteria_added = 0
+    enriched: List[Task] = []
+    for task in tasks:
+        gained = criteria_per_task.get(task.id)
+        if not gained:
+            enriched.append(task)
+            continue
+        existing_criteria: List[str] = list(task.completion_criteria or [])
+        existing_set: Set[str] = set(existing_criteria)
+        new_criteria: List[str] = list(existing_criteria)
+        for criterion in gained:
+            if criterion in existing_set:
+                continue
+            new_criteria.append(criterion)
+            existing_set.add(criterion)
+        if len(new_criteria) == len(existing_criteria):
+            enriched.append(task)
+            continue
+        n_tasks_enriched += 1
+        n_criteria_added += len(new_criteria) - len(existing_criteria)
+        enriched.append(dataclass_replace(task, completion_criteria=new_criteria))
+
+    if n_tasks_enriched > 0:
+        logger.info(
+            "Gap-fill rollup (#607 step 4): %d task(s) gained %d "
+            "outcome-coverage criterion(s) from %d gap(s)",
+            n_tasks_enriched,
+            n_criteria_added,
+            len(gap_dicts),
+        )
+    if synthesized:
+        logger.info(
+            "Gap-fill synthesis (#683 Cause 2): materialized %d "
+            "implementation task(s) for core gaps with no implementation "
+            "home (cap=%d)",
+            len(synthesized),
+            GAP_SYNTH_CAP,
+        )
+    if n_over_cap:
+        logger.warning(
+            "Gap-fill synthesis (#683 Cause 2): %d core gap(s) exceeded "
+            "the synthesis cap of %d and fell back to the criteria rollup",
+            n_over_cap,
+            GAP_SYNTH_CAP,
+        )
+
+    return enriched + synthesized, synthesized, stub_idx_to_synth_id
 
 
 def _enrich_acceptance_criteria_with_signals(
@@ -1507,6 +1973,376 @@ def _enrich_acceptance_criteria_with_signals(
     return enriched
 
 
+_GOTCHA_PROMPT = """\
+You are a senior QA engineer reviewing a project specification before \
+the build starts. Your job is to enumerate the KNOWN FAILURE MODES \
+("gotchas") for each user-visible outcome: behaviors that a naive but \
+spec-compliant implementation gets WRONG.
+
+A gotcha is NOT a restatement of the outcome. It is the specific, \
+checkable thing that breaks the user experience even though the literal \
+task ("handle direction", "spawn food") was done. Examples for a snake \
+game:
+- "Pressing the direction opposite to current travel reverses the snake \
+into itself and ends the game instantly — it must be ignored instead."
+- "Food spawns on a cell already occupied by the snake's body, so it is \
+unreachable or auto-eaten."
+
+Specification:
+{spec}
+
+User outcomes (enumerate gotchas for the in-scope ones):
+{outcomes_block}
+
+Rules:
+- Each gotcha must be a concrete, observable, checkable failure — not \
+generic advice ("handle errors", "test thoroughly").
+- Describe WHAT must be true, never HOW to implement it. Do not name \
+frameworks, libraries, patterns, or code structure.
+- 0 to 4 gotchas per outcome. Return an empty list for outcomes with no \
+non-obvious failure mode. Do not pad.
+- Use exactly the outcome ids from the input. Do not invent ids.
+
+Return strict JSON, no preamble, no markdown fences:
+
+{{
+  "gotchas": {{
+    "<outcome_id>": ["<failure mode 1>", "<failure mode 2>"]
+  }}
+}}
+"""
+
+
+async def enumerate_gotchas_with_llm(
+    *,
+    spec: str,
+    outcomes: Iterable[UserOutcome],
+    llm_client: Any,
+    max_tokens: int = 2000,
+) -> Dict[str, List[str]]:
+    """Enumerate known failure modes per in-scope outcome via one LLM call.
+
+    Issue #680. A single batched call (not per-outcome) keeps the added
+    latency negligible — the same cost profile as
+    :func:`compute_coverage_with_llm`. Out-of-scope outcomes are
+    excluded: they do not gate completion, so spending tokens
+    enumerating their gotchas would be wasted.
+
+    Parameters
+    ----------
+    spec : str
+        The original project description, for grounding. May be empty.
+    outcomes : iterable of UserOutcome
+        Extracted outcomes. Only ``scope == "in_scope"`` are sent.
+    llm_client : Any
+        Async client exposing ``analyze(...)`` — same client the
+        coverage check uses. Mocked in tests.
+    max_tokens : int, optional
+        Token budget for the call.
+
+    Returns
+    -------
+    dict
+        ``{outcome_id: [gotcha_text, ...]}`` for in-scope outcomes that
+        the LLM returned at least one gotcha for. Outcomes with no
+        gotchas are omitted. Unknown ids in the response are dropped.
+
+    Raises
+    ------
+    ValueError
+        On malformed JSON or a missing ``gotchas`` key. Callers wrap
+        this in graceful degradation (the enumeration step must never
+        block project creation).
+    """
+    in_scope = [o for o in outcomes if o.scope == "in_scope"]
+    if not in_scope:
+        return {}
+
+    outcomes_block = "\n".join(
+        f"- {o.id}: {o.action} (signal: {o.success_signal})" for o in in_scope
+    )
+    prompt = _GOTCHA_PROMPT.format(
+        spec=spec or "(no specification text provided)",
+        outcomes_block=outcomes_block,
+    )
+
+    from src.utils.structured_llm import safe_structured_call
+
+    try:
+        payload = await safe_structured_call(
+            llm=llm_client,
+            prompt=prompt,
+            operation="gotcha_enumeration",
+            initial_max_tokens=max_tokens,
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Gotcha enumeration: malformed JSON: {exc}") from exc
+
+    raw = payload.get("gotchas")
+    if not isinstance(raw, dict):
+        raise ValueError("Gotcha enumeration: response missing 'gotchas' object")
+
+    valid_ids = {o.id for o in in_scope}
+    gotchas: Dict[str, List[str]] = {}
+    for outcome_id, items in raw.items():
+        if outcome_id not in valid_ids:
+            continue
+        if not isinstance(items, list):
+            continue
+        cleaned = [g.strip() for g in items if isinstance(g, str) and g.strip()]
+        if cleaned:
+            gotchas[outcome_id] = cleaned
+    return gotchas
+
+
+def _resolve_implementation_targets(
+    *,
+    outcome_id: str,
+    mapped_task_ids: List[str],
+    tasks_by_id: Dict[str, Task],
+    impl_dependents: Dict[str, List[str]],
+) -> List[str]:
+    """Resolve an outcome's covering tasks to implementation tasks (#680).
+
+    A gotcha is a known failure mode in the *running code*, so it must
+    land on the task whose code can break the outcome — an
+    implementation task — not on a design/testing task that produces a
+    document the skeptic verifies separately. The LLM coverage mapping
+    does not respect this distinction and routes outcomes onto broad
+    design tasks, so we remap here. Three tiers, in order:
+
+    1. Keep the mapped tasks that are themselves implementation tasks.
+       This is the primary path and needs no dependency information.
+    2. If none are, walk each mapped (non-implementation) task's
+       dependents and take the implementation tasks that depend on it —
+       the design→implementation edge is "who builds what this design
+       describes." This tier only fires when ``task.dependencies`` is
+       already populated at call time. NOTE: in the feature-based
+       decomposition path it is NOT — dependencies are wired downstream
+       in ``nlp_tools`` after ``parse_prd_to_tasks`` returns, and
+       ``_infer_smart_dependencies`` deliberately strips design→impl
+       edges (GH-129), so this tier is effectively a no-op there and
+       such outcomes fall to tier 3. It is useful for callers that pass
+       a pre-wired graph (e.g. contract-first / subtask graphs with
+       explicit dependencies).
+    3. If still none, the outcome has no implementation home; the caller
+       logs it as a decomposition gap (tracked in #683) rather than
+       dropping it silently.
+
+    Parameters
+    ----------
+    outcome_id
+        The outcome being placed (for the caller's orphan logging).
+    mapped_task_ids
+        Task ids the coverage mapping assigned to this outcome.
+    tasks_by_id
+        Lookup of every task in the graph by id.
+    impl_dependents
+        Precomputed ``{task_id: [implementation_task_id, ...]}`` of the
+        implementation tasks that directly depend on each task.
+
+    Returns
+    -------
+    list of str
+        Implementation task ids to stamp. Empty when the outcome is
+        orphaned (tier 3) — the caller decides what to do.
+    """
+    # Tier 1: mapped tasks that are themselves implementation tasks.
+    impl_targets = [
+        tid
+        for tid in mapped_task_ids
+        if tid in tasks_by_id
+        and get_task_type(tasks_by_id[tid]) == TASK_TYPE_IMPLEMENTATION
+    ]
+    if impl_targets:
+        return impl_targets
+
+    # Tier 2: walk the design→implementation dependency edge.
+    fallback: List[str] = []
+    seen: Set[str] = set()
+    for tid in mapped_task_ids:
+        for dependent_id in impl_dependents.get(tid, []):
+            if dependent_id not in seen:
+                seen.add(dependent_id)
+                fallback.append(dependent_id)
+    if fallback:
+        logger.info(
+            "Gotcha placement (#680): outcome %r mapped only to "
+            "non-implementation task(s); routed to %d downstream "
+            "implementation task(s) via dependency edge",
+            outcome_id,
+            len(fallback),
+        )
+    return fallback
+
+
+def _enrich_acceptance_criteria_with_gotchas(
+    *,
+    tasks: List[Task],
+    gotchas_by_outcome: Dict[str, List[str]],
+    mapping: Optional[Dict[str, List[str]]],
+) -> List[Task]:
+    """Append enumerated gotchas to acceptance_criteria of impl tasks.
+
+    Issue #680. Each in-scope outcome's enumerated failure modes are
+    written into the ``acceptance_criteria`` of the IMPLEMENTATION tasks
+    that cover it (resolved via :func:`_resolve_implementation_targets`),
+    not wherever the raw LLM coverage mapping happens to point. Because
+    ``request_next_task`` delivers ``acceptance_criteria`` to the agent
+    (#664) and the self-verify skeptic reads the same field, the gotcha
+    reaches both the builder of the code that can break it and the
+    verifier.
+
+    Parameters
+    ----------
+    tasks
+        Current task list. Not mutated; tasks that gain criteria are
+        returned as new :func:`dataclasses.replace` copies.
+    gotchas_by_outcome
+        ``{outcome_id: [gotcha_text, ...]}`` from
+        :func:`enumerate_gotchas_with_llm`.
+    mapping
+        ``{outcome_id: [task_id, ...]}`` coverage mapping (already
+        stub-id-translated by the caller). ``None`` / empty → tasks
+        unchanged.
+
+    Returns
+    -------
+    list of Task
+        Same-length list, input order. Idempotent via
+        :data:`GOTCHA_CRITERION_PREFIX` dedup.
+    """
+    if not mapping or not gotchas_by_outcome:
+        return tasks
+
+    tasks_by_id: Dict[str, Task] = {t.id: t for t in tasks}
+
+    # Precompute implementation dependents: for each task id, the
+    # implementation tasks that directly depend on it. Used for the
+    # tier-2 design→implementation fallback in target resolution.
+    impl_dependents: Dict[str, List[str]] = {}
+    for t in tasks:
+        if get_task_type(t) != TASK_TYPE_IMPLEMENTATION:
+            continue
+        for dep_id in getattr(t, "dependencies", []) or []:
+            impl_dependents.setdefault(dep_id, []).append(t.id)
+
+    # Invert into task_id -> [gotcha criteria], preserving order so the
+    # resulting list is stable across runs (tests, audit diffs). Each
+    # outcome's mapped tasks are first remapped to implementation tasks;
+    # outcomes with no implementation home are logged, never dropped.
+    gotchas_per_task: Dict[str, List[str]] = {}
+    orphaned_outcomes: List[str] = []
+    for outcome_id, task_ids in mapping.items():
+        gotchas = gotchas_by_outcome.get(outcome_id)
+        if not gotchas:
+            continue
+        impl_targets = _resolve_implementation_targets(
+            outcome_id=outcome_id,
+            mapped_task_ids=task_ids,
+            tasks_by_id=tasks_by_id,
+            impl_dependents=impl_dependents,
+        )
+        if not impl_targets:
+            orphaned_outcomes.append(outcome_id)
+            continue
+        for tid in impl_targets:
+            bucket = gotchas_per_task.setdefault(tid, [])
+            for g in gotchas:
+                bucket.append(f"{GOTCHA_CRITERION_PREFIX}{g}")
+
+    if orphaned_outcomes:
+        # Decomposition gap: an in-scope outcome with enumerated failure
+        # modes has no implementation task to enforce them. Surface it
+        # loudly — a silently-dropped gotcha is the opposite of the
+        # transparency/correctness the feature exists for. Root cause and
+        # the proposed fix (a required outcome with no implementation task)
+        # are tracked in #683.
+        logger.warning(
+            "Gotcha placement (#680): %d outcome(s) had gotchas but NO "
+            "implementation task to host them (decomposition gap, "
+            "criteria dropped; see #683): %s",
+            len(orphaned_outcomes),
+            ", ".join(orphaned_outcomes),
+        )
+
+    if not gotchas_per_task:
+        return tasks
+
+    enriched: List[Task] = []
+    n_tasks_enriched = 0
+    n_criteria_added = 0
+    for task in tasks:
+        new_for_task = gotchas_per_task.get(task.id)
+        if not new_for_task:
+            enriched.append(task)
+            continue
+
+        existing_criteria: List[str] = list(task.acceptance_criteria or [])
+        existing_set: Set[str] = set(existing_criteria)
+        new_criteria: List[str] = list(existing_criteria)
+        for criterion in new_for_task:
+            if criterion in existing_set:
+                continue
+            new_criteria.append(criterion)
+            existing_set.add(criterion)
+
+        if len(new_criteria) == len(existing_criteria):
+            enriched.append(task)
+            continue
+
+        n_tasks_enriched += 1
+        n_criteria_added += len(new_criteria) - len(existing_criteria)
+        enriched.append(dataclass_replace(task, acceptance_criteria=new_criteria))
+
+    if n_tasks_enriched > 0:
+        logger.info(
+            "Gotcha enrichment (#680): %d task(s) gained %d gotcha "
+            "criterion(s) from %d outcome(s)",
+            n_tasks_enriched,
+            n_criteria_added,
+            len(gotchas_by_outcome),
+        )
+
+    return enriched
+
+
+async def _apply_gotcha_enrichment(
+    *,
+    spec: str,
+    outcomes: List[UserOutcome],
+    tasks: List[Task],
+    mapping: Optional[Dict[str, List[str]]],
+    llm_client: Any,
+) -> List[Task]:
+    """Run the #680 enumeration + enrichment, degrading gracefully.
+
+    Shared by the feature-based and contract-first graph paths so the
+    LLM call and error handling live in one place. Only reached from
+    inside the outcome-coverage augmenters, which already no-op when the
+    coverage pipeline is off or no outcomes were extracted — so this is
+    permanently on wherever coverage runs and needs no flag of its own.
+    Returns ``tasks`` unchanged on an empty mapping or any LLM/parse
+    error — the gotcha step must never block project creation.
+    """
+    if not mapping:
+        return tasks
+    try:
+        gotchas_by_outcome = await enumerate_gotchas_with_llm(
+            spec=spec,
+            outcomes=outcomes,
+            llm_client=llm_client,
+        )
+    except Exception as exc:  # noqa: BLE001 — broad by design (graceful degrade)
+        logger.warning("Gotcha enumeration failed; criteria unchanged: %s", exc)
+        return tasks
+    return _enrich_acceptance_criteria_with_gotchas(
+        tasks=tasks,
+        gotchas_by_outcome=gotchas_by_outcome,
+        mapping=mapping,
+    )
+
+
 async def apply_outcome_coverage_to_feature_graph(
     *,
     prd_analysis: "PRDAnalysis",
@@ -1555,38 +2391,91 @@ async def apply_outcome_coverage_to_feature_graph(
         logger.warning("Outcome coverage failed; task graph unchanged: %s", exc)
         return AugmentationResult(augmented_tasks=list(tasks))
 
-    synthesized_tasks = [
-        _build_feature_gap_fill_task(idx=idx, gap_dict=d, sibling_tasks=tasks)
-        for idx, d in enumerate(result.synthesized_tasks)
-    ]
-    augmented = list(tasks) + synthesized_tasks
+    # Issue #607 step 4: gap-fill output rolls up onto existing tasks'
+    # completion_criteria instead of synthesizing one new
+    # ``gap_fill_<uuid>`` task per uncovered outcome (the previous
+    # atomization mechanism #1). The intent-fidelity check above still
+    # ran identically; only the OUTPUT FORM differs — every gap now
+    # becomes one criterion text on an anchor task picked via the
+    # routing precedence in ``_route_gap_fill_to_criteria``.
+    #
+    # Codex P1 on PR #611: when the native graph is empty (AI
+    # decomposer failure path), the rollup has no anchor and gaps
+    # would be silently dropped. Materialize the gaps as rescue tasks
+    # instead — pre-step-4 safety net for the empty-graph case, scoped
+    # narrowly so the atomization mechanism stays dead for the normal
+    # path.
+    synthesized_ids: List[str] = []
+    # ``gap_stub_to_synth`` maps a gap's stub index to the real id of the
+    # task it was materialized into, so the downstream signal + #680
+    # gotcha enrichment land on that task. Both the empty-graph rescue
+    # path and the #683 Cause-2 synthesis path populate it.
+    gap_stub_to_synth: Dict[int, str] = {}
+    if not tasks:
+        rescued = _materialize_gap_dicts_as_rescue_tasks(result.synthesized_tasks)
+        augmented = rescued
+        synthesized_ids = [t.id for t in rescued]
+        gap_stub_to_synth = {idx: rid for idx, rid in enumerate(synthesized_ids)}
+    else:
+        augmented, gap_synth_tasks, gap_stub_to_synth = _route_gap_fill_to_criteria(
+            tasks=list(tasks),
+            gap_dicts=result.synthesized_tasks,
+            coverage_before_fill=result.coverage_before_fill,
+            coverage_after_fill=result.coverage_after_fill,
+        )
+        synthesized_ids = [t.id for t in gap_synth_tasks]
 
     # Issue #523 Slice A: project each in-scope outcome's
     # ``success_signal`` into the ``acceptance_criteria`` of every task
-    # the mapping says covers it.  ``coverage_after_fill`` includes
-    # synthesized gap-fill tasks; fall back to ``coverage_before_fill``
-    # when no gaps were filled (post is None in that case).
+    # the mapping says covers it. Stub IDs in the coverage mapping
+    # (cross-cutting outcomes that only the gap-fill task covers) are
+    # rewritten to the routed anchor id so the signal text follows the
+    # criterion to the same task — see
+    # ``_translate_stub_ids_to_anchor_ids``. Gaps materialized into tasks
+    # (empty-graph rescue OR #683 Cause-2 synthesis) map their stub id to
+    # the materialized task's real id so enrichment lands there.
+    stub_to_anchor = _resolve_gap_anchor_ids(
+        tasks=augmented,
+        gap_dicts=result.synthesized_tasks,
+        coverage_after_fill=result.coverage_after_fill,
+    )
+    for idx, real_id in gap_stub_to_synth.items():
+        stub_to_anchor[f"{STUB_TASK_ID_PREFIX}{idx}"] = real_id
+    coverage_mapping = _translate_stub_ids_to_anchor_ids(
+        result.coverage_after_fill or result.coverage_before_fill,
+        stub_to_anchor,
+    )
     augmented = _enrich_acceptance_criteria_with_signals(
         tasks=augmented,
         outcomes=prd_analysis.user_outcomes,
-        mapping=_translate_stub_ids_to_real_ids(
-            result.coverage_after_fill or result.coverage_before_fill,
-            synthesized_tasks,
-        ),
+        mapping=coverage_mapping,
+    )
+
+    # Issue #680: enumerate known failure modes per outcome and write
+    # them into the acceptance_criteria of every covering task. Reuses
+    # the same translated coverage mapping as the signal pass so a
+    # gotcha lands on the same task the signal did. Delivered to the
+    # agent by #664 and read by the self-verify skeptic.
+    augmented = await _apply_gotcha_enrichment(
+        spec=prd_analysis.original_description or "",
+        outcomes=prd_analysis.user_outcomes,
+        tasks=augmented,
+        mapping=coverage_mapping,
+        llm_client=llm_client,
     )
 
     logger.info(
-        "Outcome coverage: score=%.2f, %d outcome(s), %d gap(s), "
-        "%d synthesized task(s)",
+        "Outcome coverage: score=%.2f, %d outcome(s), %d gap(s) "
+        "rolled up onto existing tasks' completion_criteria "
+        "(#607 step 4)",
         result.intent_fidelity_score,
         len(prd_analysis.user_outcomes),
         len(result.gaps),
-        len(synthesized_tasks),
     )
 
     return AugmentationResult(
         augmented_tasks=augmented,
-        synthesized_ids=[t.id for t in synthesized_tasks],
+        synthesized_ids=synthesized_ids,
         telemetry=_coverage_to_telemetry(result),
     )
 
@@ -1642,37 +2531,83 @@ async def apply_outcome_coverage_to_contract_graph(
         )
         return AugmentationResult(augmented_tasks=list(tasks))
 
-    synthesized_tasks = [
-        _build_contract_gap_fill_task(idx=idx, gap_dict=d, sibling_tasks=tasks)
-        for idx, d in enumerate(result.synthesized_tasks)
-    ]
-    augmented = list(tasks) + synthesized_tasks
+    # Issue #607 step 4: gap-fill output rolls up onto existing tasks'
+    # completion_criteria instead of synthesizing new contract gap_fill
+    # tasks. The contract-first ``responsibility`` field that the
+    # pre-step-4 ``_build_contract_gap_fill_task`` path projected onto
+    # ``Task.responsibility`` is now embedded in the criterion text via
+    # ``_gap_dict_to_criterion`` (Codex P2 on PR #611) — the only
+    # post-step-4 channel that surfaces contract ownership for gap-
+    # driven contract work.
+    #
+    # Codex P1 on PR #611: when the native contract graph is empty,
+    # the rollup has no anchor. Materialize gaps as rescue tasks
+    # instead — pre-step-4 safety net scoped narrowly.
+    synthesized_ids: List[str] = []
+    gap_stub_to_synth: Dict[int, str] = {}
+    if not tasks:
+        rescued = _materialize_gap_dicts_as_rescue_tasks(result.synthesized_tasks)
+        augmented = rescued
+        synthesized_ids = [t.id for t in rescued]
+        gap_stub_to_synth = {idx: rid for idx, rid in enumerate(synthesized_ids)}
+    else:
+        augmented, gap_synth_tasks, gap_stub_to_synth = _route_gap_fill_to_criteria(
+            tasks=list(tasks),
+            gap_dicts=result.synthesized_tasks,
+            coverage_before_fill=result.coverage_before_fill,
+            coverage_after_fill=result.coverage_after_fill,
+        )
+        synthesized_ids = [t.id for t in gap_synth_tasks]
 
     # Issue #523 Slice A: mirror the feature-based path — inject each
     # in-scope outcome's ``success_signal`` into the
     # ``acceptance_criteria`` of every covering task so the existing
     # ``WorkAnalyzer`` static gate validates against the user's stated
-    # signal at task completion.
+    # signal at task completion. Post-#607-step-4: stub IDs in the
+    # mapping are rewritten to the routed anchor id so the signal
+    # follows the criterion to the same task. Gaps materialized into
+    # tasks (empty-graph rescue OR #683 Cause-2 synthesis) map their
+    # stub id to the materialized task's real id.
+    stub_to_anchor = _resolve_gap_anchor_ids(
+        tasks=augmented,
+        gap_dicts=result.synthesized_tasks,
+        coverage_after_fill=result.coverage_after_fill,
+    )
+    for idx, real_id in gap_stub_to_synth.items():
+        stub_to_anchor[f"{STUB_TASK_ID_PREFIX}{idx}"] = real_id
+    coverage_mapping = _translate_stub_ids_to_anchor_ids(
+        result.coverage_after_fill or result.coverage_before_fill,
+        stub_to_anchor,
+    )
     augmented = _enrich_acceptance_criteria_with_signals(
         tasks=augmented,
         outcomes=prd_analysis.user_outcomes,
-        mapping=_translate_stub_ids_to_real_ids(
-            result.coverage_after_fill or result.coverage_before_fill,
-            synthesized_tasks,
-        ),
+        mapping=coverage_mapping,
+    )
+
+    # Issue #680: gotcha enumeration, mirrored from the feature-based
+    # path. Same translated coverage mapping so failure modes land on
+    # the covering task and ride the #664 delivery pipe to the agent
+    # and the self-verify skeptic.
+    augmented = await _apply_gotcha_enrichment(
+        spec=prd_analysis.original_description or "",
+        outcomes=prd_analysis.user_outcomes,
+        tasks=augmented,
+        mapping=coverage_mapping,
+        llm_client=llm_client,
     )
 
     logger.info(
         "Outcome coverage (contract-first): score=%.2f, %d outcome(s), "
-        "%d gap(s), %d synthesized task(s)",
+        "%d gap(s) rolled up onto existing tasks' completion_criteria "
+        "(#607 step 4)",
         result.intent_fidelity_score,
         len(prd_analysis.user_outcomes),
         len(result.gaps),
-        len(synthesized_tasks),
     )
 
     return AugmentationResult(
         augmented_tasks=augmented,
-        synthesized_ids=[t.id for t in synthesized_tasks],
+        synthesized_ids=synthesized_ids,
         telemetry=_coverage_to_telemetry(result),
     )

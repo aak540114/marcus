@@ -467,14 +467,20 @@ class TestAdvancedPRDParserTaskGeneration:
         tasks1 = await parser._break_down_epic(req1, analysis, mock_constraints)
         tasks2 = await parser._break_down_epic(req2, analysis, mock_constraints)
 
+        # Issue #607 step 3: design + implement only (Test task rolled up
+        # into completion_criteria on the implement task).
+        assert len(tasks1) == 2
+        assert len(tasks2) == 2
+
         # Check task IDs are unique and based on feature
         assert tasks1[0]["id"] == "task_crud_operations_design"
         assert tasks1[1]["id"] == "task_crud_operations_implement"
-        assert tasks1[2]["id"] == "task_crud_operations_test"
 
         assert tasks2[0]["id"] == "task_user_auth_design"
         assert tasks2[1]["id"] == "task_user_auth_implement"
-        assert tasks2[2]["id"] == "task_user_auth_test"
+
+        # No separate testing tasks anywhere.
+        assert all(t["type"] != "testing" for t in tasks1 + tasks2)
 
         # Check task names include feature name
         assert tasks1[0]["name"] == "Design CRUD Operations"
@@ -539,18 +545,21 @@ class TestAdvancedPRDParserTaskGeneration:
             prd_analysis, mock_constraints
         )
 
-        # Should have all functional epics
+        # Should have all functional epics. #683: all 4 functional reqs are
+        # kept (tier cap, not team_size), so 4 functional + 1 NFR + 1 infra =
+        # 6. Previously team_size cut 'validation', giving 5.
         assert (
-            len(hierarchy) == 5
-        )  # 3 functional + 1 NFR + 1 infra (validation is filtered)
+            len(hierarchy) == 6
+        )  # 4 functional + 1 NFR + 1 infra (nothing filtered by team_size)
         assert "epic_crud_operations" in hierarchy
         assert "epic_todo_properties" in hierarchy
         assert "epic_user_auth" in hierarchy
+        assert "epic_validation" in hierarchy
 
-        # Each functional epic should have 3 tasks
-        assert len(hierarchy["epic_crud_operations"]) == 3
-        assert len(hierarchy["epic_todo_properties"]) == 3
-        assert len(hierarchy["epic_user_auth"]) == 3
+        # Issue #607 step 3: design + implement only (no Test task) -> 2 tasks each.
+        assert len(hierarchy["epic_crud_operations"]) == 2
+        assert len(hierarchy["epic_todo_properties"]) == 2
+        assert len(hierarchy["epic_user_auth"]) == 2
 
         # NFR epic should have tasks for each NFR
         assert len(hierarchy["epic_non_functional"]) == 2  # Performance + Security
@@ -1079,8 +1088,14 @@ class TestRequirementFiltering:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_guided_requirements_filtered_by_team_size(self, parser):
-        """Test that AI-generated requirements are filtered by team capacity"""
+    async def test_guided_requirements_capped_by_tier_not_team_size(self, parser):
+        """AI-generated requirements are capped by complexity tier, not team size.
+
+        #683: team_size governs parallelism, not scope. The old behavior cut
+        the list to team_size (dropping required features by list position);
+        now the cap is the complexity tier's expected feature count (standard
+        = 15), so a 5-item guided list is kept whole.
+        """
         # Arrange
         requirements = [
             {"id": "req1", "name": "Feature 1"},
@@ -1108,9 +1123,10 @@ class TestRequirementFiltering:
                 prd_content=prd_content,
             )
 
-        # Assert - Filtered to team_size (3)
-        assert len(result) == 3
-        assert result == requirements[:3]
+        # Assert - all 5 kept: under the standard tier cap (15); team_size no
+        # longer reduces scope (#683).
+        assert len(result) == 5
+        assert result == requirements
 
     @pytest.mark.unit
     @pytest.mark.asyncio

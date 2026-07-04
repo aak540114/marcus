@@ -6,11 +6,12 @@ artifacts in organized locations while allowing flexibility when needed.
 """
 
 import hashlib
+import json
 import logging
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from src.core.project_history import ArtifactMetadata, ProjectHistoryPersistence
 
@@ -31,7 +32,7 @@ ARTIFACT_PATHS = {
 async def log_artifact(
     task_id: str,
     filename: str,
-    content: str,
+    content: Union[str, Dict[str, Any], List[Any]],
     artifact_type: str,
     project_root: Optional[str] = None,
     description: Optional[str] = None,
@@ -66,8 +67,12 @@ async def log_artifact(
         The current task ID
     filename : str
         Name for the artifact file
-    content : str
-        The artifact content to store
+    content : str or dict or list
+        The artifact content to store. A ``dict`` or ``list`` is
+        serialized to a pretty-printed JSON string before being written;
+        a ``str`` is stored verbatim. Accepting structured input lets
+        agents log parsed JSON (e.g. ``tsconfig.json``) directly without
+        pre-stringifying it (issue #595 Fix 1).
     artifact_type : str
         Type of artifact (determines default location)
     project_root : Optional[str], optional
@@ -98,6 +103,13 @@ async def log_artifact(
         Dict with artifact location and storage details
     """
     try:
+        # Issue #595 Fix 1: agents (and the generated MCP schema) may pass
+        # structured JSON — e.g. a parsed tsconfig.json — as ``content``.
+        # Serialize any dict/list to a JSON string up front, before the
+        # size guard and file write, both of which require text.
+        if isinstance(content, (dict, list)):
+            content = json.dumps(content, indent=2)
+
         # Validate project_root is provided
         if not project_root:
             return {
@@ -279,6 +291,28 @@ async def log_artifact(
             artifact_entry["artifact_role"] = artifact_role
 
         state.task_artifacts[task_id].append(artifact_entry)
+
+        # v0.3.8.post1: invalidate the foundation-contract cache when an
+        # artifact is logged to a foundation task. Without this, agents
+        # would see a stale (up to TTL-seconds) foundation contract that
+        # is missing the just-logged artifact.
+        try:
+            task = next(
+                (t for t in (state.project_tasks or []) if t.id == task_id),
+                None,
+            )
+            if (
+                task is not None
+                and getattr(task, "source_type", None) == "pre_fork_synthesis"
+            ):
+                from src.marcus_mcp.tools.context import (
+                    invalidate_foundation_contract_cache,
+                )
+
+                pid = getattr(state, "current_project_id", None)
+                invalidate_foundation_contract_cache(str(pid) if pid else None)
+        except Exception:  # noqa: BLE001 - never break log_artifact on cache miss
+            pass
 
         # Add a comment to the task if kanban is available
         if state.kanban_client and description:
