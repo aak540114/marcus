@@ -11,6 +11,7 @@ from src.config.marcus_config import get_config
 from src.integrations.kanban_interface import KanbanInterface, KanbanProvider
 from src.integrations.providers import (
     GitHubKanban,
+    KanboardKanban,
     LinearKanban,
     Planka,
     SQLiteKanban,
@@ -109,6 +110,28 @@ class KanbanFactory:
                     ),
                 }
             return SQLiteKanban(config)
+
+        elif provider_lower == KanbanProvider.KANBOARD.value:
+            if not config:
+                config = {
+                    "kanboard_url": (
+                        getattr(marcus_config.kanban, "kanboard_url", None)
+                        or os.getenv(
+                            "KANBOARD_URL", "http://localhost:8080/jsonrpc.php"
+                        )
+                    ),
+                    "kanboard_api_token": (
+                        getattr(marcus_config.kanban, "kanboard_api_token", None)
+                        or os.getenv("KANBOARD_API_TOKEN", "")
+                    ),
+                    "kanboard_project_id": int(
+                        str(
+                            getattr(marcus_config.kanban, "kanboard_project_id", None)
+                            or os.getenv("KANBOARD_PROJECT_ID", "1")
+                        )
+                    ),
+                }
+            return KanboardKanban(config)
 
         else:
             raise ValueError(f"Unsupported kanban provider: {provider}")
