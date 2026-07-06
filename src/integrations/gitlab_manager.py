@@ -319,7 +319,9 @@ async def _run_git(args: List[str], cwd: str) -> None:
     )
     stdout_bytes, stderr_bytes = await proc.communicate()
     if proc.returncode != 0:
+        # Redact any embedded credentials (http://user:TOKEN@host) before logging.
+        safe_args = [re.sub(r"://[^:@/]+:[^@]*@", "://***:***@", a) for a in args]
         raise RuntimeError(
-            f"git command failed: {' '.join(args)}\n"
+            f"git command failed: {' '.join(safe_args)}\n"
             f"stdout: {stdout_bytes.decode()}\nstderr: {stderr_bytes.decode()}"
         )

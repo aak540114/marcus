@@ -233,16 +233,18 @@ class KanboardKanban(KanbanInterface):
 
     async def get_available_tasks(self) -> List[Task]:
         """
-        Return unassigned tasks in a TODO column.
+        Return unassigned tasks in a TODO or READY column.
 
         Returns
         -------
         List[Task]
-            Unassigned TODO tasks an agent can claim.
+            Unassigned tasks in the TODO or READY column that an agent can claim.
         """
         all_tasks = await self.get_all_tasks()
         return [
-            t for t in all_tasks if t.status == TaskStatus.TODO and not t.assigned_to
+            t
+            for t in all_tasks
+            if t.status in (TaskStatus.TODO, TaskStatus.READY) and not t.assigned_to
         ]
 
     async def get_task_by_id(self, task_id: str) -> Optional[Task]:
@@ -809,7 +811,11 @@ class KanboardKanban(KanbanInterface):
         self._column_status_map = {}
         for col in columns or []:
             name = col.get("title", "")
-            cid = int(col.get("id", 0))
+            raw_id = col.get("id")
+            if raw_id is None:
+                logger.warning("Kanboard returned column with null id; skipping: %s", col)
+                continue
+            cid = int(raw_id)
             self._column_map[name.lower()] = cid
             self._column_status_map[cid] = _COLUMN_STATUS_MAP.get(
                 name.lower(), TaskStatus.TODO

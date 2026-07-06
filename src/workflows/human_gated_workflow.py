@@ -386,8 +386,14 @@ class HumanGatedWorkflow:
                     )
                 except (InvalidTransitionError, KeyError):
                     pass
-            self._lifecycle.set_merged(ticket_id, self._provider)
-            self._lifecycle.release_ticket(ticket_id, self._provider)
+            try:
+                self._lifecycle.set_merged(ticket_id, self._provider)
+            except KeyError:
+                pass
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+            except KeyError:
+                pass
 
             # Stop dev env if running.
             await self._dev_env.stop(ticket_id, self._provider)
