@@ -50,7 +50,7 @@ HumanGatedWorkflow
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
 from src.core.board_watcher import BoardWatcher
@@ -68,6 +68,22 @@ from src.core.ticket_lifecycle import (
 from src.integrations.kanban_interface import KanbanInterface
 
 logger = logging.getLogger(__name__)
+
+
+def _ticket_priority_key(record: TicketRecord) -> Tuple[int, int]:
+    """Sort key for selecting the next ticket in dependency order.
+
+    Tickets in ``READY`` state come before ``IN_PROGRESS`` (they haven't been
+    touched yet).  Within each group, tickets with a lower numeric ID are
+    assumed to have been created earlier and are more likely to be
+    prerequisites for later work — so they get priority.
+    """
+    state_order = 0 if record.state == TicketState.READY else 1
+    try:
+        numeric_id = int(record.ticket_id)
+    except ValueError:
+        numeric_id = abs(hash(record.ticket_id))
+    return (state_order, numeric_id)
 
 
 class HumanGatedWorkflow:
@@ -365,6 +381,9 @@ class HumanGatedWorkflow:
             )
             await self._post_comment(ticket_id, comment)
             logger.info("Ticket %s done and merged to %s", ticket_id, main_branch)
+
+            # Agent is now free — pick up the next ticket in dependency order.
+            await self._pickup_next_ticket()
         else:
             await self._post_error(
                 ticket_id,
@@ -610,7 +629,17 @@ class HumanGatedWorkflow:
             dev_env_url=dev_url,
             commit_count=len(commits),
         )
-        return await self._post_comment(ticket_id, comment)
+        posted = await self._post_comment(ticket_id, comment)
+
+        # Release the claim so this agent is free for other work, then pick
+        # up the next available ticket in dependency order.
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+        await self._pickup_next_ticket()
+
+        return posted
 
     async def set_waiting_for_human(
         self,
@@ -664,7 +693,16 @@ class HumanGatedWorkflow:
             human_comment="",
             ai_understanding=reason,
         )
-        return await self._post_comment(ticket_id, comment)
+        posted = await self._post_comment(ticket_id, comment)
+
+        # Release claim so agent can work on the next available ticket.
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+        await self._pickup_next_ticket()
+
+        return posted
 
     async def set_blocked(
         self,
@@ -711,6 +749,13 @@ class HumanGatedWorkflow:
             await self._kanban.move_task_to_column(ticket_id, "blocked")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update kanban column: %s", exc)
+
+        # Release claim so this agent can pick up the next available ticket.
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+        await self._pickup_next_ticket()
 
         return True
 
@@ -860,6 +905,18 @@ class HumanGatedWorkflow:
         record : TicketRecord
             Current lifecycle record.
         """
+        # One-ticket-per-agent: refuse if this agent is already working on
+        # a different ticket.
+        current_ticket = self._lifecycle.get_agent_ticket(self._agent_id)
+        if current_ticket is not None and current_ticket != ticket_id:
+            logger.info(
+                "Agent %s already working on ticket %s; skipping %s",
+                self._agent_id,
+                current_ticket,
+                ticket_id,
+            )
+            return
+
         # Atomically claim the ticket; abort if another agent already has it.
         claimed = self._lifecycle.claim_ticket(
             ticket_id, self._provider, self._agent_id
@@ -1001,6 +1058,34 @@ class HumanGatedWorkflow:
             )
             return items
         return [item.text for item in ac.items]
+
+    async def _pickup_next_ticket(self) -> None:
+        """After releasing the current ticket, start the next available one.
+
+        Called whenever this agent's ticket moves to ``WAITING_FOR_HUMAN``,
+        ``BLOCKED``, or ``DONE`` so the agent does not sit idle while other
+        work is ready.
+
+        Selection order (dependency approximation):
+
+        1. ``READY`` tickets before ``IN_PROGRESS`` ones.
+        2. Lower numeric ticket ID first (earlier-created tickets are more
+           likely to be prerequisites for later work).
+        """
+        candidates = self._lifecycle.get_available_tickets()
+        if not candidates:
+            logger.debug("Agent %s has no next ticket to pick up", self._agent_id)
+            return
+
+        candidates.sort(key=_ticket_priority_key)
+        next_rec = candidates[0]
+        logger.info(
+            "Agent %s picking up next ticket: %s (state=%s)",
+            self._agent_id,
+            next_rec.ticket_id,
+            next_rec.state.value,
+        )
+        await self._start_ai_work(next_rec.ticket_id, next_rec)
 
     def _is_unassigned(self, record: TicketRecord) -> bool:
         """Return ``True`` if no human is assigned to *record*.

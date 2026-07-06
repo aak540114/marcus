@@ -661,6 +661,49 @@ class TicketLifecycleManager:
             )
         return record
 
+    def get_agent_ticket(self, agent_id: str) -> Optional[str]:
+        """Return the ``ticket_id`` currently claimed by *agent_id*, or ``None``.
+
+        Scans all records for the first one whose ``ai_agent_id`` matches.
+        Returns ``None`` if the agent holds no claim.
+
+        Parameters
+        ----------
+        agent_id : str
+            The AI agent identifier to look up.
+
+        Returns
+        -------
+        Optional[str]
+            The ticket identifier, or ``None``.
+        """
+        for record in self._records.values():
+            if record.ai_agent_id == agent_id:
+                return record.ticket_id
+        return None
+
+    def get_available_tickets(self) -> List[TicketRecord]:
+        """Return tickets that are workable, human-assigned, and unclaimed by AI.
+
+        A ticket is *available* when:
+
+        * State is ``READY`` or ``IN_PROGRESS``.
+        * ``ai_agent_id`` is ``None`` (no AI holds a claim).
+        * ``assignee`` is set and non-empty (a human owner is present).
+
+        Returns
+        -------
+        List[TicketRecord]
+            All matching records (unsorted; caller decides ordering).
+        """
+        return [
+            r
+            for r in self._records.values()
+            if r.state in (TicketState.READY, TicketState.IN_PROGRESS)
+            and r.ai_agent_id is None
+            and r.assignee not in (None, "", "0")
+        ]
+
     def all_records(self) -> List[TicketRecord]:
         """Return all tracked ticket records."""
         return list(self._records.values())

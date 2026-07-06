@@ -10,6 +10,9 @@ Covers the human-gated AI workflow rules:
   - Humans cannot push a card to waiting_for_human (AI-only state).
   - The claim gate prevents two Marcus instances from double-starting.
   - get_work_context includes the already_claimed_by field.
+  - One ticket per AI agent: agent refuses a second ticket while first is active.
+  - When ticket → waiting_for_human / blocked / done, agent picks next ticket.
+  - Next ticket is selected in dependency order (READY first, lower ID first).
 
 All external dependencies (kanban, branch manager, dev env, AC generator)
 are mocked; no file I/O or network calls occur.
@@ -493,3 +496,239 @@ class TestIsUnassigned:
     def test_named_assignee_is_not_unassigned(self, workflow):
         """A real username is not treated as unassigned."""
         assert workflow._is_unassigned(self._make_record("alice")) is False
+
+
+# ---------------------------------------------------------------------------
+# One-ticket-per-agent constraint
+# ---------------------------------------------------------------------------
+
+
+class TestOneTicketPerAgent:
+    """An agent cannot hold two claims simultaneously."""
+
+    @pytest.mark.asyncio
+    async def test_agent_skips_second_ticket_while_first_is_active(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """If agent is already working on ticket A, it does not start on ticket B."""
+        # Set up ticket A: agent already claims it.
+        lifecycle.get_or_create("100", "kanboard")
+        lifecycle.transition("100", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("100", "kanboard", workflow._agent_id)
+        lifecycle.transition("100", "kanboard", TicketState.IN_PROGRESS)
+
+        # Ticket B is available.
+        lifecycle.get_or_create("101", "kanboard")
+        lifecycle.transition("101", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("101", "kanboard", "alice")
+
+        rec_b = lifecycle.get("101", "kanboard")
+        assert rec_b is not None
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/101",
+        ):
+            await workflow._start_ai_work("101", rec_b)
+
+        # Ticket B must NOT be claimed — agent already busy with ticket A.
+        rec_b2 = lifecycle.get("101", "kanboard")
+        assert rec_b2 is not None
+        assert rec_b2.ai_agent_id is None
+        # Ticket A still held.
+        assert lifecycle.get_agent_ticket(workflow._agent_id) == "100"
+
+    @pytest.mark.asyncio
+    async def test_agent_can_reclaim_its_own_current_ticket(
+        self, workflow, lifecycle, mock_branch, mock_kanban
+    ):
+        """_start_ai_work is idempotent on the ticket the agent already holds."""
+        lifecycle.get_or_create("102", "kanboard")
+        lifecycle.transition("102", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("102", "kanboard", "bob")
+
+        rec = lifecycle.get("102", "kanboard")
+        assert rec is not None
+        # Call twice — second call should not crash or double-create the branch.
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/102",
+        ):
+            await workflow._start_ai_work("102", rec)
+            rec2 = lifecycle.get("102", "kanboard")
+            assert rec2 is not None
+            await workflow._start_ai_work("102", rec2)
+
+        # Branch created once.
+        assert mock_branch.create_branch.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Auto-pickup: next ticket in dependency order
+# ---------------------------------------------------------------------------
+
+
+class TestPickupNextTicket:
+    """When a ticket is paused/done, the agent picks the next available one."""
+
+    def _setup_waiting_ticket(self, lifecycle, ticket_id: str, agent_id: str) -> None:
+        """Put a ticket into WAITING_FOR_HUMAN with an agent claim."""
+        lifecycle.get_or_create(ticket_id, "kanboard")
+        lifecycle.transition(ticket_id, "kanboard", TicketState.READY)
+        lifecycle.claim_ticket(ticket_id, "kanboard", agent_id)
+        lifecycle.transition(ticket_id, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition(ticket_id, "kanboard", TicketState.WAITING_FOR_HUMAN)
+
+    @pytest.mark.asyncio
+    async def test_pickup_after_signal_ready_for_review(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """After signal_ready_for_review, agent auto-picks next available ticket."""
+        # Ticket A: agent is finishing it.
+        self._setup_waiting_ticket(lifecycle, "110", workflow._agent_id)
+        # Release the claim (signal_ready_for_review does this internally).
+        lifecycle.release_ticket("110", "kanboard")
+
+        # Ticket B: ready, assigned, unclaimed.
+        lifecycle.get_or_create("111", "kanboard")
+        lifecycle.transition("111", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("111", "kanboard", "alice")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/111",
+        ):
+            await workflow._pickup_next_ticket()
+
+        rec_b = lifecycle.get("111", "kanboard")
+        assert rec_b is not None
+        assert rec_b.ai_agent_id == workflow._agent_id
+        assert rec_b.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_pickup_prefers_ready_over_in_progress(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """READY tickets are preferred over IN_PROGRESS when picking next."""
+        # Ticket A (in_progress, unclaimed, assigned).
+        lifecycle.get_or_create("120", "kanboard")
+        lifecycle.transition("120", "kanboard", TicketState.READY)
+        lifecycle.transition("120", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("120", "kanboard", "bob")
+
+        # Ticket B (ready, unclaimed, assigned) — should be preferred.
+        lifecycle.get_or_create("121", "kanboard")
+        lifecycle.transition("121", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("121", "kanboard", "carol")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await workflow._pickup_next_ticket()
+
+        # Ticket B (READY) should have been picked, not ticket A (IN_PROGRESS).
+        rec_b = lifecycle.get("121", "kanboard")
+        assert rec_b is not None
+        assert rec_b.ai_agent_id == workflow._agent_id
+
+        rec_a = lifecycle.get("120", "kanboard")
+        assert rec_a is not None
+        assert rec_a.ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_pickup_prefers_lower_ticket_id(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Within the same state, lower numeric ticket ID is picked first."""
+        for tid in ("200", "100", "150"):
+            lifecycle.get_or_create(tid, "kanboard")
+            lifecycle.transition(tid, "kanboard", TicketState.READY)
+            lifecycle.set_assignee(tid, "kanboard", "dave")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await workflow._pickup_next_ticket()
+
+        # Ticket 100 has the lowest ID → picked first.
+        rec = lifecycle.get("100", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id == workflow._agent_id
+
+    @pytest.mark.asyncio
+    async def test_no_available_tickets_does_nothing(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """_pickup_next_ticket does nothing when no tickets are available."""
+        # All tickets are either todo, done, or unassigned.
+        lifecycle.get_or_create("300", "kanboard")
+        lifecycle.get_or_create("301", "kanboard")
+
+        await workflow._pickup_next_ticket()
+
+        # No claims taken.
+        assert lifecycle.get_agent_ticket(workflow._agent_id) is None
+        mock_kanban.move_task_to_column.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# get_agent_ticket and get_available_tickets (lifecycle helpers)
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleAgentHelpers:
+    """Tests for the new lifecycle manager helpers used by pickup logic."""
+
+    def test_get_agent_ticket_returns_claimed_ticket(self, lifecycle):
+        """get_agent_ticket returns the ticket held by the given agent."""
+        lifecycle.get_or_create("400", "kanboard")
+        lifecycle.claim_ticket("400", "kanboard", "agent-q")
+        assert lifecycle.get_agent_ticket("agent-q") == "400"
+
+    def test_get_agent_ticket_returns_none_when_unclaimed(self, lifecycle):
+        """get_agent_ticket returns None when agent holds no claim."""
+        assert lifecycle.get_agent_ticket("agent-z") is None
+
+    def test_get_available_tickets_excludes_unassigned(self, lifecycle):
+        """Unassigned tickets are not returned as available."""
+        lifecycle.get_or_create("410", "kanboard")
+        lifecycle.transition("410", "kanboard", TicketState.READY)
+        # No assignee set.
+        assert lifecycle.get_available_tickets() == []
+
+    def test_get_available_tickets_excludes_claimed(self, lifecycle):
+        """Tickets with an AI claim are not returned as available."""
+        lifecycle.get_or_create("411", "kanboard")
+        lifecycle.transition("411", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("411", "kanboard", "alice")
+        lifecycle.claim_ticket("411", "kanboard", "agent-r")
+        assert lifecycle.get_available_tickets() == []
+
+    def test_get_available_tickets_excludes_todo_and_done(self, lifecycle):
+        """Tickets in TODO and DONE are not available."""
+        for tid in ("412", "413"):
+            lifecycle.get_or_create(tid, "kanboard")
+            lifecycle.set_assignee(tid, "kanboard", "bob")
+        # 412 stays in TODO, 413 goes to DONE via full chain.
+        lifecycle.transition("413", "kanboard", TicketState.READY)
+        lifecycle.transition("413", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("413", "kanboard", TicketState.DONE)
+        assert lifecycle.get_available_tickets() == []
+
+    def test_get_available_tickets_returns_ready_and_in_progress(
+        self, lifecycle
+    ):
+        """READY and IN_PROGRESS unclaimed assigned tickets are available."""
+        lifecycle.get_or_create("420", "kanboard")
+        lifecycle.transition("420", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("420", "kanboard", "carol")
+
+        lifecycle.get_or_create("421", "kanboard")
+        lifecycle.transition("421", "kanboard", TicketState.READY)
+        lifecycle.transition("421", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("421", "kanboard", "dave")
+
+        available = lifecycle.get_available_tickets()
+        ids = {r.ticket_id for r in available}
+        assert ids == {"420", "421"}
