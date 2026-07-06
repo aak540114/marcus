@@ -194,9 +194,9 @@ class HumanGatedWorkflow:
     async def _on_ticket_assigned(self, event: Any) -> None:
         """Handle a ticket being assigned to a human.
 
-        When a human takes ownership, AI must stand down: the claim is
-        released so the human can work unimpeded.  A human can re-assign
-        later or unassign to let AI resume.
+        The human assigning themselves is the signal for AI to start work.
+        If the ticket is already in a non-todo state (column has been moved
+        past ``todo``), AI claims the ticket and begins immediately.
         """
         data = event.data
         ticket_id = data["ticket_id"]
@@ -210,18 +210,18 @@ class HumanGatedWorkflow:
         except KeyError:
             pass
 
-        # Release any existing AI claim — human is taking over.
-        try:
-            self._lifecycle.release_ticket(ticket_id, self._provider)
-        except KeyError:
-            pass
+        # Re-fetch so record reflects the stored assignee before the check.
+        record = self._lifecycle.get(ticket_id, self._provider) or record
+
+        # If the kanban column is already past todo, start AI work now.
+        if record.state != TicketState.TODO:
+            await self._start_ai_work(ticket_id, record)
 
     async def _on_ticket_unassigned(self, event: Any) -> None:
-        """Handle a ticket becoming unassigned.
+        """Handle a ticket being unassigned by a human.
 
-        When the human removes their assignment the ticket is free for AI
-        to pick up.  If the ticket is in a workable state (``ready`` or
-        ``in_progress``) and no other AI agent has claimed it, AI starts.
+        Without a human owner, AI has no one to report to — the claim is
+        released and AI stops until a human re-assigns the ticket.
         """
         data = event.data
         ticket_id = data["ticket_id"]
@@ -235,20 +235,22 @@ class HumanGatedWorkflow:
         except KeyError:
             pass
 
-        # If the ticket is in a workable state, AI should start working.
-        if record.state in (TicketState.READY, TicketState.IN_PROGRESS):
-            await self._start_ai_work(ticket_id, record)
+        # Release the AI claim — no human owner means AI should not work.
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
 
     async def _on_status_changed(self, event: Any) -> None:
         """Handle a kanban status/column change.
 
         Triggers
         --------
-        * ``ready`` or ``in_progress``, ticket unassigned → AI starts.
-        * ``in_progress`` while WAITING_FOR_HUMAN → AI resumes (human
-          responded or moved card back).
+        * ``ready`` or ``in_progress``, ticket has a human owner → AI starts.
+        * ``in_progress`` while WAITING_FOR_HUMAN, has human owner → AI
+          resumes (human moved card back after reviewing).
         * ``waiting_for_human`` moved by human → rejected with a warning
-          (that state is AI-only).
+          (that state is AI-only; only AI may set it).
         * ``todo`` / ``blocked`` → update lifecycle state accordingly.
         * ``done`` is handled by the ``ticket.closed`` event; no action here.
         """
@@ -270,34 +272,27 @@ class HumanGatedWorkflow:
             return
 
         if new_status in (TaskStatus.READY.value, TaskStatus.IN_PROGRESS.value):
-            if self._is_unassigned(record):
-                # Ticket is unassigned → AI should pick it up.
-                if new_status == TaskStatus.IN_PROGRESS.value and record.state == TicketState.WAITING_FOR_HUMAN:
-                    # Human moved the card from waiting_for_human to in_progress.
+            if not self._is_unassigned(record):
+                # Ticket has a human owner → AI should work.
+                if (
+                    new_status == TaskStatus.IN_PROGRESS.value
+                    and record.state == TicketState.WAITING_FOR_HUMAN
+                ):
+                    # Human moved card from waiting_for_human → in_progress.
+                    # AI resumes work on the existing branch without re-claiming.
                     try:
-                        self._lifecycle.human_transition(
+                        self._lifecycle.transition(
                             ticket_id,
                             self._provider,
                             TicketState.IN_PROGRESS,
-                            reason="Human moved ticket back to in progress",
+                            reason="Human moved ticket back to in_progress; AI resuming",
                         )
-                    except (InvalidTransitionError, KeyError):
+                    except InvalidTransitionError:
                         pass
                 else:
+                    # Status changed to a workable state with a human owner → start.
                     await self._start_ai_work(ticket_id, record)
-            elif new_status == TaskStatus.IN_PROGRESS.value:
-                # Human-assigned ticket moved back to in_progress (e.g. from
-                # waiting_for_human by the human assignee).
-                if record.state == TicketState.WAITING_FOR_HUMAN:
-                    try:
-                        self._lifecycle.human_transition(
-                            ticket_id,
-                            self._provider,
-                            TicketState.IN_PROGRESS,
-                            reason="Human moved ticket back to in progress",
-                        )
-                    except (InvalidTransitionError, KeyError):
-                        pass
+            # else: no human owner → AI does not work on unassigned tickets.
 
         elif new_status == TaskStatus.TODO.value:
             # Human reset the ticket to todo.
@@ -1010,8 +1005,9 @@ class HumanGatedWorkflow:
     def _is_unassigned(self, record: TicketRecord) -> bool:
         """Return ``True`` if no human is assigned to *record*.
 
-        Treats ``None``, empty string, and ``"0"`` (Kanboard's sentinel
-        for "no owner") as unassigned.
+        Treats ``None``, empty string, and ``"0"`` (Kanboard's ``owner_id``
+        sentinel for "no owner") as unassigned.  AI only works when this
+        returns ``False`` — i.e., when a human has taken ownership.
 
         Parameters
         ----------
