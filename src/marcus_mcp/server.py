@@ -3455,6 +3455,101 @@ function save() {{
             response.headers["Access-Control-Allow-Origin"] = "*"
             return response
 
+        async def gate_setting_api(request: Request) -> JSONResponse:
+            """GET/PUT gate-mode settings for a project or ticket.
+
+            GET  /api/gate-setting?project_id=<id>[&ticket_id=<id>]
+                Returns:
+                  {
+                    "project_id": int,
+                    "ticket_id": str | null,
+                    "project_gate": "human" | "ai" | null,
+                    "ticket_gate":  "human" | "ai" | null,
+                    "effective":    "human" | "ai"
+                  }
+
+            PUT  /api/gate-setting/project
+                Body (JSON): {"project_id": int, "gate": "human"|"ai"}
+
+            PUT  /api/gate-setting/ticket
+                Body (JSON): {"ticket_id": str, "gate": "human"|"ai"|null}
+                  (null resets the ticket to inherit the project setting)
+            """
+            from src.core.gate_settings import GateSettingManager
+
+            gate_mgr = getattr(server, "_gate_mgr", None)
+            if gate_mgr is None:
+                gate_mgr = GateSettingManager()
+                server._gate_mgr = gate_mgr  # type: ignore[attr-defined]
+
+            path = request.url.path  # e.g. /api/gate-setting/project
+
+            if request.method == "PUT":
+                try:
+                    body = await request.json()
+                except Exception:
+                    r = JSONResponse({"error": "invalid JSON"}, status_code=400)
+                    r.headers["Access-Control-Allow-Origin"] = "*"
+                    return r
+
+                if path.endswith("/project"):
+                    pid = body.get("project_id")
+                    gate = body.get("gate")
+                    if not isinstance(pid, int) or gate not in ("human", "ai"):
+                        r = JSONResponse(
+                            {"error": "project_id (int) and gate ('human'|'ai') required"},
+                            status_code=400,
+                        )
+                        r.headers["Access-Control-Allow-Origin"] = "*"
+                        return r
+                    gate_mgr.set_project_gate(pid, gate)
+                    r = JSONResponse({"saved": True, "project_id": pid, "gate": gate})
+
+                elif path.endswith("/ticket"):
+                    tid = body.get("ticket_id")
+                    gate = body.get("gate")  # may be None to reset
+                    if not isinstance(tid, str) or (gate is not None and gate not in ("human", "ai")):
+                        r = JSONResponse(
+                            {"error": "ticket_id (str) and gate ('human'|'ai'|null) required"},
+                            status_code=400,
+                        )
+                        r.headers["Access-Control-Allow-Origin"] = "*"
+                        return r
+                    gate_mgr.set_ticket_gate(str(tid), gate)
+                    r = JSONResponse({"saved": True, "ticket_id": tid, "gate": gate})
+
+                else:
+                    r = JSONResponse({"error": "use /api/gate-setting/project or /ticket"}, status_code=404)
+
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                return r
+
+            # GET: return current settings + effective gate
+            pid_str = request.query_params.get("project_id", "")
+            tid_str = request.query_params.get("ticket_id", "") or None
+            try:
+                pid = int(pid_str) if pid_str else None
+            except ValueError:
+                pid = None
+
+            project_gate = gate_mgr.get_project_gate(pid) if pid is not None else None
+            ticket_gate = gate_mgr.get_ticket_gate(tid_str) if tid_str else None
+            effective = (
+                gate_mgr.get_effective_gate(tid_str, pid)
+                if pid is not None and tid_str
+                else (project_gate or "human")
+            )
+
+            r = JSONResponse({
+                "project_id": pid,
+                "ticket_id": tid_str,
+                "project_gate": project_gate,
+                "ticket_gate": ticket_gate,
+                "effective": effective,
+            })
+            r.headers["Access-Control-Allow-Origin"] = "*"
+            return r
+
         async def dev_env_stop(request: Request) -> JSONResponse:
             """Stop a running dev environment and tear down its Docker container.
 
@@ -3693,6 +3788,9 @@ function save() {{
                 Route("/api/ticket-links", ticket_links, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),
                 Route("/api/project-description", project_description_api, methods=["GET", "PUT"]),
+                Route("/api/gate-setting", gate_setting_api, methods=["GET"]),
+                Route("/api/gate-setting/project", gate_setting_api, methods=["PUT"]),
+                Route("/api/gate-setting/ticket", gate_setting_api, methods=["PUT"]),
                 Mount("/", app=mcp_app),
             ]
         )
