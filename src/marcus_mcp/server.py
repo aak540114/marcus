@@ -3357,12 +3357,125 @@ if __name__ == "__main__":
             response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
             return response
 
+        async def ticket_links(request: Request) -> JSONResponse:
+            """Return dependency links for a Kanboard ticket.
+
+            Calls Kanboard's ``getTaskLinks`` JSON-RPC method and splits the
+            result into two groups so the MarcusDevEnv sidebar can display
+            them without any client-side credential handling.
+
+            Query params
+            ------------
+            ticket_id : str  (required)
+                Kanboard task ID.
+
+            Response body
+            -------------
+            {
+                "ticket_id": "<str>",
+                "depends_on": [
+                    {"task_id": "<str>", "title": "<str>", "column": "<str>"}
+                ],
+                "blocks": [
+                    {"task_id": "<str>", "title": "<str>", "column": "<str>"}
+                ],
+                "relates_to": [
+                    {"task_id": "<str>", "title": "<str>", "column": "<str>"}
+                ]
+            }
+
+            Returns an empty result (all lists empty) when the ticket has no
+            links or when Kanboard credentials are not configured.
+            """
+            import os
+
+            import httpx as _httpx
+
+            ticket_id = request.query_params.get("ticket_id", "").strip()
+            if not ticket_id:
+                response = JSONResponse(
+                    {"error": "ticket_id query parameter is required"},
+                    status_code=400,
+                )
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            kb_url = os.getenv(
+                "KANBOARD_URL", "http://localhost:8080/jsonrpc.php"
+            )
+            if not kb_url.endswith("/jsonrpc.php"):
+                kb_url = kb_url.rstrip("/") + "/jsonrpc.php"
+            kb_token = os.getenv("KANBOARD_API_TOKEN", "")
+
+            empty = {"ticket_id": ticket_id, "depends_on": [], "blocks": [], "relates_to": []}
+
+            if not kb_token:
+                response = JSONResponse(empty)
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            try:
+                async with _httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        kb_url,
+                        json={
+                            "jsonrpc": "2.0",
+                            "method": "getTaskLinks",
+                            "id": 1,
+                            "params": {"task_id": int(ticket_id)},
+                        },
+                        auth=_httpx.BasicAuth("jsonrpc", kb_token),
+                    )
+                    resp.raise_for_status()
+                    raw_links = resp.json().get("result") or []
+            except Exception as exc:
+                logger.warning("ticket_links: Kanboard call failed: %s", exc)
+                response = JSONResponse(empty)
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            # Kanboard link labels (lower-case) → dependency direction.
+            # "is blocked by" means this ticket depends on the other one.
+            # "blocks"        means this ticket is a prerequisite for others.
+            depends_labels = {"is blocked by", "is a child of", "depends on"}
+            blocks_labels  = {"blocks", "is a parent of"}
+
+            depends_on: list = []
+            blocks: list = []
+            relates_to: list = []
+
+            for link in raw_links:
+                label = (link.get("label") or "").lower().strip()
+                entry = {
+                    "task_id": str(link.get("opposite_task_id", "")),
+                    "title":   link.get("title", ""),
+                    "column":  link.get("column_title", ""),
+                }
+                if label in depends_labels:
+                    depends_on.append(entry)
+                elif label in blocks_labels:
+                    blocks.append(entry)
+                else:
+                    relates_to.append(entry)
+
+            payload = {
+                "ticket_id":  ticket_id,
+                "depends_on": depends_on,
+                "blocks":     blocks,
+                "relates_to": relates_to,
+            }
+            response = JSONResponse(payload)
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            return response
+
         mcp_app = fastmcp.streamable_http_app()
         app = Starlette(
             routes=[
                 Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
                 Route("/api/active-agents", active_agents, methods=["GET"]),
+                Route("/api/ticket-links", ticket_links, methods=["GET"]),
                 Mount("/", app=mcp_app),
             ]
         )
@@ -3370,6 +3483,7 @@ if __name__ == "__main__":
         print(f"[I] Webhook URL:    http://{host}:{port}/webhooks/kanboard")
         print(f"[I] Dev-env view:   http://{host}:{port}/dev-env/view?ticket_id=<id>")
         print(f"[I] Active agents:  http://{host}:{port}/api/active-agents")
+        print(f"[I] Ticket links:   http://{host}:{port}/api/ticket-links?ticket_id=<id>")
         print(
             "[I] Kanboard webhook setup: Settings → Integrations → Webhook URL"
             f"\n              → http://host.docker.internal:{port}/webhooks/kanboard"
