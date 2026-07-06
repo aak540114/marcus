@@ -63,76 +63,91 @@ _DEFAULT_IDLE_TIMEOUT = 4 * 3600  # 4 hours
 #: the start command handles hot-reload itself.  All stacks expose the app on
 #: container port **3000**; the host port is allocated by PortAllocator.
 STACK_CONFIGS: Dict[str, Dict[str, Any]] = {
+    # ── JavaScript / TypeScript ──────────────────────────────────────────
+    # native_reload=True: Vite/webpack push module diffs over a WebSocket
+    # without restarting the process.  Killing the process on every save
+    # (inotifywait) would drop the WebSocket and degrade to full-page
+    # reloads, defeating the purpose of the dev server.
     "nodejs": {
-        "image": "node:lts-alpine",
+        "image": "node:lts-alpine",   # ~180 MB; already the fastest Node image
         "setup": "npm install",
         "start": "npm run dev -- --port 3000",
-        "native_reload": True,  # Vite / webpack HMR
+        "native_reload": True,
     },
+    # ── Python (interpreted — inotifywait restart is safe and uniform) ───
+    # No --reload flags so there is only one file-watcher in play.
     "python-fastapi": {
-        "image": "python:3.12-slim",
-        "setup": "pip install -r requirements.txt",
-        "start": "uvicorn main:app --reload --host 0.0.0.0 --port 3000",
-        "native_reload": True,  # uvicorn --reload
+        "image": "python:3.12-alpine",  # ~60 MB vs 130 MB for slim
+        "setup": "pip install --no-cache-dir -r requirements.txt",
+        "start": "uvicorn main:app --host 0.0.0.0 --port 3000",
+        "native_reload": False,
     },
     "python-flask": {
-        "image": "python:3.12-slim",
-        "setup": "pip install -r requirements.txt",
+        "image": "python:3.12-alpine",
+        "setup": "pip install --no-cache-dir -r requirements.txt",
         "start": "flask run --host 0.0.0.0 --port 3000",
-        "native_reload": True,  # FLASK_DEBUG=1 enables auto-reload
-        "env": {"FLASK_DEBUG": "1", "FLASK_APP": "app.py"},
+        "native_reload": False,
+        "env": {"FLASK_APP": "app.py"},
     },
     "python-django": {
-        "image": "python:3.12-slim",
-        "setup": "pip install -r requirements.txt",
-        "start": "python manage.py runserver 0.0.0.0:3000",
-        "native_reload": True,  # Django runserver auto-reloads
+        "image": "python:3.12-alpine",
+        "setup": "pip install --no-cache-dir -r requirements.txt",
+        "start": "python manage.py runserver 0.0.0.0:3000 --noreload",
+        "native_reload": False,  # --noreload so only inotifywait restarts
     },
     "python": {
-        "image": "python:3.12-slim",
-        "setup": "pip install -r requirements.txt 2>/dev/null || true",
+        "image": "python:3.12-alpine",
+        "setup": "pip install --no-cache-dir -r requirements.txt 2>/dev/null || true",
         "start": "python -m http.server 3000",
-        "native_reload": False,  # wrapped with inotifywait
+        "native_reload": False,
     },
+    # ── Rust ─────────────────────────────────────────────────────────────
+    # cargo-watch manages incremental compilation internally; killing it
+    # mid-compile with inotifywait would abort builds.
     "rust": {
-        "image": "rust:latest",
+        "image": "rust:alpine",   # ~600 MB vs 1.5 GB for rust:latest
         "setup": "cargo install cargo-watch",
         "start": "cargo watch -x run",
-        "native_reload": True,  # cargo-watch
+        "native_reload": True,
     },
+    # ── Go ───────────────────────────────────────────────────────────────
+    # air manages its own build/restart loop; same reasoning as Rust.
     "go": {
-        "image": "golang:latest",
+        "image": "golang:alpine",  # ~260 MB vs 800 MB for golang:latest
         "setup": "go install github.com/air-verse/air@latest",
         "start": "$(go env GOPATH)/bin/air",
-        "native_reload": True,  # air
+        "native_reload": True,
     },
+    # ── Ruby, Java, PHP, static (interpreted / no meaningful HMR state) ──
     "ruby": {
-        "image": "ruby:latest",
-        "setup": "gem install rerun && bundle install 2>/dev/null || true",
-        "start": "rerun --pattern '**/*.rb' -- bundle exec ruby app.rb -p 3000",
-        "native_reload": True,  # rerun wraps restart
+        "image": "ruby:3.3-alpine",  # ~80 MB vs 900 MB for ruby:latest
+        "setup": "bundle install 2>/dev/null || true",
+        "start": "bundle exec ruby app.rb -p 3000 2>/dev/null || ruby app.rb -p 3000",
+        "native_reload": False,
     },
     "java": {
-        "image": "maven:latest",
-        "setup": "mvn dependency:resolve -q 2>/dev/null || true",
-        "start": "mvn spring-boot:run -Dspring-boot.run.jvmArguments='-Dserver.port=3000'",
+        "image": "eclipse-temurin:21-jdk-alpine",  # ~340 MB vs 500 MB+ for maven:latest
+        "setup": "mvn dependency:resolve -q 2>/dev/null || gradle dependencies -q 2>/dev/null || true",
+        "start": "mvn spring-boot:run -Dspring-boot.run.jvmArguments='-Dserver.port=3000' 2>/dev/null || gradle bootRun",
         "native_reload": False,
     },
     "php": {
-        "image": "php:cli",
+        "image": "php:8.3-alpine",  # ~30 MB
         "setup": "composer install 2>/dev/null || true",
         "start": "php -S 0.0.0.0:3000",
-        "native_reload": False,  # wrapped with inotifywait
+        "native_reload": False,
     },
     "static": {
-        "image": "python:3.12-slim",
+        "image": "python:3.12-alpine",  # ~60 MB
         "setup": "",
         "start": "python -m http.server 3000",
         "native_reload": False,
     },
 }
 
-#: Shell snippet that installs inotify-tools on Alpine or Debian-family images.
+#: Installs inotify-tools on Alpine images (all non-Node/Rust/Go stacks).
+#: Alpine's apk is consistently present; the apt-get fallback covers any
+#: Debian-based custom images.
 _INOTIFY_INSTALL = (
     "apk add --no-cache inotify-tools 2>/dev/null || "
     "apt-get install -y --no-install-recommends inotify-tools 2>/dev/null || "

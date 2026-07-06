@@ -291,11 +291,12 @@ class TestBuildEntrypoint:
         assert "npm run dev" in cmd
         assert "inotifywait" not in cmd
 
-    def test_python_fastapi_uses_uvicorn_reload(self) -> None:
+    def test_python_fastapi_uses_uvicorn_inotifywait(self) -> None:
+        """python-fastapi uses inotifywait (no --reload flag to avoid double-watcher)."""
         cmd = self._mgr()._build_entrypoint("ticket/k/2", "python-fastapi")
         assert "uvicorn" in cmd
-        assert "--reload" in cmd
-        assert "inotifywait" not in cmd
+        assert "--reload" not in cmd
+        assert "inotifywait" in cmd
 
     def test_static_uses_inotifywait_wrapper(self) -> None:
         cmd = self._mgr()._build_entrypoint("ticket/k/3", "static")
