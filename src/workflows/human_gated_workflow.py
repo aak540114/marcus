@@ -57,6 +57,7 @@ from src.core.board_watcher import BoardWatcher
 from src.core.comment_protocol import CommentFormatter, CommentParser
 from src.core.dev_environment import DevEnvironmentManager
 from src.core.events import Events
+from src.core.gate_settings import GateMode, GateSettingManager
 from src.core.git_branch_manager import BranchManager
 from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
@@ -119,6 +120,7 @@ class HumanGatedWorkflow:
         branch_manager: Optional[BranchManager] = None,
         dev_env_manager: Optional[DevEnvironmentManager] = None,
         ac_generator: Optional[ACGenerator] = None,
+        gate_settings: Optional[GateSettingManager] = None,
         poll_interval: float = 30.0,
     ) -> None:
         """Initialise the workflow."""
@@ -129,6 +131,7 @@ class HumanGatedWorkflow:
         self._branch = branch_manager or BranchManager()
         self._dev_env = dev_env_manager or DevEnvironmentManager()
         self._ac_gen = ac_generator or ACGenerator()
+        self._gate = gate_settings or GateSettingManager()
         self._project_sync = project_sync  # Optional ProjectSyncWorkflow
         self._watcher = BoardWatcher(
             kanban=kanban,
@@ -604,12 +607,16 @@ class HumanGatedWorkflow:
         return await self._post_comment(ticket_id, comment)
 
     async def signal_ready_for_review(self, ticket_id: str) -> bool:
-        """Signal that the AI agent is done and awaiting human acceptance.
+        """Signal that the AI agent is done.
 
-        Transitions the ticket to ``WAITING_FOR_HUMAN``, moves the kanban
-        column to ``waiting for human``, and posts a "Ready for Review"
-        comment asking the human to review the work and mark the ticket
-        ``done`` when satisfied.
+        **Human gate (default)**: transitions to ``WAITING_FOR_HUMAN``, moves
+        the kanban card to ``waiting for human``, and posts a review comment
+        asking the human to approve and mark the ticket ``done``.
+
+        **AI gate**: skips the human review step entirely.  The branch is
+        merged to main automatically, the kanban card moves to ``done``, and
+        a completion comment is posted — identical to what happens when a
+        human marks the ticket done in human-gate mode.
 
         Parameters
         ----------
@@ -625,6 +632,12 @@ class HumanGatedWorkflow:
         if record is None:
             return False
 
+        gate = await self._get_effective_gate(ticket_id)
+
+        if gate == "ai":
+            return await self._autocomplete_ticket(ticket_id, record)
+
+        # ── Human gate: wait for human review ──────────────────────────
         try:
             self._lifecycle.transition(
                 ticket_id,
@@ -638,7 +651,6 @@ class HumanGatedWorkflow:
             )
             return False
 
-        # Move the kanban card to "waiting for human".
         try:
             await self._kanban.move_task_to_column(ticket_id, "waiting for human")
         except Exception as exc:  # noqa: BLE001
@@ -658,8 +670,6 @@ class HumanGatedWorkflow:
         )
         posted = await self._post_comment(ticket_id, comment)
 
-        # Release the claim so this agent is free for other work, then pick
-        # up the next available ticket in dependency order.
         try:
             self._lifecycle.release_ticket(ticket_id, self._provider)
         except KeyError:
@@ -675,10 +685,13 @@ class HumanGatedWorkflow:
     ) -> bool:
         """Signal that the AI needs external human input.
 
-        Transitions to ``WAITING_FOR_HUMAN`` and moves the kanban card to
-        the ``waiting for human`` column.  Use this when the AI is blocked
-        by something outside its control (e.g. missing credentials, unclear
-        requirement) rather than having finished the work.
+        **Human gate (default)**: transitions to ``WAITING_FOR_HUMAN`` and
+        moves the kanban card to ``waiting for human``.
+
+        **AI gate**: the ticket stays ``in progress``.  A note is posted on
+        the ticket so the human can see what the AI asked, but no blocking
+        state change occurs — the AI tool call returns success so the agent
+        can continue with its best guess.
 
         Parameters
         ----------
@@ -699,6 +712,24 @@ class HumanGatedWorkflow:
         if record.state != TicketState.IN_PROGRESS:
             return False
 
+        gate = await self._get_effective_gate(ticket_id)
+
+        if gate == "ai":
+            # AI gate: acknowledge but don't block — post a note and continue.
+            note = (
+                f"🤖 **AI gate active** — AI had a question but is continuing "
+                f"autonomously.\n\n> {reason}\n\n"
+                "If you want AI to pause for your input on this ticket, "
+                "switch it to **Human Gate** in the sidebar."
+            )
+            logger.info(
+                "AI gate: ticket %s asked for human input but will continue (%s)",
+                ticket_id,
+                reason,
+            )
+            return await self._post_comment(ticket_id, note)
+
+        # ── Human gate: block until human responds ─────────────────────
         try:
             self._lifecycle.transition(
                 ticket_id,
@@ -722,7 +753,6 @@ class HumanGatedWorkflow:
         )
         posted = await self._post_comment(ticket_id, comment)
 
-        # Release claim so agent can work on the next available ticket.
         try:
             self._lifecycle.release_ticket(ticket_id, self._provider)
         except KeyError:
@@ -896,13 +926,26 @@ class HumanGatedWorkflow:
             "assignee": record.assignee,
             "already_claimed_by": record.ai_agent_id,
             "mcp_server_url": "http://localhost:4298/mcp",
+            "gate_mode": (
+                self._gate.get_effective_gate(ticket_id, kanboard_project_id)
+                if kanboard_project_id is not None
+                else "human"
+            ),
             "instructions": (
                 "1. cd into local_repo_path\n"
                 "2. git checkout branch_name\n"
                 "3. Read the description and acceptance_criteria\n"
                 "4. Implement the work; commit and push to the branch\n"
-                "5. Call signal_ready_for_review when done, "
-                "or signal_waiting_for_human / signal_blocked if stuck"
+                "5. Call signal_ready_for_review when done"
+                + (
+                    " — NOTE: gate_mode is 'ai', so this will auto-merge and "
+                    "complete without human review."
+                    if (
+                        kanboard_project_id is not None
+                        and self._gate.get_effective_gate(ticket_id, kanboard_project_id) == "ai"
+                    )
+                    else ", or signal_waiting_for_human / signal_blocked if stuck"
+                )
             ),
         }
 
@@ -1136,6 +1179,125 @@ class HumanGatedWorkflow:
             ``True`` if the ticket has no human assignee.
         """
         return record.assignee in (None, "", "0")
+
+    async def _autocomplete_ticket(
+        self,
+        ticket_id: str,
+        record: TicketRecord,
+    ) -> bool:
+        """Merge and complete a ticket without waiting for human review.
+
+        Used by :meth:`signal_ready_for_review` when the effective gate is
+        ``"ai"``.  Replicates the merge + DONE transition that normally
+        happens in :meth:`_on_ticket_closed` when a human marks the card done.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        record : TicketRecord
+            Current lifecycle record (for branch name / AC).
+
+        Returns
+        -------
+        bool
+            ``True`` on success.
+        """
+        branch_name = record.branch_name
+        main_branch = self._branch.config.main_branch
+
+        merge_msg = (
+            f"merge: ticket/{self._provider}/{ticket_id} (auto-completed, AI gate)"
+        )
+        merged = await self._branch.merge_to_main(branch_name, commit_message=merge_msg)
+
+        if not merged:
+            await self._post_error(
+                ticket_id,
+                f"Auto-merge of `{branch_name}` to `{main_branch}` failed — "
+                "there may be conflicts.  Please merge manually or rebase the branch.",
+            )
+            return False
+
+        try:
+            self._lifecycle.transition(
+                ticket_id,
+                self._provider,
+                TicketState.DONE,
+                reason="AI gate: auto-completed after AI signalled ready",
+            )
+        except InvalidTransitionError:
+            try:
+                self._lifecycle.human_transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.DONE,
+                    reason="AI gate: forced DONE after auto-merge",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
+
+        try:
+            self._lifecycle.set_merged(ticket_id, self._provider)
+        except KeyError:
+            pass
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+
+        await self._dev_env.stop(ticket_id, self._provider)
+
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "done")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not move ticket %s to done: %s", ticket_id, exc)
+
+        comment = CommentFormatter.merged(
+            ticket_id=ticket_id,
+            branch_name=branch_name,
+            main_branch=main_branch,
+        )
+        await self._post_comment(ticket_id, comment)
+        logger.info(
+            "AI gate: ticket %s auto-completed and merged to %s", ticket_id, main_branch
+        )
+
+        await self._pickup_next_ticket()
+        return True
+
+    async def _get_effective_gate(self, ticket_id: str) -> GateMode:
+        """Resolve the effective gate mode for a ticket.
+
+        Fetches the kanboard task to discover its project ID, then calls
+        ``GateSettingManager.get_effective_gate``.  On any error the safe
+        default ``"human"`` is returned.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        GateMode
+            ``"human"`` or ``"ai"``.
+        """
+        project_id: Optional[int] = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                src_ctx = task.source_context or {}
+                raw = src_ctx.get("kanboard_task", {})
+                pid_raw = raw.get("project_id")
+                if pid_raw:
+                    project_id = int(pid_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not fetch project_id for gate check on %s: %s", ticket_id, exc)
+
+        if project_id is None:
+            return "human"
+        return self._gate.get_effective_gate(ticket_id, project_id)
 
     async def _check_project_stack(self, ticket_id: str) -> None:
         """Verify the project description has enough stack info to start work.

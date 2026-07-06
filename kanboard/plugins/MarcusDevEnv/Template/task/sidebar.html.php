@@ -8,7 +8,11 @@
  *   /dev-env/stop and immediately tears down the Docker container without
  *   waiting for the ticket to be closed.
  *
- * Section 2 — "Dependencies" panel
+ * Section 2 — Gate Mode panel
+ *   Per-ticket Human Gate / AI Gate toggle.  Shows the project-level default
+ *   and lets the human override it for this ticket only.
+ *
+ * Section 3 — "Dependencies" panel
  *   Shows which tickets this one depends on ("is blocked by") and which
  *   tickets depend on this one ("blocks"), fetched live from Marcus's
  *   /api/ticket-links endpoint.
@@ -17,19 +21,18 @@
  *   $task  — associative array with at least 'id' and 'project_id'
  */
 
-$marcusUrl = getenv('MARCUS_URL') ?: 'http://localhost:4298';
-$ticketId  = $task['id'] ?? '';
-$provider  = 'kanboard';
+$marcusUrl  = getenv('MARCUS_URL') ?: 'http://localhost:4298';
+$ticketId   = $task['id'] ?? '';
+$provider   = 'kanboard';
+$projectId  = $task['project_id'] ?? '';
 
-$projectId = $task['project_id'] ?? '';
-
-$viewUrl   = $marcusUrl
+$viewUrl = $marcusUrl
     . '/dev-env/view'
     . '?ticket_id='  . urlencode((string) $ticketId)
     . '&provider='   . urlencode($provider)
     . '&project_id=' . urlencode((string) $projectId);
 
-$stopUrl   = $marcusUrl
+$stopUrl = $marcusUrl
     . '/dev-env/stop'
     . '?ticket_id=' . urlencode((string) $ticketId)
     . '&provider='  . urlencode($provider);
@@ -39,29 +42,117 @@ $statusUrl = $marcusUrl
     . '?ticket_id=' . urlencode((string) $ticketId)
     . '&provider='  . urlencode($provider);
 
-$linksUrl  = $marcusUrl
+$linksUrl = $marcusUrl
     . '/api/ticket-links'
     . '?ticket_id=' . urlencode((string) $ticketId);
+
+$gateApiBase = $marcusUrl . '/api/gate-setting';
 ?>
 
 <!-- ── Section 1: Dev environment ─────────────────────────────────── -->
 <style>
 #marcus-dev-env-panel .btn { display:block; text-align:center; padding:6px 12px; margin-top:4px; }
 #marcus-dev-env-status-msg { font-size:11px; color:#888; margin-top:4px; }
+
+/* ── Gate toggle (sidebar) ──────────────────────────────────────── */
+.m-gate-section { margin-top: 4px; }
+.m-gate-desc {
+    font-size: 11px;
+    color: #888;
+    margin-bottom: 6px;
+    line-height: 1.4;
+}
+.m-gate-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+.m-gate-row-label {
+    font-size: 10px;
+    font-weight: 700;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    min-width: 52px;
+}
+.m-gate-pills {
+    display: inline-flex;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid #d1d5db;
+    background: #f9fafb;
+}
+.m-gate-pills button {
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+    background: transparent;
+    color: #6b7280;
+    transition: background 0.12s, color 0.12s;
+    white-space: nowrap;
+}
+.m-gate-pills button.on-human { background:#dbeafe; color:#1d4ed8; }
+.m-gate-pills button.on-ai    { background:#f3e8ff; color:#7c3aed; }
+.m-gate-pills button.on-inherit { background:#ecfdf5; color:#065f46; }
+.m-gate-pills button:disabled { opacity:.5; cursor:default; }
+.m-gate-eff {
+    font-size: 11px;
+    color: #6b7280;
+    padding: 2px 0 0;
+}
+.m-gate-saving { font-size:10px; color:#9ca3af; display:none; }
 </style>
 
 <div class="sidebar-collapse">
     <h2 class="sidebar-title"><?= t('Marcus Dev Environment') ?></h2>
     <ul>
         <li id="marcus-dev-env-panel">
-            <!-- Populated by JS below based on /api/dev-env/status -->
             <span style="font-size:12px;color:#aaa;">Checking status&hellip;</span>
         </li>
     </ul>
     <p id="marcus-dev-env-status-msg"></p>
 </div>
 
-<!-- ── Section 2: Dependencies ────────────────────────────────────── -->
+<!-- ── Section 2: Gate mode ───────────────────────────────────────── -->
+<div class="sidebar-collapse">
+    <h2 class="sidebar-title"><?= t('Marcus Gate Mode') ?></h2>
+    <div class="m-gate-section">
+        <p class="m-gate-desc">
+            <strong>Human Gate</strong>: AI pauses for human review before marking done.<br>
+            <strong>AI Gate</strong>: AI works autonomously from ready to done.
+        </p>
+
+        <!-- Project-level row (read-only indicator) -->
+        <div class="m-gate-row">
+            <span class="m-gate-row-label">Project</span>
+            <div class="m-gate-pills" id="marcus-pg-pills">
+                <button id="pgBtn-human" disabled>&#128100; Human</button>
+                <button id="pgBtn-ai"    disabled>&#129302; AI</button>
+            </div>
+        </div>
+
+        <!-- Per-ticket row (editable) -->
+        <div class="m-gate-row">
+            <span class="m-gate-row-label">This ticket</span>
+            <div class="m-gate-pills" id="marcus-tg-pills">
+                <button id="tgBtn-inherit" onclick="setTicketGate(null)">&#10226; Inherit</button>
+                <button id="tgBtn-human"   onclick="setTicketGate('human')">&#128100; Human</button>
+                <button id="tgBtn-ai"      onclick="setTicketGate('ai')">&#129302; AI</button>
+            </div>
+            <span class="m-gate-saving" id="marcus-tg-saving">saving&hellip;</span>
+        </div>
+
+        <!-- Resolved effective gate -->
+        <div class="m-gate-eff">
+            Effective: <strong id="marcus-eff-gate">loading&hellip;</strong>
+        </div>
+    </div>
+</div>
+
+<!-- ── Section 3: Dependencies ────────────────────────────────────── -->
 <style>
 .marcus-deps { margin: 0; padding: 0; list-style: none; }
 .marcus-deps li {
@@ -80,7 +171,6 @@ $linksUrl  = $marcusUrl
     margin-right: 4px;
     vertical-align: middle;
 }
-.dep-badge-col { color: #666; font-size: 10px; }
 .marcus-deps-empty { color: #aaa; font-size: 12px; font-style: italic; }
 #marcus-deps-error { color: #b45309; font-size: 11px; }
 </style>
@@ -112,10 +202,13 @@ $linksUrl  = $marcusUrl
 <script>
 (function () {
     /* ── URLs injected from PHP ──────────────────────────────────── */
-    var VIEW_URL   = <?= json_encode($viewUrl) ?>;
-    var STOP_URL   = <?= json_encode($stopUrl) ?>;
-    var STATUS_URL = <?= json_encode($statusUrl) ?>;
-    var LINKS_URL  = <?= json_encode($linksUrl) ?>;
+    var VIEW_URL     = <?= json_encode($viewUrl) ?>;
+    var STOP_URL     = <?= json_encode($stopUrl) ?>;
+    var STATUS_URL   = <?= json_encode($statusUrl) ?>;
+    var LINKS_URL    = <?= json_encode($linksUrl) ?>;
+    var GATE_URL     = <?= json_encode($gateApiBase) ?>;
+    var TICKET_ID    = <?= json_encode((string) $ticketId) ?>;
+    var PROJECT_ID   = <?= json_encode((int) $projectId) ?>;
 
     /* ── Dev-environment panel ───────────────────────────────────── */
     var devPanel  = document.getElementById('marcus-dev-env-panel');
@@ -156,21 +249,82 @@ $linksUrl  = $marcusUrl
         });
     }
 
-    /* Poll status once on page load */
     fetch(STATUS_URL, { cache: 'no-store' })
         .then(function (r) { return r.json(); })
         .then(function (data) {
-            if (data.running && data.url) {
-                renderRunning(data.url);
-            } else {
-                renderStopped();
-            }
+            if (data.running && data.url) { renderRunning(data.url); }
+            else { renderStopped(); }
         })
         .catch(function () {
-            /* Marcus unreachable — show the start button anyway */
             renderStopped();
             setMsg('Marcus is unreachable. Start anyway to launch a new preview.');
         });
+
+    /* ── Gate mode panel ─────────────────────────────────────────── */
+    var saving  = document.getElementById('marcus-tg-saving');
+    var effEl   = document.getElementById('marcus-eff-gate');
+
+    // Apply visual state to project-level pill row (read-only indicator)
+    function applyProjectPills(gate) {
+        var h = document.getElementById('pgBtn-human');
+        var a = document.getElementById('pgBtn-ai');
+        h.className = gate === 'human' ? 'on-human' : '';
+        a.className = gate === 'ai'    ? 'on-ai'    : '';
+    }
+
+    // Apply visual state to ticket-level pill row
+    function applyTicketPills(ticketGate) {
+        var iBtn = document.getElementById('tgBtn-inherit');
+        var hBtn = document.getElementById('tgBtn-human');
+        var aBtn = document.getElementById('tgBtn-ai');
+        iBtn.className = ticketGate === null      ? 'on-inherit' : '';
+        hBtn.className = ticketGate === 'human'   ? 'on-human'   : '';
+        aBtn.className = ticketGate === 'ai'      ? 'on-ai'      : '';
+    }
+
+    function applyEffective(effective) {
+        var labels = { human: '👤 Human Gate', ai: '🤖 AI Gate' };
+        effEl.textContent = labels[effective] || effective;
+        effEl.style.color = effective === 'ai' ? '#7c3aed' : '#1d4ed8';
+    }
+
+    function loadGateSettings() {
+        var url = GATE_URL + '?project_id=' + PROJECT_ID + '&ticket_id=' + encodeURIComponent(TICKET_ID);
+        fetch(url, { cache: 'no-store' })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                applyProjectPills(data.project_gate || 'human');
+                applyTicketPills(data.ticket_gate);          // null = inheriting
+                applyEffective(data.effective || 'human');
+            })
+            .catch(function () {
+                applyProjectPills('human');
+                applyTicketPills(null);
+                applyEffective('human');
+            });
+    }
+
+    loadGateSettings();
+
+    // Called by button onclick handlers
+    window.setTicketGate = function (gate) {
+        saving.style.display = 'inline';
+        var btns = document.querySelectorAll('#marcus-tg-pills button');
+        btns.forEach(function (b) { b.disabled = true; });
+
+        fetch(GATE_URL + '/ticket', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ticket_id: TICKET_ID, gate: gate }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function () { loadGateSettings(); })
+        .catch(function () { /* visual state stays, user can retry */ })
+        .finally(function () {
+            btns.forEach(function (b) { b.disabled = false; });
+            saving.style.display = 'none';
+        });
+    };
 
     /* ── Dependencies panel ──────────────────────────────────────── */
     var loadingEl  = document.getElementById('marcus-deps-loading');
@@ -218,9 +372,9 @@ $linksUrl  = $marcusUrl
         .then(function (data) {
             loadingEl.style.display = 'none';
             contentEl.style.display = 'block';
-            renderList(onList,     data.depends_on, 'No dependencies');
-            renderList(blocksList,  data.blocks,    'Blocks nothing');
-            renderList(relList,     data.relates_to, 'No related tickets');
+            renderList(onList,      data.depends_on,  'No dependencies');
+            renderList(blocksList,  data.blocks,       'Blocks nothing');
+            renderList(relList,     data.relates_to,   'No related tickets');
         })
         .catch(function () {
             loadingEl.style.display = 'none';
