@@ -28,6 +28,10 @@ class Plugin extends Base
             'template:task:sidebar:information',
             'MarcusDevEnv:task/sidebar'
         );
+        $this->template->hook->attach(
+            'template:board:private:header',
+            'MarcusDevEnv:board/header'
+        );
     }
 
     /**

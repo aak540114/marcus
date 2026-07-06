@@ -3316,17 +3316,60 @@ if __name__ == "__main__":
                     status_code=500,
                 )
 
+        async def active_agents(request: Request) -> JSONResponse:
+            """Return all tickets currently claimed by an AI agent.
+
+            Used by the MarcusDevEnv Kanboard plugin to display a live
+            "active AI agents" count on the board view.
+
+            Response body
+            -------------
+            {
+                "active_agent_count": <int>,
+                "agents": [
+                    {
+                        "agent_id": "<str>",
+                        "ticket_id": "<str>",
+                        "provider": "<str>",
+                        "state": "<str>"
+                    },
+                    ...
+                ]
+            }
+            """
+            from src.core.ticket_lifecycle import TicketLifecycleManager
+
+            lm = TicketLifecycleManager()
+            active = [
+                {
+                    "agent_id": r.ai_agent_id,
+                    "ticket_id": r.ticket_id,
+                    "provider": r.provider,
+                    "state": r.state.value,
+                }
+                for r in lm.all_records()
+                if r.ai_agent_id is not None
+            ]
+            response = JSONResponse(
+                {"active_agent_count": len(active), "agents": active}
+            )
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            return response
+
         mcp_app = fastmcp.streamable_http_app()
         app = Starlette(
             routes=[
                 Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
+                Route("/api/active-agents", active_agents, methods=["GET"]),
                 Mount("/", app=mcp_app),
             ]
         )
 
         print(f"[I] Webhook URL:    http://{host}:{port}/webhooks/kanboard")
         print(f"[I] Dev-env view:   http://{host}:{port}/dev-env/view?ticket_id=<id>")
+        print(f"[I] Active agents:  http://{host}:{port}/api/active-agents")
         print(
             "[I] Kanboard webhook setup: Settings → Integrations → Webhook URL"
             f"\n              → http://host.docker.internal:{port}/webhooks/kanboard"
