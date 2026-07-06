@@ -187,6 +187,15 @@ on half-configured tickets.
 | `get_ticket_lifecycle_state` | Query current state + metadata |
 | `get_pending_tickets` | List tickets in a given state |
 | `start_ticket_dev_environment` | Spin up a hot-reload preview URL |
+| `get_ticket_dev_environment_url` | Get the URL of a running dev environment |
+
+### Marcus HTTP endpoints (Kanboard stack)
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/mcp` | GET/POST | MCP protocol — all AI agent tooling |
+| `/webhooks/kanboard` | POST | Receives Kanboard push webhooks; instant event delivery |
+| `/dev-env/view?ticket_id=<id>` | GET | Starts dev environment and redirects browser to hot-reload URL |
 
 ---
 
@@ -265,16 +274,7 @@ cd cato && pip install -e . && ./cato start
 # Open http://localhost:5173
 ```
 
-**Planka** — drag-and-drop kanban UI (requires Docker):
-
-```bash
-docker compose up -d
-# Edit config_marcus.json: set kanban.provider to "planka"
-./marcus start
-# Open http://localhost:3333  (login: demo@demo.demo / demo)
-```
-
-**Kanboard + GitLab** — fully self-hosted task management and git server for local macOS testing (see [Local Kanboard + GitLab setup](#local-kanboard--gitlab-setup) below).
+**Kanboard + GitLab** — fully self-hosted task management and git server with real-time push webhooks, per-ticket dev environments, and a "View Live Changes" button on every ticket. See [Local Kanboard + GitLab setup](#local-kanboard--gitlab-setup) below.
 
 ### Step 5: Your first project — Runner mode
 
@@ -422,9 +422,25 @@ docker compose logs -f gitlab | grep "GitLab is ready to serve"
 
 1. Log in at http://localhost:8080
 2. **Settings → API** — copy the API token
-3. Create a project (e.g. "My App")
-4. Add columns named exactly: `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
+3. **Settings → Integrations → Webhook URL** — paste this URL so Kanboard pushes changes to Marcus in real time instead of waiting for the next poll:
+   ```
+   http://host.docker.internal:4298/webhooks/kanboard
+   ```
+   *(Kanboard runs inside Docker; `host.docker.internal` is the hostname that reaches your Mac from inside a container.)*
+4. Create a project (e.g. "My App")
+5. Add columns named exactly: `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
    *(column names are case-insensitive in Marcus's mapping)*
+
+**Optional — "View Live Changes" button:**
+Install the MarcusDevEnv Kanboard plugin to add a sidebar button on every task that spins up a hot-reload dev environment with one click:
+
+```bash
+# Copy the plugin into the Kanboard container and restart
+docker compose cp kanboard-plugins/MarcusDevEnv marcus-kanboard:/var/www/app/plugins/
+docker compose restart kanboard
+```
+
+After restart, every task detail page shows a **View Live Changes** button. Clicking it calls Marcus's `/dev-env/view` endpoint, starts the dev environment for that ticket's branch, and redirects the browser to the hot-reload URL.
 
 ### First-time GitLab setup
 
@@ -441,6 +457,11 @@ export KANBOARD_API_TOKEN=<your-kanboard-token>
 export KANBOARD_PROJECT_ID=1
 export GITLAB_URL=http://localhost:8929
 export GITLAB_TOKEN=<your-gitlab-pat>
+export MARCUS_URL=http://localhost:4298       # used by the MarcusDevEnv plugin
+
+# Optional: validate that webhook POSTs come from your Kanboard
+# (set the same value in Kanboard → Settings → Integrations → Webhook Token)
+export KANBOARD_WEBHOOK_TOKEN=<shared-secret>
 ```
 
 Or set these in `config_marcus.json`:
@@ -470,26 +491,22 @@ Or set these in `config_marcus.json`:
 **Ticket → Branch → AI work:**
 1. Create a task in Kanboard and assign it to yourself
 2. Move the task to the `Ready` column
-3. Within ~30 s, Marcus detects both conditions (assignee + ready status)
+3. **Instantly** (webhook) or within ~30 s (poll fallback), Marcus detects both conditions
 4. Branch `ticket/kanboard/<task_id>` created and pushed to GitLab
 5. Kanboard column moves to `In Progress` automatically
-6. Marcus posts a "Started" comment on the task
+6. Marcus posts a "Started" comment with the branch name on the task
+
+**Viewing live changes (dev environment):**
+- Click the **View Live Changes** button in the task sidebar (requires MarcusDevEnv plugin), **or**
+- Open `http://localhost:4298/dev-env/view?ticket_id=<id>` directly in your browser
+- Marcus starts a hot-reload dev environment for that ticket's branch and redirects you to it
+- Each ticket gets its own port — you can test multiple tickets simultaneously
 
 **Review and merge:**
 7. AI signals completion → column moves to `Waiting for Human`
-8. Human reviews the branch in GitLab
+8. Human reviews the branch in GitLab and the live preview in the dev environment
 9. Human moves Kanboard card to `Done`
-10. Within ~30 s, Marcus merges the branch to `main` and posts a "Merged" comment
-
-### Switching back to Planka
-
-The docker-compose.yml keeps the Planka + Postgres services as commented-out blocks. To switch back:
-
-```bash
-# In docker-compose.yml: uncomment planka + postgres, comment kanboard + gitlab
-docker compose up -d
-# In config_marcus.json: set kanban_provider back to "planka"
-```
+10. **Instantly** (webhook) or within ~30 s (poll fallback), Marcus merges the branch to `main`
 
 ---
 
@@ -531,7 +548,7 @@ transparency, and letting the system — not any single agent — hold the truth
 
 Marcus is open source and community-driven. Good first contributions:
 
-1. **Kanban provider integrations** — Jira, Trello support (Linear ✓, GitHub ✓, SQLite ✓, Kanboard ✓ already done)
+1. **Kanban provider integrations** — Trello, Jira support (SQLite ✓, Kanboard ✓ already done)
 2. **Runners** — automated workflows for new CLI agents (Codex, Gemini CLI, Kimi, AutoGen); see [PROTOCOL.md](PROTOCOL.md)
 3. **Documentation** — tutorials, use cases, examples
 4. **Use-case definitions** — show what Marcus can build beyond software
@@ -555,6 +572,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [Local Development Setup](docs/source
 
 | Date           | Update |
 |----------------|--------|
+| **2026-07-06** | Kanboard push webhooks for instant event delivery; `/dev-env/view` HTTP endpoint; MarcusDevEnv Kanboard plugin ("View Live Changes" sidebar button); removed Planka/Linear/GitHub/Jira providers |
 | **2026-07-05** | Human-gated workflow, Kanboard provider, GitLab integration, ProjectWatcher, ProjectSyncWorkflow |
 | **2026-04-26** | v0.3.6 — parallel experiment isolation, agent auto-termination, DONE-task board integrity guards |
 | **2026-04-17** | v0.3.4 — `contract_first` default decomposer, `recommended_agents` in API response, `PROTOCOL.md` |
@@ -571,7 +589,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [Local Development Setup](docs/source
 
 | Version    | Date       | Commits | Highlights |
 |------------|------------|---------|------------|
-| **dev**    | 2026-07-05 | —       | Human-gated workflow; Kanboard JSON-RPC provider; GitLab CE integration; `ProjectWatcher`; `ProjectSyncWorkflow`; 6-state ticket lifecycle (`todo/ready/in_progress/waiting_for_human/blocked/done`); 9 new MCP tools for AI agents; Kanboard + GitLab docker-compose stack |
+| **dev**    | 2026-07-06 | —       | Kanboard push webhooks (`POST /webhooks/kanboard`) for instant event delivery; `/dev-env/view` HTTP endpoint; MarcusDevEnv Kanboard PHP plugin with "View Live Changes" sidebar button; removed Planka/Linear/GitHub/Jira providers; human-gated workflow; Kanboard JSON-RPC provider; GitLab CE integration; `ProjectWatcher`; `ProjectSyncWorkflow`; 6-state ticket lifecycle; 10 new MCP tools for AI agents |
 | **v0.3.6** | 2026-04-26 | 28      | Parallel experiment isolation, agent auto-termination, DONE-task board integrity guards, Phase 4 lease tuning, spec-coverage ordering fix |
 | **v0.3.4** | 2026-04-17 | —       | `contract_first` default decomposer, `recommended_agents` in `create_project` response, `PROTOCOL.md`, pre-fork synthesis, scope annotation |
 | **v0.3.0** | 2026-04-03 | 59      | SQLite default provider, Epictetus evaluation, `/marcus` one-command experiments, resilience overhaul |
