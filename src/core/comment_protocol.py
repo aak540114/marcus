@@ -85,6 +85,7 @@ class CommentType(Enum):
     DEV_ENV_STARTED = "dev_env_started"
     MERGED = "merged"
     ERROR = "error"
+    VERIFICATION_FAILED = "verification_failed"
 
 
 @dataclass
@@ -466,6 +467,40 @@ class CommentFormatter:
             f"Marcus encountered an issue while working on this ticket:\n\n"
             f"> {error_summary}\n"
             f"{action}"
+            f"{_FOOTER}"
+        )
+        return body
+
+    @classmethod
+    def verification_failed(
+        cls,
+        ticket_id: str,
+        findings: List[str],
+    ) -> str:
+        """Comment posted when AI verification finds issues before merging.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        findings : List[str]
+            List of issues found by the AI verifier.
+
+        Returns
+        -------
+        str
+            Full comment body.
+        """
+        items = "\n".join(f"- {f}" for f in findings) if findings else "- (no details)"
+        body = (
+            f"{cls._header(CommentType.VERIFICATION_FAILED, ticket_id)}\n"
+            f"### Marcus AI Verifier — Issues Found\n\n"
+            f"The AI code reviewer checked the branch and found problems that "
+            f"must be fixed before this ticket can be merged:\n\n"
+            f"{items}\n\n"
+            f"**Action needed:** Please fix the issues listed above and call "
+            f"`signal_ready_for_review` again once done.  Marcus will re-run "
+            f"verification automatically."
             f"{_FOOTER}"
         )
         return body

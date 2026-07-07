@@ -337,6 +337,31 @@ class BranchManager:
         _, stdout, _ = await self._git("rev-parse", "--abbrev-ref", "HEAD")
         return stdout.strip()
 
+    async def get_branch_diff(
+        self, branch_name: str, *, base_branch: Optional[str] = None
+    ) -> str:
+        """Return the unified diff for all changes on *branch_name* vs *base_branch*.
+
+        Uses ``git diff <base>...<branch>`` (three-dot notation) so only
+        commits unique to *branch_name* are included.
+
+        Parameters
+        ----------
+        branch_name : str
+            Ticket branch to diff.
+        base_branch : Optional[str]
+            Comparison base; defaults to ``config.main_branch``.
+
+        Returns
+        -------
+        str
+            Unified diff text.  Empty string when there are no changes.
+        """
+        base = base_branch or self.config.main_branch
+        await self._git("fetch", self.config.remote, base)
+        _, stdout, _ = await self._git("diff", f"{base}...{branch_name}")
+        return stdout
+
     async def get_branch_commits(
         self, branch_name: str, *, base_branch: Optional[str] = None
     ) -> List[str]:

@@ -52,6 +52,7 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.ai.verification.ai_verifier import AIVerifier
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
 from src.core.board_watcher import BoardWatcher
 from src.core.comment_protocol import CommentFormatter, CommentParser
@@ -121,6 +122,7 @@ class HumanGatedWorkflow:
         dev_env_manager: Optional[DevEnvironmentManager] = None,
         ac_generator: Optional[ACGenerator] = None,
         gate_settings: Optional[GateSettingManager] = None,
+        ai_verifier: Optional[AIVerifier] = None,
         poll_interval: float = 30.0,
     ) -> None:
         """Initialise the workflow."""
@@ -132,6 +134,7 @@ class HumanGatedWorkflow:
         self._dev_env = dev_env_manager or DevEnvironmentManager()
         self._ac_gen = ac_generator or ACGenerator()
         self._gate = gate_settings or GateSettingManager()
+        self._verifier = ai_verifier or AIVerifier()
         self._project_sync = project_sync  # Optional ProjectSyncWorkflow
         self._watcher = BoardWatcher(
             kanban=kanban,
@@ -1216,6 +1219,15 @@ class HumanGatedWorkflow:
             )
             return False
 
+        # ── AI verification (when enabled) ────────────────────────────────
+        # Run an independent LLM review of the branch diff before merging.
+        # If issues are found, post findings and release the ticket back to
+        # "In Progress" so the worker can fix them.
+        if await self._get_effective_verify(ticket_id):
+            verified = await self._run_verification(ticket_id, record, branch_name)
+            if not verified:
+                return False
+
         merge_msg = (
             f"merge: ticket/{self._provider}/{ticket_id} (auto-completed, AI gate)"
         )
@@ -1313,6 +1325,122 @@ class HumanGatedWorkflow:
         if project_id is None:
             return "human"
         return self._gate.get_effective_gate(ticket_id, project_id)
+
+    async def _run_verification(
+        self,
+        ticket_id: str,
+        record: TicketRecord,
+        branch_name: str,
+    ) -> bool:
+        """Run the AI verifier on the branch and handle the result.
+
+        If verification passes, returns ``True`` and the caller continues to
+        merge.  If verification fails, posts a findings comment, releases the
+        ticket claim, and moves the kanban card back to ``"in progress"`` so
+        the worker can fix the issues.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        record : TicketRecord
+            Current lifecycle record (for AC items and title).
+        branch_name : str
+            Branch to diff and verify.
+
+        Returns
+        -------
+        bool
+            ``True`` if verification passed; ``False`` if issues were found.
+        """
+        logger.info("AI Verify: running verification for ticket %s (branch %s)", ticket_id, branch_name)
+
+        try:
+            diff_text = await self._branch.get_branch_diff(branch_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AI Verify: could not get diff for %s: %s — skipping", branch_name, exc)
+            return True  # fail-open on diff error
+
+        ac_items = self._get_ac_items(record)
+        ticket_title = ticket_id
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task and task.name:
+                ticket_title = task.name
+        except Exception:  # noqa: BLE001
+            pass
+
+        result = await self._verifier.verify(
+            ticket_id=ticket_id,
+            ticket_title=ticket_title,
+            acceptance_criteria=ac_items,
+            diff_text=diff_text,
+        )
+
+        if result.passed:
+            logger.info("AI Verify: ticket %s passed verification", ticket_id)
+            return True
+
+        logger.info(
+            "AI Verify: ticket %s failed — %d finding(s): %s",
+            ticket_id,
+            len(result.findings),
+            result.findings,
+        )
+
+        # Post the findings comment.
+        comment = CommentFormatter.verification_failed(
+            ticket_id=ticket_id,
+            findings=result.findings,
+        )
+        await self._post_comment(ticket_id, comment)
+
+        # Release the ticket so the worker (or any agent) can pick it up again.
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+
+        # Ensure the kanban card stays in "in progress" so agents can claim it.
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "in progress")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AI Verify: could not reset kanban column for %s: %s", ticket_id, exc)
+
+        return False
+
+    async def _get_effective_verify(self, ticket_id: str) -> bool:
+        """Resolve whether AI verification is enabled for a ticket.
+
+        Fetches the kanboard task to discover its project ID, then calls
+        ``GateSettingManager.get_effective_verify``.  Returns ``False`` on
+        any error (fail-open — don't block merging on a lookup failure).
+
+        Parameters
+        ----------
+        ticket_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        bool
+            ``True`` if AI verification should run before merging.
+        """
+        project_id: Optional[int] = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                src_ctx = task.source_context or {}
+                raw = src_ctx.get("kanboard_task", {})
+                pid_raw = raw.get("project_id")
+                if pid_raw:
+                    project_id = int(pid_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not fetch project_id for verify check on %s: %s", ticket_id, exc)
+
+        if project_id is None:
+            return False
+        return self._gate.get_effective_verify(ticket_id, project_id)
 
     async def _check_project_stack(self, ticket_id: str) -> bool:
         """Verify the project description has enough stack info to start work.

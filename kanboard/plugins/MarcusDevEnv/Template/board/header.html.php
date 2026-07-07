@@ -5,9 +5,11 @@
  * Section 1 — Active AI Agents badge (polls /api/active-agents every 15 s)
  * Section 2 — Project Description link button
  * Section 3 — Project-level Human Gate / AI Gate toggle
+ * Section 4 — AI Verify toggle (only visible when AI Gate is active)
  *
- * The gate toggle persists via Marcus /api/gate-setting/project.
- * Default is "human". Per-ticket overrides are in the task sidebar.
+ * The gate and verify toggles persist via Marcus /api/gate-setting/project.
+ * Default gate is "human"; default verify is false.
+ * Per-ticket overrides are in the task sidebar.
  */
 $marcusUrl   = getenv('MARCUS_URL') ?: 'http://localhost:4298';
 $apiUrl      = $marcusUrl . '/api/active-agents';
@@ -98,6 +100,47 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     margin-left: 4px;
     display: none;
 }
+
+/* ── AI Verify toggle ────────────────────────────────────────────────── */
+#marcus-verify-wrap {
+    display: none; /* hidden by default; shown only when AI gate is active */
+    align-items: center;
+    gap: 6px;
+}
+#marcus-verify-wrap.visible { display: inline-flex; }
+.marcus-verify-switch {
+    position: relative;
+    display: inline-block;
+    width: 36px;
+    height: 20px;
+}
+.marcus-verify-switch input { opacity: 0; width: 0; height: 0; }
+.marcus-verify-slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background: #d1d5db;
+    border-radius: 20px;
+    transition: background 0.2s;
+}
+.marcus-verify-slider:before {
+    content: '';
+    position: absolute;
+    width: 14px; height: 14px;
+    left: 3px; bottom: 3px;
+    background: white;
+    border-radius: 50%;
+    transition: transform 0.2s;
+}
+.marcus-verify-switch input:checked + .marcus-verify-slider { background: #7c3aed; }
+.marcus-verify-switch input:checked + .marcus-verify-slider:before { transform: translateX(16px); }
+.marcus-verify-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #6b7280;
+    white-space: nowrap;
+}
+.marcus-verify-label.on { color: #7c3aed; }
 </style>
 
 <div style="padding: 0 16px 2px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
@@ -131,6 +174,16 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
             </button>
         </div>
         <span class="marcus-gate-saving" id="marcus-gate-saving">saving&hellip;</span>
+    </div>
+
+    <!-- AI Verify toggle (only shown when AI Gate is active) -->
+    <div id="marcus-verify-wrap">
+        <span class="marcus-gate-label">AI Verify:</span>
+        <label class="marcus-verify-switch" title="When on, a second AI agent reviews the work before merging">
+            <input type="checkbox" id="marcus-verify-chk" onchange="setProjectVerify(this.checked)">
+            <span class="marcus-verify-slider"></span>
+        </label>
+        <span class="marcus-verify-label" id="marcus-verify-label">Off</span>
     </div>
 
 </div>
@@ -175,21 +228,42 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     updateAgents();
     setInterval(updateAgents, INTERVAL);
 
-    /* ── Project gate toggle ─────────────────────────────────────────── */
-    var saving = document.getElementById('marcus-gate-saving');
+    /* ── Project gate + verify toggle ───────────────────────────────── */
+    var saving      = document.getElementById('marcus-gate-saving');
+    var verifyWrap  = document.getElementById('marcus-verify-wrap');
+    var verifyChk   = document.getElementById('marcus-verify-chk');
+    var verifyLabel = document.getElementById('marcus-verify-label');
 
     function applyProjectGate(gate) {
         var humanBtn = document.getElementById('pgBtn-human');
         var aiBtn    = document.getElementById('pgBtn-ai');
         humanBtn.className = gate === 'human' ? 'active-human' : '';
         aiBtn.className    = gate === 'ai'    ? 'active-ai'    : '';
+        // Show/hide AI Verify toggle depending on gate
+        if (gate === 'ai') {
+            verifyWrap.classList.add('visible');
+        } else {
+            verifyWrap.classList.remove('visible');
+        }
     }
 
-    // Load current project gate on page load
+    function applyProjectVerify(verify) {
+        verifyChk.checked = !!verify;
+        verifyLabel.textContent = verify ? 'On' : 'Off';
+        verifyLabel.className = 'marcus-verify-label' + (verify ? ' on' : '');
+    }
+
+    // Load current project gate + verify on page load
     fetch(GATE_URL + '?project_id=' + PROJECT_ID, { cache: 'no-store' })
         .then(function (r) { return r.json(); })
-        .then(function (data) { applyProjectGate(data.project_gate || 'human'); })
-        .catch(function () { applyProjectGate('human'); });
+        .then(function (data) {
+            applyProjectGate(data.project_gate || 'human');
+            applyProjectVerify(!!data.project_verify);
+        })
+        .catch(function () {
+            applyProjectGate('human');
+            applyProjectVerify(false);
+        });
 
     window.setProjectGate = function (gate) {
         saving.style.display = 'inline';
@@ -207,6 +281,29 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         .catch(function () { /* keep current visual state */ })
         .finally(function () {
             humanBtn.disabled = aiBtn.disabled = false;
+            saving.style.display = 'none';
+        });
+    };
+
+    window.setProjectVerify = function (enabled) {
+        saving.style.display = 'inline';
+        verifyChk.disabled = true;
+
+        fetch(GATE_URL + '/project', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            // Also send the current gate so the PUT handler has both fields
+            body: JSON.stringify({
+                project_id: PROJECT_ID,
+                gate: document.getElementById('pgBtn-ai').className === 'active-ai' ? 'ai' : 'human',
+                verify: enabled,
+            }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function () { applyProjectVerify(enabled); })
+        .catch(function () { /* keep current visual state */ })
+        .finally(function () {
+            verifyChk.disabled = false;
             saving.style.display = 'none';
         });
     };

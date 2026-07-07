@@ -104,6 +104,67 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     padding: 2px 0 0;
 }
 .m-gate-saving { font-size:10px; color:#9ca3af; display:none; }
+
+/* ── AI Verify (sidebar) ─────────────────────────────────────────── */
+.m-verify-section {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(0,0,0,.08);
+    display: none; /* shown only when effective gate is AI */
+}
+.m-verify-section.visible { display: block; }
+.m-verify-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.m-verify-desc {
+    font-size: 10px;
+    color: #888;
+    margin: 3px 0 6px;
+    line-height: 1.4;
+}
+.m-verify-switch {
+    position: relative;
+    display: inline-block;
+    width: 32px;
+    height: 18px;
+    flex-shrink: 0;
+}
+.m-verify-switch input { opacity: 0; width: 0; height: 0; }
+.m-verify-slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background: #d1d5db;
+    border-radius: 18px;
+    transition: background 0.2s;
+}
+.m-verify-slider:before {
+    content: '';
+    position: absolute;
+    width: 12px; height: 12px;
+    left: 3px; bottom: 3px;
+    background: white;
+    border-radius: 50%;
+    transition: transform 0.2s;
+}
+.m-verify-switch input:checked + .m-verify-slider { background: #7c3aed; }
+.m-verify-switch input:checked + .m-verify-slider:before { transform: translateX(14px); }
+.m-verify-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: #f3e8ff;
+    color: #7c3aed;
+}
+.m-verify-badge.off { background: #f3f4f6; color: #6b7280; }
+.m-verify-inherit-row {
+    margin-top: 4px;
+    font-size: 10px;
+    color: #9ca3af;
+}
 </style>
 
 <div class="sidebar-collapse">
@@ -148,6 +209,25 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         <!-- Resolved effective gate -->
         <div class="m-gate-eff">
             Effective: <strong id="marcus-eff-gate">loading&hellip;</strong>
+        </div>
+
+        <!-- AI Verify (only shown when effective gate is AI) -->
+        <div class="m-verify-section" id="marcus-verify-section">
+            <p class="m-verify-desc">
+                When <strong>AI Verify</strong> is on, a second AI agent reviews
+                the implementation before merging. Issues are posted as a comment
+                and the worker agent must fix them.
+            </p>
+            <!-- Per-ticket verify override -->
+            <div class="m-verify-row">
+                <label class="m-verify-switch" title="Toggle AI verification for this ticket">
+                    <input type="checkbox" id="marcus-verify-chk" onchange="setTicketVerify(this.checked)">
+                    <span class="m-verify-slider"></span>
+                </label>
+                <span id="marcus-verify-badge" class="m-verify-badge off">Off</span>
+                <span class="m-gate-saving" id="marcus-verify-saving">saving&hellip;</span>
+            </div>
+            <div class="m-verify-inherit-row" id="marcus-verify-inherit-note"></div>
         </div>
     </div>
 </div>
@@ -261,8 +341,13 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         });
 
     /* ── Gate mode panel ─────────────────────────────────────────── */
-    var saving  = document.getElementById('marcus-tg-saving');
-    var effEl   = document.getElementById('marcus-eff-gate');
+    var saving       = document.getElementById('marcus-tg-saving');
+    var effEl        = document.getElementById('marcus-eff-gate');
+    var verifySection = document.getElementById('marcus-verify-section');
+    var verifyChk    = document.getElementById('marcus-verify-chk');
+    var verifyBadge  = document.getElementById('marcus-verify-badge');
+    var verifySaving = document.getElementById('marcus-verify-saving');
+    var verifyNote   = document.getElementById('marcus-verify-inherit-note');
 
     // Apply visual state to project-level pill row (read-only indicator)
     function applyProjectPills(gate) {
@@ -286,6 +371,25 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         var labels = { human: '👤 Human Gate', ai: '🤖 AI Gate' };
         effEl.textContent = labels[effective] || effective;
         effEl.style.color = effective === 'ai' ? '#7c3aed' : '#1d4ed8';
+        // Show AI Verify section only when effective gate is AI
+        if (effective === 'ai') {
+            verifySection.classList.add('visible');
+        } else {
+            verifySection.classList.remove('visible');
+        }
+    }
+
+    function applyVerify(ticketVerify, projectVerify, effectiveVerify) {
+        verifyChk.checked = !!effectiveVerify;
+        verifyBadge.textContent = effectiveVerify ? 'On' : 'Off';
+        verifyBadge.className = 'marcus-verify-badge' + (effectiveVerify ? '' : ' off');
+        // Show inherit note when ticket has no explicit setting
+        if (ticketVerify === null || ticketVerify === undefined) {
+            var src = projectVerify ? 'project: On' : 'project: Off';
+            verifyNote.textContent = '(inheriting from ' + src + ')';
+        } else {
+            verifyNote.textContent = '';
+        }
     }
 
     function loadGateSettings() {
@@ -296,11 +400,13 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
                 applyProjectPills(data.project_gate || 'human');
                 applyTicketPills(data.ticket_gate);          // null = inheriting
                 applyEffective(data.effective || 'human');
+                applyVerify(data.ticket_verify, data.project_verify, data.effective_verify);
             })
             .catch(function () {
                 applyProjectPills('human');
                 applyTicketPills(null);
                 applyEffective('human');
+                applyVerify(null, false, false);
             });
     }
 
@@ -323,6 +429,25 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         .finally(function () {
             btns.forEach(function (b) { b.disabled = false; });
             saving.style.display = 'none';
+        });
+    };
+
+    // Called by AI Verify toggle
+    window.setTicketVerify = function (enabled) {
+        verifySaving.style.display = 'inline';
+        verifyChk.disabled = true;
+
+        fetch(GATE_URL + '/ticket', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ticket_id: TICKET_ID, gate: null, verify: enabled }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function () { loadGateSettings(); })
+        .catch(function () { /* keep current visual state */ })
+        .finally(function () {
+            verifyChk.disabled = false;
+            verifySaving.style.display = 'none';
         });
     };
 
