@@ -14,8 +14,9 @@ class TestValidationNoneCriteria:
 
     @pytest.fixture
     def work_analyzer(self):
-        """Create WorkAnalyzer instance."""
-        return WorkAnalyzer()
+        """Create WorkAnalyzer instance with mocked LLM."""
+        with patch("src.ai.validation.work_analyzer.LLMAbstraction"):
+            return WorkAnalyzer()
 
     @pytest.fixture
     def task_with_none_criteria(self):
@@ -45,6 +46,7 @@ class TestValidationNoneCriteria:
         mock_evidence.decisions = []
         mock_evidence.has_placeholders = False
         mock_evidence.empty_files = []
+        mock_evidence.file_manifest = []
 
         # Act & Assert - Should not raise TypeError
         try:
@@ -69,6 +71,7 @@ class TestValidationNoneCriteria:
         mock_evidence.decisions = []
         mock_evidence.has_placeholders = False
         mock_evidence.empty_files = []
+        mock_evidence.file_manifest = []
 
         # Act
         prompt = work_analyzer._build_validation_prompt(
@@ -94,6 +97,7 @@ class TestValidationNoneCriteria:
         mock_evidence.decisions = []
         mock_evidence.has_placeholders = False
         mock_evidence.empty_files = []
+        mock_evidence.file_manifest = []
 
         # Act
         prompt = work_analyzer._build_validation_prompt(

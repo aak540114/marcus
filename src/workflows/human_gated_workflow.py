@@ -1002,7 +1002,10 @@ class HumanGatedWorkflow:
 
         # Check that the project description has enough tech-stack info.
         # If the stack is unclear, ask the human and stop until they respond.
-        await self._check_project_stack(ticket_id)
+        stack_ok = await self._check_project_stack(ticket_id)
+        if not stack_ok:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+            return
 
         # Advance the lifecycle state to IN_PROGRESS via READY if needed.
         if record.state == TicketState.TODO:
@@ -1206,6 +1209,13 @@ class HumanGatedWorkflow:
         branch_name = record.branch_name
         main_branch = self._branch.config.main_branch
 
+        if not branch_name:
+            await self._post_error(
+                ticket_id,
+                "Cannot auto-merge: no branch was created for this ticket.",
+            )
+            return False
+
         merge_msg = (
             f"merge: ticket/{self._provider}/{ticket_id} (auto-completed, AI gate)"
         )
@@ -1235,7 +1245,12 @@ class HumanGatedWorkflow:
                     reason="AI gate: forced DONE after auto-merge",
                 )
             except (InvalidTransitionError, KeyError):
-                pass
+                logger.error(
+                    "Could not transition ticket %s to DONE after merge; "
+                    "lifecycle state is inconsistent",
+                    ticket_id,
+                )
+                return False
 
         try:
             self._lifecycle.set_merged(ticket_id, self._provider)
@@ -1299,7 +1314,7 @@ class HumanGatedWorkflow:
             return "human"
         return self._gate.get_effective_gate(ticket_id, project_id)
 
-    async def _check_project_stack(self, ticket_id: str) -> None:
+    async def _check_project_stack(self, ticket_id: str) -> bool:
         """Verify the project description has enough stack info to start work.
 
         If the stack cannot be determined, post a clarification comment on the
@@ -1310,6 +1325,12 @@ class HumanGatedWorkflow:
         ----------
         ticket_id : str
             Kanboard task ID.
+
+        Returns
+        -------
+        bool
+            ``True`` if the stack is known (or check is not applicable);
+            ``False`` if the ticket was paused awaiting human input.
         """
         try:
             from src.core.project_description import (
@@ -1330,12 +1351,12 @@ class HumanGatedWorkflow:
                 logger.debug("Could not fetch task for stack check: %s", exc)
 
             if project_id is None:
-                return  # non-Kanboard providers skip description check
+                return True  # non-Kanboard providers skip description check
 
             mgr = ProjectDescriptionManager()
             stack = mgr.get_stack(project_id)
             if stack is not None:
-                return  # description is complete — proceed normally
+                return True  # description is complete — proceed normally
 
             # Stack missing: ask the human and pause.
             await self._post_comment(ticket_id, _WAITING_COMMENT)
@@ -1347,8 +1368,10 @@ class HumanGatedWorkflow:
                 "Ticket %s paused — project description missing tech-stack info",
                 ticket_id,
             )
+            return False
         except Exception as exc:  # noqa: BLE001
             logger.warning("Project stack check failed, proceeding anyway: %s", exc)
+            return True
 
     async def _post_comment(self, ticket_id: str, body: str) -> bool:
         """Post a comment via the kanban provider (best-effort)."""

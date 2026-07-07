@@ -3314,7 +3314,7 @@ if __name__ == "__main__":
                                 f"Please fill in the <strong>Tech Stack</strong> section of the "
                                 f'<a href="{desc_url}">Project Description</a> '
                                 f"and try again.</p>",
-                                status_code=202,
+                                status_code=400,
                             )
                     except ValueError:
                         pass  # bad project_id — fall through to file detection
@@ -3446,10 +3446,10 @@ function save() {{
                     response = JSONResponse({"error": str(exc)}, status_code=500)
             else:
                 raw = desc_mgr.get_description(pid)
+                from starlette.responses import PlainTextResponse
                 if raw is None:
-                    response = JSONResponse({"description": None, "project_id": pid})
+                    response = PlainTextResponse("", status_code=404)  # type: ignore[assignment]
                 else:
-                    from starlette.responses import PlainTextResponse
                     response = PlainTextResponse(raw)  # type: ignore[assignment]
 
             response.headers["Access-Control-Allow-Origin"] = "*"
@@ -3537,7 +3537,7 @@ function save() {{
             effective = (
                 gate_mgr.get_effective_gate(tid_str, pid)
                 if pid is not None and tid_str
-                else (project_gate or "human")
+                else (ticket_gate or project_gate or "human")
             )
 
             r = JSONResponse({
