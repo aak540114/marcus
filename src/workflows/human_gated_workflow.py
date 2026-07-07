@@ -1407,6 +1407,10 @@ class HumanGatedWorkflow:
         except Exception as exc:  # noqa: BLE001
             logger.warning("AI Verify: could not reset kanban column for %s: %s", ticket_id, exc)
 
+        # Signal Marcus to assign the next available ticket (same pattern as all
+        # other release_ticket call sites in this file).
+        await self._pickup_next_ticket()
+
         return False
 
     async def _get_effective_verify(self, ticket_id: str) -> bool:
@@ -1436,9 +1440,20 @@ class HumanGatedWorkflow:
                 if pid_raw:
                     project_id = int(pid_raw)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Could not fetch project_id for verify check on %s: %s", ticket_id, exc)
+            # Kanban API is unreachable — fail-safe: run verification rather than
+            # silently bypass it.  A transient outage should not allow unreviewed
+            # branches to auto-merge.
+            logger.warning(
+                "Could not fetch project_id for verify check on ticket %s: %s "
+                "— defaulting to verify=enabled (fail-safe)",
+                ticket_id,
+                exc,
+            )
+            return True
 
         if project_id is None:
+            # Task has no project_id in its source context (e.g. non-Kanboard
+            # provider or task not yet fully synced). Verification not configured.
             return False
         return self._gate.get_effective_verify(ticket_id, project_id)
 

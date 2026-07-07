@@ -281,6 +281,7 @@ class GateSettingManager:
         # Migrate old string-only format: "ai" → {"gate": "ai"}
         if isinstance(entry, str):
             projects[key] = {"gate": entry}
+            self._save()  # persist so the migration doesn't re-run every restart
         return projects[key]
 
     def _ticket_entry(self, ticket_id: str, *, create: bool = False) -> Dict[str, Any]:
@@ -296,6 +297,7 @@ class GateSettingManager:
         # Migrate old string-only format: "ai" → {"gate": "ai"}
         if isinstance(entry, str):
             tickets[key] = {"gate": entry}
+            self._save()  # persist so the migration doesn't re-run every restart
         return tickets[key]
 
     # ------------------------------------------------------------------
