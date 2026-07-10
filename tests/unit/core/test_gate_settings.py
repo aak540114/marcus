@@ -257,6 +257,36 @@ class TestGateSettingManager:
         assert mgr.get_project_gate(1) == "ai"
         assert mgr.get_ticket_gate("42") == "human"
 
+    def test_negative_verify_count_in_file_is_ignored(self, tmp_path):
+        """A negative verify_count on disk reads back as None, not a negative."""
+        data = {
+            "projects": {"1": {"gate": "ai", "verify_count": -2}},
+            "tickets": {"42": {"gate": "ai", "verify_count": -1}},
+        }
+        (tmp_path / "gate_settings.json").write_text(json.dumps(data))
+        mgr = GateSettingManager(data_dir=tmp_path)
+        assert mgr.get_project_verify_count(1) is None
+        assert mgr.get_ticket_verify_count("42") is None
+        assert mgr.get_effective_verify_count("42", 1) == 0
+
+    def test_set_negative_verify_count_raises(self, mgr):
+        """Setters reject negative counts with ValueError."""
+        with pytest.raises(ValueError):
+            mgr.set_project_verify_count(1, -1)
+        with pytest.raises(ValueError):
+            mgr.set_ticket_verify_count("42", -3)
+
+    def test_bool_stored_as_verify_count_is_rejected(self, tmp_path):
+        """A bool smuggled into verify_count reads back as None, not 0/1."""
+        data = {
+            "projects": {"1": {"gate": "ai", "verify_count": True}},
+            "tickets": {"42": {"gate": "ai", "verify_count": False}},
+        }
+        (tmp_path / "gate_settings.json").write_text(json.dumps(data))
+        mgr = GateSettingManager(data_dir=tmp_path)
+        assert mgr.get_project_verify_count(1) is None
+        assert mgr.get_ticket_verify_count("42") is None
+
     def test_migrates_old_bool_verify_true_to_count_one(self, tmp_path):
         """Old format verify=true is migrated to verify_count=1."""
         data = {
@@ -289,6 +319,7 @@ class TestGateSettingManager:
 
         # Second instance reads the already-migrated file
         mgr2 = GateSettingManager(data_dir=tmp_path)
+        assert mgr2.get_project_verify_count(1) == 1
         raw = json.loads((tmp_path / "gate_settings.json").read_text())
         assert "verify" not in raw["projects"]["1"]
         assert raw["projects"]["1"]["verify_count"] == 1

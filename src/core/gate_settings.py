@@ -141,7 +141,9 @@ class GateSettingManager:
             stored.
         """
         val = self._project_entry(project_id).get("verify_count")
-        return int(val) if isinstance(val, int) and not isinstance(val, bool) else None
+        if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+            return int(val)
+        return None
 
     def get_ticket_verify_count(self, ticket_id: str) -> Optional[int]:
         """Return the number of AI verification rounds configured for a ticket.
@@ -158,7 +160,9 @@ class GateSettingManager:
             from its project.
         """
         val = self._ticket_entry(ticket_id).get("verify_count")
-        return int(val) if isinstance(val, int) and not isinstance(val, bool) else None
+        if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+            return int(val)
+        return None
 
     def get_effective_verify_count(self, ticket_id: str, project_id: int) -> int:
         """Return the resolved number of AI verification rounds for a ticket.
@@ -237,7 +241,14 @@ class GateSettingManager:
             Kanboard project ID.
         count : int
             Number of verification rounds (0 = disabled).
+
+        Raises
+        ------
+        ValueError
+            If ``count`` is negative.
         """
+        if count < 0:
+            raise ValueError(f"verify_count must be >= 0, got {count}")
         self._project_entry(project_id, create=True)["verify_count"] = count
         self._save()
         logger.info("Set project %d verify_count to %d", project_id, count)
@@ -252,7 +263,14 @@ class GateSettingManager:
         count : Optional[int]
             Non-negative integer to override; ``None`` to reset to the
             project-level setting.
+
+        Raises
+        ------
+        ValueError
+            If ``count`` is negative.
         """
+        if count is not None and count < 0:
+            raise ValueError(f"verify_count must be >= 0 or None, got {count}")
         entry = self._ticket_entry(ticket_id, create=True)
         if count is None:
             entry.pop("verify_count", None)

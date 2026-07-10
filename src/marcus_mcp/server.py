@@ -73,7 +73,6 @@ from src.integrations.kanban_interface import KanbanInterface  # noqa: E402
 from src.marcus_mcp.handlers import handle_tool_call  # noqa: E402
 from src.marcus_mcp.tool_groups import get_tools_for_endpoint  # noqa: E402
 from src.monitoring.assignment_monitor import AssignmentMonitor  # noqa: E402
-from src.monitoring.project_monitor import ProjectMonitor  # noqa: E402
 
 
 def _carry_forward_active_subtasks(
@@ -910,8 +909,8 @@ class MarcusServer:
         from src.core.error_framework import ConfigurationError, ErrorContext
 
         try:
-            # Load from centralized config
-            config = get_config()
+            # Load from centralized config (raises if the file is missing)
+            get_config()
 
             # Configuration loaded successfully from config_marcus.json
 
@@ -3237,7 +3236,7 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.applications import Starlette
         from starlette.requests import Request
-        from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse
+        from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse, Response
         from starlette.routing import Mount, Route
 
         from src.core.kanboard_webhook_receiver import KanboardWebhookReceiver
@@ -3265,7 +3264,7 @@ if __name__ == "__main__":
                 return JSONResponse({"status": "ok"}, status_code=200)
             return JSONResponse({"status": "rejected"}, status_code=403)
 
-        async def dev_env_view(request: Request) -> "Response":  # type: ignore[name-defined]
+        async def dev_env_view(request: Request) -> Response:
             """
             Start (or look up) a hot-reload dev environment for a ticket
             and redirect the browser to it.
@@ -3345,13 +3344,13 @@ if __name__ == "__main__":
                     status_code=500,
                 )
 
-        async def project_description_page(request: Request) -> "Response":  # type: ignore[name-defined]
+        async def project_description_page(request: Request) -> Response:
             """Serve the project description as a human-readable HTML page.
 
             Query params:
                 project_id  (required)
             """
-            from src.core.project_description import ProjectDescriptionManager, _WAITING_COMMENT
+            from src.core.project_description import ProjectDescriptionManager
 
             project_id_str = request.query_params.get("project_id", "")
             try:
@@ -3416,7 +3415,7 @@ function save() {{
 </html>"""
             return HTMLResponse(page)
 
-        async def project_description_api(request: Request) -> "Response":  # type: ignore[name-defined]
+        async def project_description_api(request: Request) -> Response:
             """GET/PUT the raw project description text.
 
             GET  → returns plain text markdown

@@ -301,6 +301,77 @@ class TestVerifyCountThree:
         assert "42" not in workflow._ticket_verify_rounds
 
 
+class TestFinalRoundPassComment:
+    """The last passing round posts a 'Merging now' comment before the merge."""
+
+    @pytest.mark.asyncio
+    async def test_final_round_pass_posts_round_comment(self, workflow):
+        """verify_count=2, both rounds pass → round-2 comment announces the merge."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 2)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        # Round 1: passes, not last → released for re-signal
+        await workflow._autocomplete_ticket("42", record)
+        workflow._kanban.add_comment.reset_mock()
+
+        # Round 2 (last): passes → posts PASSED comment, then merges
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is True
+        workflow._branch.merge_to_main.assert_called_once()
+        bodies = [c.args[1] for c in workflow._kanban.add_comment.call_args_list]
+        round_comments = [b for b in bodies if "Round 2 of 2: PASSED" in b]
+        assert len(round_comments) == 1
+        assert "Merging now" in round_comments[0]
+
+
+class TestMergeFailureClearsCounter:
+    """A failed merge leaves no stale round counter behind."""
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_clears_round_counter(self, workflow):
+        """verify_count=1, round passes but merge fails → counter is cleared."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+        workflow._branch.merge_to_main = AsyncMock(return_value=False)
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is False
+        assert "42" not in workflow._ticket_verify_rounds
+
+
+class TestVerifierErrorFailsOpen:
+    """An exception from the LLM verifier must not leave the ticket stuck."""
+
+    @pytest.mark.asyncio
+    async def test_verifier_exception_treated_as_pass(self, workflow):
+        """verify_count=1, verifier raises → fail-open, branch merges."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(side_effect=RuntimeError("LLM down"))
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is True
+        workflow._branch.merge_to_main.assert_called_once()
+        assert "42" not in workflow._ticket_verify_rounds
+
+
 class TestVerifyCountRoundTrackerIsolation:
     """Round counters for different tickets are independent."""
 
