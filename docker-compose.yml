@@ -1,38 +1,31 @@
-# docker-compose.yml — LOCAL DEVELOPMENT ONLY
+# docker-compose.yml — LOCAL DEVELOPMENT / DEMO
 #
-# Runs Kanboard + Gitea on a single machine alongside a locally-running
-# Marcus instance.  Not intended for production — use the individual
-# compose files instead:
+# Runs the full stack — Kanboard + Gitea + Marcus — on a single machine.
+# Not intended for production — use the individual compose files instead:
 #
 #   kanboard/docker-compose.yml  →  deploy Kanboard (e.g. Railway)
 #   gitea/docker-compose.yml     →  deploy Gitea    (e.g. VPS / cloud VM)
 #
 # Quick start
 # -----------
-#   docker compose up -d
+#   ./scripts/setup.sh
 #
-#   # Gitea boots in seconds — it's a single lightweight Go binary with an
-#   # embedded SQLite database, unlike GitLab CE's multi-minute Rails boot:
+# That one script provisions everything (Kanboard project/columns/token/
+# webhook, Gitea admin/token) and brings up all three containers with zero
+# manual clicks except pasting your Claude API key. See scripts/setup.sh
+# and README.md for what it does and how to run the steps manually if you
+# ever need to.
+#
+# Gitea boots in seconds — a single lightweight Go binary with an embedded
+# SQLite database, unlike GitLab CE's multi-minute Rails boot:
 #   docker compose logs -f gitea | grep "Listen"
 #
 # The MarcusDevEnv plugin is bind-mounted from kanboard/plugins/ so any
 # edits to the PHP templates take effect after a container restart:
 #   docker compose restart kanboard
 #
-# One-time Gitea admin setup (INSTALL_LOCK skips the web installer wizard,
-# so there is no default admin account yet):
-#   docker compose exec -u git gitea gitea admin user create \
-#     --username root --password Marcus123! \
-#     --email root@example.com --admin --must-change-password=false
-#
-# Configure Marcus (run locally, not in Docker):
-#   export KANBOARD_URL=http://localhost:8080/jsonrpc.php
-#   export KANBOARD_API_TOKEN=<token from Kanboard → Settings → API>
-#   export KANBOARD_PROJECT_ID=1
-#   export GITEA_URL=http://localhost:3000
-#   export GITEA_TOKEN=<token from Gitea → Settings → Applications>
-#   export MARCUS_URL=http://localhost:4298
-#   export KANBOARD_WEBHOOK_TOKEN=<shared secret, optional>
+# Marcus's src/ is bind-mounted too, so a Python edit takes effect after:
+#   docker compose restart marcus
 
 services:
   kanboard:
@@ -46,8 +39,18 @@ services:
       # Bind-mount the plugin from source so edits are immediately testable
       - ./kanboard/plugins:/var/www/app/plugins
     environment:
-      MARCUS_URL: "${MARCUS_URL:-http://host.docker.internal:4298}"
+      MARCUS_URL: "${MARCUS_URL:-http://marcus:4298}"
       KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
+      # Sets the app-level JSON-RPC API token to a known value so
+      # scripts/setup.sh can provision Kanboard without any UI login —
+      # see app/Api/Middleware/AuthenticationMiddleware.php in Kanboard's
+      # own source (auth as user "jsonrpc", password = this token).
+      API_AUTHENTICATION_TOKEN: "${KANBOARD_API_TOKEN:-}"
+      # Kanboard silently drops outbound webhook calls to private-network
+      # URLs unless this is set — and http://marcus:4298/... (a sibling
+      # Docker service name) counts as private. Required for the
+      # auto-seeded webhook (see scripts/setup.sh) to actually fire.
+      WEBHOOK_ALLOW_PRIVATE_NETWORKS: "true"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
       interval: 15s
@@ -78,6 +81,52 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  marcus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: marcus-server
+    restart: unless-stopped
+    depends_on:
+      kanboard:
+        condition: service_healthy
+      gitea:
+        condition: service_healthy
+    ports:
+      - "${MARCUS_PORT:-4298}:4298"
+    volumes:
+      # Bind-mount source for hot-reload-on-restart, matching the
+      # kanboard plugin bind-mount convention above (editable install
+      # picks up host edits after `docker compose restart marcus`).
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # CostStore opens ~/.marcus/costs.db (src/marcus_mcp/server.py);
+      # container runs as root so $HOME=/root. Kept under ./data so all
+      # Marcus state lives under one host directory.
+      - ./data/.marcus:/root/.marcus
+    environment:
+      # Container-to-container URLs use Docker service names, not
+      # localhost. Note Kanboard listens on port 80 *inside* the compose
+      # network — 8080 above is only the host-side port mapping.
+      KANBAN_PROVIDER: kanboard
+      KANBOARD_URL: "http://kanboard/jsonrpc.php"
+      KANBOARD_API_TOKEN: "${KANBOARD_API_TOKEN:-}"
+      KANBOARD_PROJECT_ID: "${KANBOARD_PROJECT_ID:-1}"
+      GITEA_URL: "http://gitea:3000"
+      GITEA_TOKEN: "${GITEA_TOKEN:-}"
+      CLAUDE_API_KEY: "${CLAUDE_API_KEY:-}"
+      MARCUS_URL: "http://marcus:4298"
+    healthcheck:
+      # /mcp is a Streamable-HTTP JSON-RPC endpoint (POST-only) — a plain
+      # `curl -f GET` would 4xx and falsely report unhealthy. A bare TCP
+      # connect just confirms the process is up and bound to the port.
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('localhost', 4298), 2).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
 volumes:
   kanboard_data:

@@ -11,7 +11,7 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | Feature | Description |
 |---|---|
 | **Kanboard provider** | Full Kanboard JSON-RPC integration — tickets, columns, comments, assignments |
-| **Gitea integration** | Auto-creates a Gitea repo for each new Kanboard project; branches pushed per ticket |
+| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) can auto-create a Gitea repo per Kanboard project and push branches per ticket — the classes are complete and tested, but not yet instantiated by the running server (`src/marcus_mcp/server.py`), so this doesn't fire automatically today. Tracked as follow-up work. |
 | **MarcusDevEnv plugin** | Kanboard plugin that adds AI-aware UI to every board and task |
 | **Hot-reload dev environments** | One-click per-ticket preview URL; supports any language/framework via project description |
 | **Project Description system** | Per-project markdown doc that AI agents read to learn the tech stack; editable from the board |
@@ -56,17 +56,19 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 
 ## Architecture
 
+All three services run as containers on one `docker compose` network and reach each other by service name (`kanboard`, `gitea`, `marcus`) — only the host-side port mappings (8080, 3000, 4298) matter from outside Docker.
+
 ```
-Human (browser + Kanboard)
-  │  creates project                  │  creates ticket, assigns, sets "Ready"
-  ▼                                   ▼
-Kanboard (port 8080) ←──────────── Kanboard JSON-RPC API
-  │  ProjectWatcher polls              │  BoardWatcher polls / webhook
-  ▼  getAllProjects()                  ▼  getAllTasks()
-Marcus (local, port 4298)        Marcus (local)
-  │  GiteaManager                      │  BranchManager + HumanGatedWorkflow
-  ▼  POST /api/v1/user/repos           ▼  git push branch
-Gitea (port 3000)               Gitea — branch per ticket
+Human (browser)
+  │  creates project, ticket           │  assigns, sets "Ready"
+  ▼                                    ▼
+kanboard (container, host port 8080) ← Kanboard JSON-RPC API (internal port 80)
+  │  ProjectWatcher polls               │  BoardWatcher polls (30s) + webhook (instant)
+  ▼  getAllProjects()                   ▼  getAllTasks()
+marcus (container, host port 4298) ─── marcus (container)
+  │  GiteaManager*                      │  BranchManager + HumanGatedWorkflow
+  ▼  POST /api/v1/user/repos            ▼  git push branch
+gitea (container, host port 3000) ──── gitea — branch per ticket
 
 AI agents (Claude Code, Codex, etc.)
   └── connect to http://localhost:4298/mcp  (MCP protocol)
@@ -78,6 +80,8 @@ AI agents (Claude Code, Codex, etc.)
       └── post_ticket_progress
 ```
 
+\* Not wired into the running server yet — see the Gitea integration row above.
+
 ---
 
 ## Quick Start
@@ -85,85 +89,67 @@ AI agents (Claude Code, Codex, etc.)
 ### Prerequisites
 
 - Docker Desktop (macOS/Linux) — **2 GB RAM** is plenty (Gitea is lightweight; no GitLab-sized allocation needed)
-- Python 3.11+
+- `curl`, `python3`, `openssl` (all preinstalled on macOS/most Linux distros)
+- A Claude API key from [console.anthropic.com](https://console.anthropic.com/) — the one thing that can't be automated
 - An MCP-compatible AI agent (Claude Code, Codex, etc.)
 
-### 1. Start the stack
+### 1. Run the setup script
 
 ```bash
-docker compose up -d
+./scripts/setup.sh
 ```
 
-Both services are ready in seconds — Gitea is a single Go binary with an embedded SQLite database, not a multi-process Rails app:
+This one command does everything the individually-numbered steps below used to require by hand: starts Kanboard and Gitea, creates the Kanboard project and its six required columns, sets the Kanboard API token and webhook, creates the Gitea admin account and access token, then builds and starts Marcus itself. The only thing it asks you for is your Claude API key (paste it once when prompted — it's saved to `.env`, which is git-ignored).
 
-```bash
-docker compose logs -f gitea | grep "Listen"
-```
+It's safe to re-run — every step checks live state before creating or changing anything, so running it again after `docker compose down` is a fast no-op, and running it after `docker compose down -v` (which wipes volumes) re-provisions everything from scratch.
 
-| Service | URL | Default credentials |
+When it finishes it prints the Kanboard/Gitea/Marcus URLs, the Gitea admin password, and the exact `claude mcp add` command for step 2 below.
+
+<details>
+<summary><strong>How the setup script works</strong> (click to expand)</summary>
+
+| Step | What happens | How |
 |---|---|---|
-| Kanboard | http://localhost:8080 | `admin` / `admin` |
-| Gitea | http://localhost:3000 | *(create on first run — see step 3)* |
+| Kanboard API token | Set to a known, generated value — no UI login needed | `API_AUTHENTICATION_TOKEN` env var on the `kanboard` container (Kanboard's own app-level auth mechanism) |
+| Kanboard project + columns | Created if missing; columns reconciled to `Todo, Ready, In Progress, Waiting for Human, Blocked, Done` | JSON-RPC calls (`createProject`, `getColumns`, `updateColumn`, `addColumn`) via `scripts/provision_kanboard.py` |
+| Kanboard webhook | Set to `http://marcus:4298/webhooks/kanboard` so board changes reach Marcus instantly instead of on the next 30s poll | Kanboard has no API for this — it's two rows (`webhook_url`, `webhook_token`) in its own SQLite `settings` table, written directly via `docker compose exec kanboard php -r '...'` (PDO SQLite, the same DB driver Kanboard itself uses) |
+| Gitea admin account | Created non-interactively | `docker compose exec -u git gitea gitea admin user create ...` |
+| Gitea access token | Generated non-interactively | `docker compose exec -u git gitea gitea admin user generate-access-token ...` |
+| Marcus | Built and started once everything above has produced the values it needs | `docker compose up -d --build marcus` |
 
-### 2. First-time Kanboard setup
+</details>
 
-1. Log in at http://localhost:8080
+<details>
+<summary><strong>Manual setup</strong> (if you'd rather do it by hand, or the script fails partway)</summary>
+
+**Start Kanboard and Gitea:**
+```bash
+docker compose up -d kanboard gitea
+docker compose logs -f gitea | grep "Listen"   # Gitea boots in seconds
+```
+
+**First-time Kanboard setup:**
+1. Log in at http://localhost:8080 (`admin` / `admin`)
 2. **Settings → API** — copy the API token
-3. **Settings → Integrations → Webhook URL** — set to:
-   ```
-   http://host.docker.internal:4298/webhooks/kanboard
-   ```
+3. **Settings → Integrations → Webhook URL** — set to `http://marcus:4298/webhooks/kanboard`
 4. Create a project and add columns: `Todo`, `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
 
-### 3. First-time Gitea setup
-
-`docker-compose.yml` sets `GITEA__security__INSTALL_LOCK=true`, which skips Gitea's web installer wizard — but that also means no admin account exists yet. Create one (note `-u git`: the Gitea CLI refuses to run admin commands as root, and `docker compose exec` defaults to root unless told otherwise):
-
+**First-time Gitea setup** (`-u git`: the Gitea CLI refuses to run admin commands as root, and `docker compose exec` defaults to root):
 ```bash
 docker compose exec -u git gitea gitea admin user create \
   --username root --password Marcus123! \
   --email root@example.com --admin --must-change-password=false
 ```
+Then log in at http://localhost:3000 as `root` / `Marcus123!` → **Settings → Applications → Generate New Token** (scopes `write:repository`, `read:user`).
 
-Then:
-1. Log in at http://localhost:3000 as `root` / `Marcus123!`
-2. **Settings → Applications → Generate New Token** — create a token with `write:repository` and `read:user` scopes
-
-### 4. Configure Marcus
-
+**Configure and start Marcus** — put the values you just collected into `.env` (see `.env.example`), then:
 ```bash
-export KANBAN_PROVIDER=kanboard
-export KANBOARD_URL=http://localhost:8080/jsonrpc.php
-export KANBOARD_API_TOKEN=<your-kanboard-token>
-export KANBOARD_PROJECT_ID=1
-export GITEA_URL=http://localhost:3000
-export GITEA_TOKEN=<your-gitea-pat>
-export MARCUS_URL=http://localhost:4298
+docker compose up -d --build marcus
 ```
 
-Or set these in `config_marcus.json`:
+</details>
 
-```json
-{
-  "kanban_provider": "kanboard",
-  "kanban": {
-    "kanboard_url": "http://localhost:8080/jsonrpc.php",
-    "kanboard_api_token": "YOUR_KANBOARD_TOKEN",
-    "kanboard_project_id": 1
-  },
-  "gitea_url": "http://localhost:3000",
-  "gitea_token": "YOUR_GITEA_PAT"
-}
-```
-
-### 5. Start Marcus
-
-```bash
-pip install -e .
-python -m marcus --provider kanboard
-```
-
-### 6. Connect your AI agent
+### 2. Connect your AI agent
 
 Point any MCP-compatible agent at `http://localhost:4298/mcp`. For Claude Code:
 
@@ -270,10 +256,10 @@ Each service deploys independently:
 
 | Service | Compose file | Suggested platform |
 |---|---|---|
-| Local all-in-one | `docker-compose.yml` (root) | macOS / Linux laptop |
+| Local all-in-one (Kanboard + Gitea + Marcus) | `docker-compose.yml` (root), via `./scripts/setup.sh` | macOS / Linux laptop |
 | Kanboard only | `kanboard/docker-compose.yml` | Railway, Fly.io, any VPS |
 | Gitea only | `gitea/docker-compose.yml` | Any small VPS (≥ 512 MB RAM) |
-| Marcus | runs locally, no Docker | Your laptop, a cloud VM, or CI |
+| Marcus only | `Dockerfile` (root), or `pip install -e .` + `python -m marcus --http` locally | A cloud VM, or CI, pointed at remote Kanboard/Gitea instances |
 
 **Railway (Kanboard):** push to GitHub, create a Railway service pointing at `kanboard/`, set environment variables in the Railway dashboard. Railway reads `kanboard/railway.toml` automatically.
 
