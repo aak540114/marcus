@@ -976,13 +976,13 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
         USAGE_REPORT_TOOL,
         # Cost tracking dashboard (#409)
         COST_SUMMARY_TOOL,
-        # Human-gated workflow tools (Kanboard+GitLab integration)
+        # Human-gated workflow tools (Kanboard+Gitea integration)
         types.Tool(
             name="get_work_context",
             description=(
                 "Return everything a new AI agent needs to start working on a "
                 "ticket: title, description, acceptance criteria, git branch name, "
-                "local repo path, GitLab URL, and step-by-step instructions. "
+                "local repo path, Gitea URL, and step-by-step instructions. "
                 "Call this first when assigned to a Kanboard ticket."
             ),
             inputSchema={
@@ -1724,7 +1724,7 @@ async def handle_tool_call(
                 ),
             }
 
-        # Human-gated workflow tools (Kanboard+GitLab integration)
+        # Human-gated workflow tools (Kanboard+Gitea integration)
         elif name in {
             "get_work_context",
             "generate_acceptance_criteria",

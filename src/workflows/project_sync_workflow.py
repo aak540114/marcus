@@ -1,11 +1,11 @@
-"""ProjectSyncWorkflow — syncs Kanboard projects to GitLab repositories.
+"""ProjectSyncWorkflow — syncs Kanboard projects to Gitea repositories.
 
 Subscribes to the ``project.created`` event emitted by ``ProjectWatcher``
 and reacts by:
 
-1. Creating a corresponding GitLab repository (slugified from the project name).
+1. Creating a corresponding Gitea repository (slugified from the project name).
 2. Initialising it with a README and pushing the first commit.
-3. Persisting the Kanboard-project → GitLab-repo mapping to
+3. Persisting the Kanboard-project → Gitea-repo mapping to
    ``./data/project_repos.json`` so that ``HumanGatedWorkflow`` can look
    up the correct git remote when creating ticket branches.
 
@@ -14,7 +14,7 @@ Usage
 ::
 
     sync = ProjectSyncWorkflow(
-        gitlab_manager=gitlab_mgr,
+        gitea_manager=gitea_mgr,
         events=events,
         repos_path="./data/project_repos.json",
         local_repos_base="./repos",
@@ -30,7 +30,7 @@ Mapping file format (``project_repos.json``)
       "kanboard:1": {
         "kanboard_project_id": 1,
         "kanboard_project_name": "Shopping Cart",
-        "gitlab_repo_url": "http://localhost:8929/root/shopping-cart.git",
+        "gitea_repo_url": "http://localhost:3000/root/shopping-cart.git",
         "local_repo_path": "./repos/shopping-cart"
       }
     }
@@ -42,18 +42,18 @@ import os
 from typing import Any, Dict, Optional
 
 from src.core.events import Events
-from src.integrations.gitlab_manager import GitLabManager, _slugify
+from src.integrations.gitea_manager import GiteaManager, _slugify
 
 logger = logging.getLogger(__name__)
 
 
 class ProjectSyncWorkflow:
-    """Sync Kanboard projects to GitLab repositories.
+    """Sync Kanboard projects to Gitea repositories.
 
     Parameters
     ----------
-    gitlab_manager : GitLabManager
-        Connected GitLab manager instance.
+    gitea_manager : GiteaManager
+        Connected Gitea manager instance.
     events : Events
         Marcus event bus.
     repos_path : str
@@ -64,13 +64,13 @@ class ProjectSyncWorkflow:
 
     def __init__(
         self,
-        gitlab_manager: GitLabManager,
+        gitea_manager: GiteaManager,
         events: Events,
         repos_path: str = "./data/project_repos.json",
         local_repos_base: str = "./repos",
     ) -> None:
         """Initialise the workflow."""
-        self._gitlab = gitlab_manager
+        self._gitea = gitea_manager
         self._events = events
         self._repos_path = repos_path
         self._local_repos_base = local_repos_base
@@ -90,7 +90,7 @@ class ProjectSyncWorkflow:
     # ------------------------------------------------------------------
 
     async def _on_project_created(self, event: Any) -> None:
-        """Handle a new Kanboard project by creating a GitLab repo.
+        """Handle a new Kanboard project by creating a Gitea repo.
 
         Parameters
         ----------
@@ -112,11 +112,11 @@ class ProjectSyncWorkflow:
         local_path = os.path.join(self._local_repos_base, slug)
 
         try:
-            clone_url = await self._gitlab.create_repo(name, description)
-            await self._gitlab.init_with_readme(clone_url, local_path)
+            clone_url = await self._gitea.create_repo(name, description)
+            await self._gitea.init_with_readme(clone_url, local_path)
         except Exception as exc:  # noqa: BLE001
             logger.error(
-                "Failed to create GitLab repo for project %d (%s): %s",
+                "Failed to create Gitea repo for project %d (%s): %s",
                 pid,
                 name,
                 exc,
@@ -126,12 +126,12 @@ class ProjectSyncWorkflow:
         self._mapping[key] = {
             "kanboard_project_id": pid,
             "kanboard_project_name": name,
-            "gitlab_repo_url": clone_url,
+            "gitea_repo_url": clone_url,
             "local_repo_path": local_path,
         }
         self._save_mapping()
         logger.info(
-            "Project %d (%s) → GitLab %s (local: %s)",
+            "Project %d (%s) → Gitea %s (local: %s)",
             pid,
             name,
             clone_url,
@@ -155,7 +155,7 @@ class ProjectSyncWorkflow:
         Returns
         -------
         Optional[Dict[str, Any]]
-            Dict with ``gitlab_repo_url`` and ``local_repo_path``, or None.
+            Dict with ``gitea_repo_url`` and ``local_repo_path``, or None.
         """
         return self._mapping.get(f"kanboard:{kanboard_project_id}")
 

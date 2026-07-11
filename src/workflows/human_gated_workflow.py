@@ -870,13 +870,13 @@ class HumanGatedWorkflow:
         """Return everything an AI agent needs to start working on a ticket.
 
         This is the single entry-point for any new AI agent connecting to
-        the Marcus–Kanboard–GitLab system.  A single call gives the agent:
+        the Marcus–Kanboard–Gitea system.  A single call gives the agent:
 
         - Ticket title and description (from Kanboard)
         - Acceptance criteria checklist (from Marcus lifecycle store)
         - Git branch name to check out
         - Local repository path on disk
-        - GitLab remote URL
+        - Gitea remote URL
         - Current lifecycle state
         - MCP server URL for reporting back
 
@@ -913,12 +913,12 @@ class HumanGatedWorkflow:
 
         # Repo info from ProjectSyncWorkflow (if wired up).
         local_repo_path: Optional[str] = None
-        gitlab_repo_url: Optional[str] = None
+        gitea_repo_url: Optional[str] = None
         if self._project_sync and kanboard_project_id is not None:
             mapping = self._project_sync.get_repo_for_project(kanboard_project_id)
             if mapping:
                 local_repo_path = mapping.get("local_repo_path")
-                gitlab_repo_url = mapping.get("gitlab_repo_url")
+                gitea_repo_url = mapping.get("gitea_repo_url")
 
         return {
             "ticket_id": ticket_id,
@@ -928,7 +928,7 @@ class HumanGatedWorkflow:
             "acceptance_criteria": record.acceptance_criteria or "",
             "branch_name": record.branch_name,
             "local_repo_path": local_repo_path,
-            "gitlab_repo_url": gitlab_repo_url,
+            "gitea_repo_url": gitea_repo_url,
             "state": record.state.value,
             "assignee": record.assignee,
             "already_claimed_by": record.ai_agent_id,

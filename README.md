@@ -1,6 +1,6 @@
 # Marcus × Kanboard
 
-A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — the board-mediated AI multi-agent orchestrator — wired to **Kanboard** for ticket management, **GitLab CE** for git repositories, and a custom Kanboard plugin that gives every board a live AI control panel.
+A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — the board-mediated AI multi-agent orchestrator — wired to **Kanboard** for ticket management, **Gitea** for git repositories, and a custom Kanboard plugin that gives every board a live AI control panel.
 
 > **What Marcus is:** see the [Marcus README](https://github.com/lwgray/marcus) and [docs](https://marcus-ai.dev). This repo is an opinionated deployment of it, not a fork.
 
@@ -11,7 +11,7 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | Feature | Description |
 |---|---|
 | **Kanboard provider** | Full Kanboard JSON-RPC integration — tickets, columns, comments, assignments |
-| **GitLab CE integration** | Auto-creates a GitLab repo for each new Kanboard project; branches pushed per ticket |
+| **Gitea integration** | Auto-creates a Gitea repo for each new Kanboard project; branches pushed per ticket |
 | **MarcusDevEnv plugin** | Kanboard plugin that adds AI-aware UI to every board and task |
 | **Hot-reload dev environments** | One-click per-ticket preview URL; supports any language/framework via project description |
 | **Project Description system** | Per-project markdown doc that AI agents read to learn the tech stack; editable from the board |
@@ -26,9 +26,9 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 |---|---|
 | [Marcus](https://github.com/lwgray/marcus) | AI multi-agent orchestrator (MCP server, board watcher, ticket lifecycle, agent coordination) |
 | [Kanboard](https://kanboard.org) | Self-hosted kanban board — the shared task board all agents coordinate through |
-| [GitLab CE](https://about.gitlab.com) | Self-hosted git — one repo per project, one branch per ticket |
+| [Gitea](https://about.gitea.com) | Self-hosted git — one repo per project, one branch per ticket. A single lightweight Go binary, chosen over GitLab CE for its low resource footprint |
 | Python 3.11+ | Marcus server runtime |
-| Docker / Docker Compose | Runs Kanboard and GitLab; dev containers for hot-reload previews |
+| Docker / Docker Compose | Runs Kanboard and Gitea; dev containers for hot-reload previews |
 | [MCP](https://modelcontextprotocol.io) | Protocol agents use to talk to Marcus (Claude Code, Codex, Gemini CLI, etc.) |
 
 ---
@@ -64,9 +64,9 @@ Kanboard (port 8080) ←──────────── Kanboard JSON-RPC A
   │  ProjectWatcher polls              │  BoardWatcher polls / webhook
   ▼  getAllProjects()                  ▼  getAllTasks()
 Marcus (local, port 4298)        Marcus (local)
-  │  GitLabManager                     │  BranchManager + HumanGatedWorkflow
-  ▼  POST /api/v4/projects             ▼  git push branch
-GitLab CE (port 8929)           GitLab CE — branch per ticket
+  │  GiteaManager                      │  BranchManager + HumanGatedWorkflow
+  ▼  POST /api/v1/user/repos           ▼  git push branch
+Gitea (port 3000)               Gitea — branch per ticket
 
 AI agents (Claude Code, Codex, etc.)
   └── connect to http://localhost:4298/mcp  (MCP protocol)
@@ -84,7 +84,7 @@ AI agents (Claude Code, Codex, etc.)
 
 ### Prerequisites
 
-- Docker Desktop (macOS/Linux) with **≥ 6 GB RAM** allocated (GitLab needs it)
+- Docker Desktop (macOS/Linux) — **2 GB RAM** is plenty (Gitea is lightweight; no GitLab-sized allocation needed)
 - Python 3.11+
 - An MCP-compatible AI agent (Claude Code, Codex, etc.)
 
@@ -94,16 +94,16 @@ AI agents (Claude Code, Codex, etc.)
 docker compose up -d
 ```
 
-Kanboard is ready in ~5 seconds. GitLab takes **3–10 minutes** on first boot:
+Both services are ready in seconds — Gitea is a single Go binary with an embedded SQLite database, not a multi-process Rails app:
 
 ```bash
-docker compose logs -f gitlab | grep "GitLab is ready to serve"
+docker compose logs -f gitea | grep "Listen"
 ```
 
 | Service | URL | Default credentials |
 |---|---|---|
 | Kanboard | http://localhost:8080 | `admin` / `admin` |
-| GitLab CE | http://localhost:8929 | `root` / `Marcus123!` |
+| Gitea | http://localhost:3000 | *(create on first run — see step 3)* |
 
 ### 2. First-time Kanboard setup
 
@@ -115,10 +115,19 @@ docker compose logs -f gitlab | grep "GitLab is ready to serve"
    ```
 4. Create a project and add columns: `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
 
-### 3. First-time GitLab setup
+### 3. First-time Gitea setup
 
-1. Log in at http://localhost:8929
-2. **Edit Profile → Access Tokens** — create a token with `api` + `write_repository` scopes
+`docker-compose.yml` sets `GITEA__security__INSTALL_LOCK=true`, which skips Gitea's web installer wizard — but that also means no admin account exists yet. Create one:
+
+```bash
+docker compose exec gitea gitea admin user create \
+  --username root --password Marcus123! \
+  --email root@example.com --admin --must-change-password=false
+```
+
+Then:
+1. Log in at http://localhost:3000 as `root` / `Marcus123!`
+2. **Settings → Applications → Generate New Token** — create a token with `write:repository` and `read:user` scopes
 
 ### 4. Configure Marcus
 
@@ -127,8 +136,8 @@ export KANBAN_PROVIDER=kanboard
 export KANBOARD_URL=http://localhost:8080/jsonrpc.php
 export KANBOARD_API_TOKEN=<your-kanboard-token>
 export KANBOARD_PROJECT_ID=1
-export GITLAB_URL=http://localhost:8929
-export GITLAB_TOKEN=<your-gitlab-pat>
+export GITEA_URL=http://localhost:3000
+export GITEA_TOKEN=<your-gitea-pat>
 export MARCUS_URL=http://localhost:4298
 ```
 
@@ -142,8 +151,8 @@ Or set these in `config_marcus.json`:
     "kanboard_api_token": "YOUR_KANBOARD_TOKEN",
     "kanboard_project_id": 1
   },
-  "gitlab_url": "http://localhost:8929",
-  "gitlab_token": "YOUR_GITLAB_PAT"
+  "gitea_url": "http://localhost:3000",
+  "gitea_token": "YOUR_GITEA_PAT"
 }
 ```
 
@@ -173,7 +182,7 @@ Human creates ticket in Kanboard
 Human assigns ticket + moves to "Ready"
   → Marcus checks project description for tech stack
   → If stack missing: posts clarification comment, moves to "Waiting for Human"
-  → If stack OK: creates branch in GitLab, moves to "In Progress"
+  → If stack OK: creates branch in Gitea, moves to "In Progress"
 
 AI agent works on the branch
   → Posts progress comments at 25 / 50 / 75 / 100 %
@@ -263,7 +272,7 @@ Each service deploys independently:
 |---|---|---|
 | Local all-in-one | `docker-compose.yml` (root) | macOS / Linux laptop |
 | Kanboard only | `kanboard/docker-compose.yml` | Railway, Fly.io, any VPS |
-| GitLab only | `gitlab/docker-compose.yml` | Dedicated VPS (≥ 4 GB RAM) |
+| Gitea only | `gitea/docker-compose.yml` | Any small VPS (≥ 512 MB RAM) |
 | Marcus | runs locally, no Docker | Your laptop, a cloud VM, or CI |
 
 **Railway (Kanboard):** push to GitHub, create a Railway service pointing at `kanboard/`, set environment variables in the Railway dashboard. Railway reads `kanboard/railway.toml` automatically.

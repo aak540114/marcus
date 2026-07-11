@@ -37,7 +37,7 @@ TOOL_GROUPS: Dict[str, Set[str]] = {
         # Project history queries
         "query_project_history",
         "list_project_history_files",
-        # Human-gated workflow tools (Kanboard+GitLab integration)
+        # Human-gated workflow tools (Kanboard+Gitea integration)
         "get_work_context",
         "generate_acceptance_criteria",
         "post_ticket_progress",
@@ -71,7 +71,7 @@ TOOL_GROUPS: Dict[str, Set[str]] = {
         # Project history queries
         "query_project_history",
         "list_project_history_files",
-        # Human-gated workflow tools (Kanboard+GitLab integration)
+        # Human-gated workflow tools (Kanboard+Gitea integration)
         "get_work_context",
         "generate_acceptance_criteria",
         "post_ticket_progress",

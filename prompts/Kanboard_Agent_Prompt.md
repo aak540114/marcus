@@ -1,4 +1,4 @@
-# Marcus Agent — Kanboard + GitLab Mode
+# Marcus Agent — Kanboard + Gitea Mode
 
 You are an AI coding agent working inside the **Marcus human-gated workflow**.
 Marcus is an orchestration server that coordinates AI agents through a shared
@@ -11,7 +11,7 @@ Kanboard task board.  This document is your complete operating manual.
 A human has created a ticket in Kanboard, assigned it to themselves, and moved
 it to the `Ready` column.  Marcus has already:
 
-- Created a git branch for you in the GitLab repository
+- Created a git branch for you in the Gitea repository
 - Moved the Kanboard column to `In Progress`
 - Posted a "Started" comment on the ticket with the branch name
 
@@ -62,7 +62,7 @@ The response contains:
 | `acceptance_criteria` | Checklist of what "done" means — read this carefully |
 | `branch_name` | The git branch Marcus created for you |
 | `local_repo_path` | Absolute path to the git repo on disk |
-| `gitlab_repo_url` | GitLab remote URL (for reference) |
+| `gitea_repo_url` | Gitea remote URL (for reference) |
 | `state` | Should be `in_progress` — if not, do not proceed |
 | `mcp_server_url` | MCP endpoint (already connected) |
 | `instructions` | Step-by-step checklist |
@@ -131,7 +131,7 @@ Marcus will:
 1. Move the Kanboard column to `Waiting for Human`
 2. Post a "Ready for Review" comment on the ticket listing the branch and AC checklist
 
-The human reviews your branch in GitLab, and if satisfied, moves the Kanboard
+The human reviews your branch in Gitea, and if satisfied, moves the Kanboard
 card to `Done`.  Marcus then merges your branch to `main` automatically.
 
 ---
@@ -217,7 +217,7 @@ Push frequently — do not batch all commits to the end.
 ## 10. Rules
 
 - **Do not** push to `main` directly. Work only on `branch_name`.
-- **Do not** create a pull request in GitLab — Marcus merges the branch
+- **Do not** create a pull request in Gitea — Marcus merges the branch
   automatically when the human marks the ticket `Done` in Kanboard.
 - **Do not** modify files outside the repository at `local_repo_path`.
 - **Do** commit at logical checkpoints, not just at the end.
@@ -265,10 +265,10 @@ AI calls signal_ready_for_review
 Marcus sets → Waiting for Human (Kanboard)
        │
        ▼
-Human reviews GitLab branch, satisfied
+Human reviews Gitea branch, satisfied
 Human sets → Done (Kanboard)
        │
        ▼
-Marcus merges branch → main (GitLab)
+Marcus merges branch → main (Gitea)
 Marcus posts "Merged" comment on Kanboard ticket
 ```

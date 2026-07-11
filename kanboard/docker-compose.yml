@@ -2,7 +2,7 @@
 #
 # Standalone Kanboard deployment — runs only Kanboard with the
 # MarcusDevEnv plugin pre-installed.  Use this when Kanboard lives on
-# a different server from Marcus and GitLab (e.g. Railway, Fly.io, VPS).
+# a different server from Marcus and Gitea (e.g. Railway, Fly.io, VPS).
 #
 # Quick start (VPS / local)
 # -------------------------

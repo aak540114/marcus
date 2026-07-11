@@ -1,29 +1,36 @@
 # docker-compose.yml — LOCAL DEVELOPMENT ONLY
 #
-# Runs Kanboard + GitLab on a single machine alongside a locally-running
+# Runs Kanboard + Gitea on a single machine alongside a locally-running
 # Marcus instance.  Not intended for production — use the individual
 # compose files instead:
 #
 #   kanboard/docker-compose.yml  →  deploy Kanboard (e.g. Railway)
-#   gitlab/docker-compose.yml    →  deploy GitLab   (e.g. VPS / cloud VM)
+#   gitea/docker-compose.yml     →  deploy Gitea    (e.g. VPS / cloud VM)
 #
 # Quick start
 # -----------
 #   docker compose up -d
 #
-#   # GitLab takes 3–10 min on first boot:
-#   docker compose logs -f gitlab | grep "GitLab is ready to serve"
+#   # Gitea boots in seconds — it's a single lightweight Go binary with an
+#   # embedded SQLite database, unlike GitLab CE's multi-minute Rails boot:
+#   docker compose logs -f gitea | grep "Listen"
 #
 # The MarcusDevEnv plugin is bind-mounted from kanboard/plugins/ so any
 # edits to the PHP templates take effect after a container restart:
 #   docker compose restart kanboard
 #
+# One-time Gitea admin setup (INSTALL_LOCK skips the web installer wizard,
+# so there is no default admin account yet):
+#   docker compose exec gitea gitea admin user create \
+#     --username root --password Marcus123! \
+#     --email root@example.com --admin --must-change-password=false
+#
 # Configure Marcus (run locally, not in Docker):
 #   export KANBOARD_URL=http://localhost:8080/jsonrpc.php
 #   export KANBOARD_API_TOKEN=<token from Kanboard → Settings → API>
 #   export KANBOARD_PROJECT_ID=1
-#   export GITLAB_URL=http://localhost:8929
-#   export GITLAB_TOKEN=<token from GitLab → Profile → Access Tokens>
+#   export GITEA_URL=http://localhost:3000
+#   export GITEA_TOKEN=<token from Gitea → Settings → Applications>
 #   export MARCUS_URL=http://localhost:4298
 #   export KANBOARD_WEBHOOK_TOKEN=<shared secret, optional>
 
@@ -48,29 +55,30 @@ services:
       retries: 5
       start_period: 10s
 
-  gitlab:
-    image: gitlab/gitlab-ce:latest
-    container_name: marcus-gitlab
-    hostname: localhost
+  gitea:
+    image: gitea/gitea:latest
+    container_name: marcus-gitea
     restart: unless-stopped
     ports:
-      - "8929:80"
-      - "2289:22"
+      - "3000:3000"
+      - "2222:22"
     volumes:
-      - gitlab_config:/etc/gitlab
-      - gitlab_logs:/var/log/gitlab
-      - gitlab_data:/var/opt/gitlab
-    shm_size: "256m"
+      - gitea_data:/data
     environment:
-      GITLAB_OMNIBUS_CONFIG: |
-        external_url 'http://localhost:8929'
-        gitlab_rails['gitlab_shell_ssh_port'] = 2289
-        gitlab_rails['initial_root_password'] = 'Marcus123!'
-        puma['worker_processes'] = 2
-        sidekiq['concurrency'] = 5
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__DOMAIN: localhost
+      GITEA__server__ROOT_URL: "http://localhost:3000/"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
 volumes:
   kanboard_data:
-  gitlab_config:
-  gitlab_logs:
-  gitlab_data:
+  gitea_data:

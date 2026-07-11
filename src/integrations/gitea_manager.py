@@ -1,16 +1,30 @@
-"""GitLab REST API wrapper for repository management.
+"""Gitea REST API wrapper for repository management.
 
-Creates and manages GitLab repositories for Kanboard projects.
-Uses the GitLab REST API v4 with a Personal Access Token.
+Creates and manages Gitea repositories for Kanboard projects.
+Uses the Gitea REST API v1 with a Personal Access Token.
+
+Gitea was chosen over GitLab CE for this deployment because it is a single
+lightweight Go binary — it boots in seconds on ~200-500 MB of RAM, versus
+GitLab CE's multi-minute boot and 4+ GB RAM requirement.  That makes local
+demos and small VPS deployments far more practical.
 
 Configuration
 -------------
-``gitlab_url``
-    Base URL, e.g. ``http://localhost:8929``.
-``gitlab_token``
-    Personal Access Token with ``api`` and ``write_repository`` scopes.
-``gitlab_namespace``
-    Optional group/user namespace. Defaults to the token owner.
+``gitea_url``
+    Base URL, e.g. ``http://localhost:3000``.
+``gitea_token``
+    Personal Access Token with ``write:repository`` and ``read:user`` scopes.
+``gitea_namespace``
+    Optional organisation name. Defaults to the token owner's own account.
+
+Push authentication
+--------------------
+Unlike GitLab, which accepts the fixed placeholder username ``oauth2`` for
+any Personal Access Token, Gitea's Git-over-HTTP auth requires the *actual*
+username of the token's owner as the HTTP Basic username (the token itself
+is the password).  This manager resolves and caches that username in
+``connect()`` and uses it — not the namespace, which may be a different
+organisation — when building authenticated push URLs.
 """
 
 import asyncio
@@ -24,31 +38,32 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-class GitLabManager:
-    """Create and configure GitLab repositories for new Kanboard projects.
+class GiteaManager:
+    """Create and configure Gitea repositories for new Kanboard projects.
 
     Parameters
     ----------
-    gitlab_url : str
-        GitLab base URL (no trailing slash).
+    gitea_url : str
+        Gitea base URL (no trailing slash).
     token : str
         Personal Access Token.
     namespace : Optional[str]
-        GitLab username or group to create repos under.
+        Gitea username or organisation to create repos under.
         If None, repos are created under the authenticated user.
     """
 
     def __init__(
         self,
-        gitlab_url: str,
+        gitea_url: str,
         token: str,
         namespace: Optional[str] = None,
     ) -> None:
         """Initialise the manager (no network calls)."""
-        self._base = gitlab_url.rstrip("/")
+        self._base = gitea_url.rstrip("/")
         self._token = token
         self._namespace = namespace
-        self._headers = {"PRIVATE-TOKEN": token}
+        self._username: Optional[str] = None
+        self._headers = {"Authorization": f"token {token}"}
         self._client: Optional[httpx.AsyncClient] = None
 
     # ------------------------------------------------------------------
@@ -58,6 +73,10 @@ class GitLabManager:
     async def connect(self) -> bool:
         """Open the HTTP client and verify the token is valid.
 
+        Also resolves the token owner's username, which is required later
+        for building authenticated push URLs (Gitea has no GitLab-style
+        ``oauth2`` username placeholder).
+
         Returns
         -------
         bool
@@ -65,19 +84,21 @@ class GitLabManager:
         """
         self._client = httpx.AsyncClient(timeout=30.0, headers=self._headers)
         try:
-            r = await self._client.get(f"{self._base}/api/v4/user")
+            r = await self._client.get(f"{self._base}/api/v1/user")
             r.raise_for_status()
             user = r.json()
+            self._username = user.get("login")
             if self._namespace is None:
-                self._namespace = user.get("username", "root")
+                self._namespace = self._username
             logger.info(
-                "GitLabManager connected as %s on %s",
+                "GiteaManager connected as %s (namespace %s) on %s",
+                self._username,
                 self._namespace,
                 self._base,
             )
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.error("GitLabManager connect failed: %s", exc)
+            logger.error("GiteaManager connect failed: %s", exc)
             return False
 
     async def disconnect(self) -> None:
@@ -101,20 +122,19 @@ class GitLabManager:
         Returns
         -------
         bool
-            True if an exact match is found.
+            True if the repository exists under the configured namespace.
         """
         if self._client is None:
-            raise RuntimeError("GitLabManager not connected — call connect() first")
-        r = await self._client.get(
-            f"{self._base}/api/v4/projects",
-            params={"search": slug, "owned": True},
-        )
+            raise RuntimeError("GiteaManager not connected — call connect() first")
+        owner = self._namespace
+        r = await self._client.get(f"{self._base}/api/v1/repos/{owner}/{slug}")
+        if r.status_code == 404:
+            return False
         r.raise_for_status()
-        projects = r.json()
-        return any(p.get("path") == slug for p in projects)
+        return True
 
     async def create_repo(self, name: str, description: str = "") -> str:
-        """Create a new GitLab repository.
+        """Create a new Gitea repository.
 
         Parameters
         ----------
@@ -127,7 +147,7 @@ class GitLabManager:
         -------
         str
             HTTP clone URL, e.g.
-            ``http://localhost:8929/root/shopping-cart.git``.
+            ``http://localhost:3000/root/shopping-cart.git``.
 
         Raises
         ------
@@ -135,46 +155,45 @@ class GitLabManager:
             If the repository cannot be created.
         """
         if self._client is None:
-            raise RuntimeError("GitLabManager not connected — call connect() first")
+            raise RuntimeError("GiteaManager not connected — call connect() first")
 
         slug = _slugify(name)
+        owner = self._namespace
 
         if await self.repo_exists(slug):
-            logger.info("GitLab repo %r already exists — skipping creation", slug)
-            r = await self._client.get(
-                f"{self._base}/api/v4/projects/{self._namespace}%2F{slug}"
-            )
+            logger.info("Gitea repo %r already exists — skipping creation", slug)
+            r = await self._client.get(f"{self._base}/api/v1/repos/{owner}/{slug}")
             r.raise_for_status()
-            return str(r.json()["http_url_to_repo"])
+            return str(r.json()["clone_url"])
 
         payload: Dict[str, Any] = {
-            "name": name,
-            "path": slug,
+            "name": slug,
             "description": description,
-            "visibility": "private",
-            "initialize_with_readme": False,
+            "private": True,
+            "auto_init": False,
         }
-        if self._namespace:
-            # Try to resolve namespace_id (handles groups correctly)
-            ns_id = await self._resolve_namespace_id(self._namespace)
-            if ns_id:
-                payload["namespace_id"] = ns_id
 
-        r = await self._client.post(
-            f"{self._base}/api/v4/projects", json=payload
-        )
+        # Repos can only be created under the authenticated user's own
+        # account or an organisation they belong to — Gitea addresses each
+        # via a different endpoint (no numeric namespace ID, unlike GitLab).
+        if owner and owner != self._username:
+            create_url = f"{self._base}/api/v1/orgs/{owner}/repos"
+        else:
+            create_url = f"{self._base}/api/v1/user/repos"
+
+        r = await self._client.post(create_url, json=payload)
         r.raise_for_status()
-        clone_url: str = r.json()["http_url_to_repo"]
-        logger.info("Created GitLab repo %s", clone_url)
+        clone_url: str = r.json()["clone_url"]
+        logger.info("Created Gitea repo %s", clone_url)
         return clone_url
 
     async def init_with_readme(self, clone_url: str, local_path: str) -> None:
-        """Initialise a local repo with a README and push to GitLab.
+        """Initialise a local repo with a README and push to Gitea.
 
         Parameters
         ----------
         clone_url : str
-            GitLab HTTP clone URL for the repo.
+            Gitea HTTP clone URL for the repo.
         local_path : str
             Local directory to initialise (created if absent).
 
@@ -185,8 +204,10 @@ class GitLabManager:
         """
         os.makedirs(local_path, exist_ok=True)
 
-        # Embed token in the push URL so no interactive auth is needed.
-        push_url = _auth_clone_url(clone_url, self._token)
+        # Embed the token owner's username + token in the push URL so no
+        # interactive auth is needed for Marcus's own pushes or the AI
+        # agent's later `git push origin <branch>` calls.
+        push_url = _auth_clone_url(clone_url, self._username or "", self._token)
 
         cmds = [
             ["git", "init", "-b", "main"],
@@ -215,38 +236,6 @@ class GitLabManager:
         )
         logger.info("Pushed initial commit to %s", clone_url)
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    async def _resolve_namespace_id(self, namespace: str) -> Optional[int]:
-        """Look up the numeric namespace ID for a username or group path.
-
-        Parameters
-        ----------
-        namespace : str
-            Username or group path.
-
-        Returns
-        -------
-        Optional[int]
-            Numeric ID or None if not found.
-        """
-        if self._client is None:
-            return None
-        try:
-            r = await self._client.get(
-                f"{self._base}/api/v4/namespaces",
-                params={"search": namespace},
-            )
-            r.raise_for_status()
-            for ns in r.json():
-                if ns.get("path") == namespace or ns.get("name") == namespace:
-                    return int(ns["id"])
-        except Exception:  # noqa: BLE001
-            pass
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -254,7 +243,7 @@ class GitLabManager:
 
 
 def _slugify(name: str) -> str:
-    """Convert a project name to a URL-safe GitLab path slug.
+    """Convert a project name to a URL-safe Gitea repo slug.
 
     Parameters
     ----------
@@ -271,28 +260,34 @@ def _slugify(name: str) -> str:
     return slug.strip("-")
 
 
-def _auth_clone_url(clone_url: str, token: str) -> str:
+def _auth_clone_url(clone_url: str, username: str, token: str) -> str:
     """Embed a PAT into an HTTP clone URL for password-free git push.
+
+    Gitea requires the *real* username of the token's owner as the HTTP
+    Basic username — there is no GitLab-style ``oauth2`` placeholder that
+    works regardless of who owns the token.
 
     Parameters
     ----------
     clone_url : str
-        Plain clone URL, e.g. ``http://localhost:8929/root/repo.git``.
+        Plain clone URL, e.g. ``http://localhost:3000/root/repo.git``.
+    username : str
+        Gitea username that owns the token.
     token : str
-        GitLab Personal Access Token.
+        Gitea Personal Access Token.
 
     Returns
     -------
     str
         Authenticated URL, e.g.
-        ``http://oauth2:<token>@localhost:8929/root/repo.git``.
+        ``http://root:<token>@localhost:3000/root/repo.git``.
     """
     if clone_url.startswith("http://"):
         rest = clone_url[len("http://"):]
-        return f"http://oauth2:{token}@{rest}"
+        return f"http://{username}:{token}@{rest}"
     if clone_url.startswith("https://"):
         rest = clone_url[len("https://"):]
-        return f"https://oauth2:{token}@{rest}"
+        return f"https://{username}:{token}@{rest}"
     return clone_url
 
 

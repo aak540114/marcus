@@ -1,0 +1,78 @@
+# gitea/docker-compose.yml
+#
+# Standalone Gitea deployment.  Use this when Gitea lives on a dedicated
+# server (VPS, bare metal, cloud VM) separate from Kanboard and Marcus.
+#
+# Resource requirements
+# ----------------------
+# Gitea is a single lightweight Go binary with an embedded SQLite database —
+# no separate database container, no Rails/Sidekiq/Puma stack.  Minimum
+# recommended:
+#   CPU:  1 vCPU
+#   RAM:  512 MB (1 GB for comfortable use)
+#   Disk: 1 GB + repo storage
+#
+# For comparison, GitLab CE recommends 2 vCPUs / 4+ GB RAM and takes
+# several minutes to boot.  Gitea boots in seconds.
+#
+# Quick start
+# -----------
+#   cd gitea/
+#   GITEA_EXTERNAL_URL=http://your-server-ip:3000 \
+#     docker compose up -d
+#
+#   docker compose logs -f gitea | grep "Listen"
+#
+# Environment variables
+# ----------------------
+# GITEA_EXTERNAL_URL   The full URL agents and browsers use to reach Gitea,
+#                       e.g. http://203.0.113.10:3000 or
+#                       https://git.example.com.  Must be reachable from
+#                       Marcus and from developer machines.
+#
+# GITEA_DOMAIN          Hostname only (no scheme/port), used for SSH clone
+#                       URLs.  Defaults to "localhost".
+#
+# After starting
+# ---------------
+# 1. Create the admin account (INSTALL_LOCK skips the web installer, so
+#    there is no default admin user yet):
+#      docker compose exec gitea gitea admin user create \
+#        --username root --password <choose-a-password> \
+#        --email root@example.com --admin --must-change-password=false
+# 2. Visit $GITEA_EXTERNAL_URL — log in as root
+# 3. Settings → Applications → Generate New Token — scopes:
+#      write:repository  read:user
+#    Copy the token; set it on Marcus:
+#      export GITEA_TOKEN=<token>
+#      export GITEA_URL=<GITEA_EXTERNAL_URL>
+# 4. Marcus will auto-create repos under the root namespace when new
+#    Kanboard projects appear.
+
+services:
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    restart: unless-stopped
+    ports:
+      - "${GITEA_HTTP_PORT:-3000}:3000"
+      - "${GITEA_SSH_PORT:-2222}:22"
+    volumes:
+      - gitea_data:/data
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__DOMAIN: "${GITEA_DOMAIN:-localhost}"
+      GITEA__server__ROOT_URL: "${GITEA_EXTERNAL_URL:-http://localhost:3000/}"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  gitea_data:

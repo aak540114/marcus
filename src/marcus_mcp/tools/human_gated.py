@@ -14,7 +14,7 @@ Tool list
 ``get_work_context``
     **Start here.** Returns everything a new AI agent needs to begin work
     on a ticket: title, description, acceptance criteria, branch name,
-    local repo path, GitLab URL, and step-by-step instructions.
+    local repo path, Gitea URL, and step-by-step instructions.
 ``generate_acceptance_criteria``
     Generate an AC checklist for a ticket and post it.
 ``post_ticket_progress``
@@ -559,7 +559,7 @@ async def get_work_context(
     This is the **first tool** any new AI agent should call after connecting
     to the Marcus MCP server.  A single call returns the full work context:
     ticket title, description, acceptance criteria, git branch name, local
-    repository path, GitLab remote URL, and step-by-step instructions.
+    repository path, Gitea remote URL, and step-by-step instructions.
 
     Parameters
     ----------
@@ -572,7 +572,7 @@ async def get_work_context(
     -------
     Dict[str, Any]
         ``{success, result: {ticket_id, provider, title, description,
-        acceptance_criteria, branch_name, local_repo_path, gitlab_repo_url,
+        acceptance_criteria, branch_name, local_repo_path, gitea_repo_url,
         state, assignee, mcp_server_url, instructions}}``
         or ``{success: False, error}``.
 
@@ -591,7 +591,7 @@ async def get_work_context(
           "acceptance_criteria": "- [ ] Button visible on cart page\\n- [ ] ...",
           "branch_name": "ticket/kanboard/42",
           "local_repo_path": "./repos/my-app",
-          "gitlab_repo_url": "http://localhost:8929/root/my-app.git",
+          "gitea_repo_url": "http://localhost:3000/root/my-app.git",
           "state": "in_progress",
           "mcp_server_url": "http://localhost:4298/mcp",
           "instructions": "1. cd into local_repo_path ..."
