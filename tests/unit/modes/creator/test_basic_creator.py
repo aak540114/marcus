@@ -6,8 +6,8 @@ which handles project creation from templates, customization, and task generatio
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from typing import Any
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -16,10 +16,7 @@ from src.modes.creator.basic_creator import BasicCreatorMode
 from src.modes.creator.template_library import (
     APIServiceTemplate,
     MobileAppTemplate,
-    PhaseTemplate,
     ProjectSize,
-    ProjectTemplate,
-    TaskTemplate,
     WebAppTemplate,
 )
 

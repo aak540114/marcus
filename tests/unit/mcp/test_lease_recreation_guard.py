@@ -7,7 +7,7 @@ on the finished task.  Doing so creates an orphaned lease that expires,
 triggering another recovery cycle and eventually a zombie task.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

@@ -5,9 +5,7 @@ Tests the integration verification phase that runs after implementation
 completes to verify the project actually builds, starts, and works.
 """
 
-import uuid
 from datetime import datetime, timezone
-from unittest.mock import patch
 
 import pytest
 

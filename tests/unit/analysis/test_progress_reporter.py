@@ -6,12 +6,11 @@ and monitoring of analysis operations.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from src.analysis.helpers.progress import (
-    ProgressCallback,
     ProgressEvent,
     ProgressReporter,
 )

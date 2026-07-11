@@ -6,8 +6,8 @@ error context, and error response formatting.
 """
 
 import json
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock, Mock, patch
+from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -15,34 +15,23 @@ from src.core.error_framework import (  # Transient errors; Configuration errors
     AIProviderError,
     AuthenticationError,
     AuthorizationError,
-    BusinessLogicError,
-    ConfigurationError,
-    CorruptedStateError,
     CriticalDependencyError,
     DatabaseError,
-    EnvironmentError,
     ErrorCategory,
     ErrorContext,
     ErrorSeverity,
     ExternalServiceError,
-    IntegrationError,
     InvalidConfigurationError,
     KanbanIntegrationError,
     MarcusBaseError,
     MissingCredentialsError,
     MissingDependencyError,
     NetworkTimeoutError,
-    PermissionError,
     RateLimitError,
     RemediationSuggestion,
     ResourceExhaustionError,
-    SecurityError,
     ServiceUnavailableError,
-    StateConflictError,
-    SystemError,
     TaskAssignmentError,
-    TemporaryResourceError,
-    TransientError,
     ValidationError,
     WorkflowViolationError,
     WorkspaceSecurityError,

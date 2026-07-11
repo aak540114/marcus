@@ -7,9 +7,6 @@ This demonstrates how Marcus agents would use attachments.
 
 import base64
 import json
-import subprocess
-import sys
-from pathlib import Path
 
 
 def call_mcp_tool(tool_name, arguments):
@@ -242,7 +239,7 @@ def test_attachment_workflow():
         print("\n🔍 Analyzing API specification...")
         print(f"   - API Title: {spec['info']['title']}")
         print(f"   - Version: {spec['info']['version']}")
-        print(f"   - Endpoints to implement:")
+        print("   - Endpoints to implement:")
         for path, methods in spec["paths"].items():
             for method, details in methods.items():
                 print(f"     • {method.upper()} {path} - {details['summary']}")

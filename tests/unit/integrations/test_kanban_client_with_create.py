@@ -10,19 +10,17 @@ All external MCP server calls and HTTP requests are mocked to ensure fast,
 isolated unit tests that don't require external services.
 """
 
-import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
+from typing import Any, Dict
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from src.core.error_framework import (
     ConfigurationError,
-    ErrorContext,
     KanbanIntegrationError,
 )
 from src.core.models import Priority, Task, TaskStatus

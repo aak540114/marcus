@@ -9,8 +9,6 @@ This demonstrates:
 4. Monitoring pipeline events
 """
 
-import asyncio
-import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -110,7 +108,7 @@ def start_workflow(project_id: str) -> Optional[Dict[str, Any]]:
     if response.status_code == 200:
         data = response.json()
         if data["success"]:
-            print(f"✓ Workflow started!")
+            print("✓ Workflow started!")
             print(f"  Flow ID: {data['flow_id']}")
             print(f"  PM Project ID: {data.get('pm_project_id')}")
             print(f"  Workflow ID: {data.get('workflow_id')}")

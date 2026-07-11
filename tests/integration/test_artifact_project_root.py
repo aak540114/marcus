@@ -6,7 +6,6 @@ and that all agents working on the same project can see each other's artifacts.
 No mocking - uses real file system operations.
 """
 
-import asyncio
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional

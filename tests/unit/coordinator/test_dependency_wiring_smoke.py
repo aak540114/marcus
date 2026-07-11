@@ -6,10 +6,7 @@ running comprehensive test suite.
 """
 
 from datetime import datetime, timezone
-from typing import List
-from unittest.mock import AsyncMock, Mock
 
-import numpy as np
 import pytest
 
 from src.core.models import Priority, Task, TaskStatus

@@ -2,13 +2,11 @@
 Unit tests for src/core/comment_protocol.py
 """
 
-import pytest
 
 from src.core.comment_protocol import (
     CommentFormatter,
     CommentParser,
     CommentType,
-    ParsedComment,
 )
 
 

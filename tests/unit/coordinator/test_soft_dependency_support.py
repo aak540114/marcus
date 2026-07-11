@@ -10,7 +10,6 @@ Tests verify that:
 
 from datetime import datetime, timezone
 
-import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.marcus_mcp.coordinator.subtask_assignment import (

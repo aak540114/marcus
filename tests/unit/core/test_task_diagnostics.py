@@ -6,7 +6,6 @@ Tests the diagnostic collectors, analyzers, and report generators.
 
 from datetime import datetime, timedelta, timezone
 from typing import List
-from unittest.mock import Mock
 
 import pytest
 

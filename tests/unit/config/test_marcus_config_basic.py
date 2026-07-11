@@ -4,7 +4,6 @@ This test file verifies the core configuration loading and structure.
 """
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -14,8 +13,6 @@ from src.config.marcus_config import (
     KanbanSettings,
     MarcusConfig,
     MCPSettings,
-    get_config,
-    reload_config,
 )
 
 

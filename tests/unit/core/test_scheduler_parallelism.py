@@ -4,7 +4,6 @@ Unit tests for parallelism calculation in scheduler.
 Tests the sweep-line algorithm that correctly handles overlapping task intervals.
 """
 
-import pytest
 
 from src.marcus_mcp.coordinator.scheduler import _calculate_max_parallelism
 

@@ -7,18 +7,14 @@ follow the correct development lifecycle order.
 
 from datetime import datetime, timezone
 from typing import Any, List
-from unittest.mock import Mock, patch
 
 import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.core.phase_dependency_enforcer import (
-    DependencyType,
-    FeatureGroup,
     PhaseDependencyEnforcer,
     TaskPhase,
 )
-from src.integrations.nlp_task_utils import TaskType
 
 
 def create_test_task(

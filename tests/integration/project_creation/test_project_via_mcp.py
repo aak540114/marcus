@@ -4,7 +4,6 @@ Test creating a project through the MCP server tools
 """
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 
@@ -56,7 +55,7 @@ async def test_create_project():
             response = json.loads(result[0].text)
 
             if response.get("success"):
-                print(f"\n✅ Project created successfully!")
+                print("\n✅ Project created successfully!")
                 print(f"Tasks generated: {response.get('task_count', 0)}")
 
                 if "tasks" in response:

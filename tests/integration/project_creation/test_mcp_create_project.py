@@ -59,7 +59,7 @@ async def test_create_project_via_mcp():
                         print(json.dumps(response_data, indent=2))
 
                         if response_data.get("success"):
-                            print(f"\n✅ Project created successfully!")
+                            print("\n✅ Project created successfully!")
                             print(
                                 f"Tasks generated: {response_data.get('task_count', 0)}"
                             )

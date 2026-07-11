@@ -12,7 +12,6 @@ import pytest
 
 from src.ai.advanced.prd.advanced_parser import (
     AdvancedPRDParser,
-    ProjectConstraints,
 )
 
 

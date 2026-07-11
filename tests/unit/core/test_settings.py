@@ -2,7 +2,6 @@ import json
 import os
 import tempfile
 
-import pytest
 
 from src.config.settings import Settings
 

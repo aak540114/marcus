@@ -6,7 +6,6 @@ complexity mode still receive documentation tasks (fix for issue #147).
 """
 
 from datetime import datetime, timezone
-from unittest.mock import Mock
 
 import pytest
 

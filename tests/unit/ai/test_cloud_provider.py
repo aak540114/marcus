@@ -8,12 +8,12 @@ behaviour, and LLMAbstraction integration — all without network access.
 import os
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
-from src.ai.providers.base_provider import EffortEstimate, SemanticAnalysis
+from src.ai.providers.base_provider import SemanticAnalysis
 from src.core.models import Priority, Task, TaskStatus
 
 # ---------------------------------------------------------------------------

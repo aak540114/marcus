@@ -2,9 +2,7 @@
 Unit tests for monitoring module.
 """
 
-from unittest.mock import AsyncMock, Mock, patch
 
-import pytest
 
 
 class TestMonitoringSystem:

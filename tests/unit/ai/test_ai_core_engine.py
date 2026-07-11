@@ -11,17 +11,14 @@ Tests cover:
 - Error handling and fallback mechanisms
 """
 
-import json
-import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from src.ai.core.ai_engine import MarcusAIEngine, RuleBasedEngine
 from src.ai.types import AIInsights, AnalysisContext, HybridAnalysis, RuleBasedResult
-from src.core.models import Priority, Task, TaskStatus, WorkerStatus
+from src.core.models import Priority, Task, TaskStatus
 
 
 class TestRuleBasedEngine:

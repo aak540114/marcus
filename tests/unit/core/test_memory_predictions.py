@@ -3,11 +3,9 @@ Unit tests for Memory system predictive intelligence features
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from src.core.events import Events
 from src.core.memory import AgentProfile, Memory, TaskOutcome
 from src.core.models import Priority, Task, TaskStatus
 

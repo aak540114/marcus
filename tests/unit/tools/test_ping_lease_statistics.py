@@ -2,8 +2,7 @@
 Unit tests for ping tool lease statistics functionality.
 """
 
-from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import Mock
 
 import pytest
 

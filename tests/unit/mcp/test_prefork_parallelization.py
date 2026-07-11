@@ -13,7 +13,7 @@ See also: swim lane analysis of dashboard-v82 where agent_unicorn_2 polled
 for ~30 minutes without receiving any Phase 1 foundation tasks.
 """
 
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -22,9 +22,6 @@ from src.core.phase_dependency_enforcer import PhaseDependencyEnforcer
 from src.integrations.enhanced_task_classifier import EnhancedTaskClassifier
 
 pytestmark = pytest.mark.unit
-from src.core.phase_dependency_enforcer import PhaseDependencyEnforcer, TaskPhase
-from src.integrations.enhanced_task_classifier import EnhancedTaskClassifier
-from src.integrations.nlp_task_utils import TaskType
 
 
 def _make_foundation_task(
@@ -197,7 +194,6 @@ class TestPreforkTasksAssignedInParallel:
         """
         from src.core.phase_dependency_enforcer import PhaseDependencyEnforcer
         from src.integrations.enhanced_task_classifier import EnhancedTaskClassifier
-        from src.integrations.nlp_task_utils import TaskType
 
         _SYSTEM_LABELS = frozenset({"pre-fork", "foundation", "pre_fork_synthesis"})
 

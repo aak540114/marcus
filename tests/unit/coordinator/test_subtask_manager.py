@@ -8,13 +8,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
 
 import pytest
 
-from src.core.models import Priority, TaskStatus
+from src.core.models import TaskStatus
 from src.marcus_mcp.coordinator.subtask_manager import (
-    Subtask,
     SubtaskManager,
     SubtaskMetadata,
 )

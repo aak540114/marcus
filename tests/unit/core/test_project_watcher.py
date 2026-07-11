@@ -3,7 +3,7 @@
 import json
 import os
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from src.core.events import Events
 from src.core.project_watcher import ProjectWatcher

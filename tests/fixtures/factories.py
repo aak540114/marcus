@@ -6,7 +6,6 @@ sensible defaults that can be easily overridden.
 """
 
 import random
-import string
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
 
@@ -16,7 +15,6 @@ from src.core.models import (
     ProjectState,
     RiskLevel,
     Task,
-    TaskAssignment,
     TaskStatus,
     WorkerStatus,
 )

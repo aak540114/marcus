@@ -153,7 +153,7 @@ async def test_stdio_protocol() -> None:
         async with asyncio.timeout(5):
             response = await process.stdout.readline() if process.stdout else b""
             if response:
-                print(f"✅ Got tool response")
+                print("✅ Got tool response")
                 data = json.loads(response.decode())
                 if "result" in data:
                     print("   Tool call successful")

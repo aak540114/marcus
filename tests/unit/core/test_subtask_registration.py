@@ -6,8 +6,8 @@ registered with SubtaskManager so they can be assigned individually to agents.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict
-from unittest.mock import AsyncMock, Mock, call, patch
+from typing import Any
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 

@@ -4,10 +4,9 @@ Test workspace security and integration with Marcus
 Verifies that workspace isolation is working correctly
 """
 
-import json
 import os
 import sys
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -147,17 +146,17 @@ def test_workspace_integration():
     forbidden = os.path.join(workspace_manager.marcus_state_root, "config")
     try:
         workspace_manager.validate_path(forbidden)
-        print(f"   ❌ Security breach: accessed forbidden path!")
+        print("   ❌ Security breach: accessed forbidden path!")
     except WorkspaceSecurityError:
-        print(f"   ✅ Correctly blocked access to forbidden path")
+        print("   ✅ Correctly blocked access to forbidden path")
 
     # Test safe path
     safe_path = os.path.join(workspace, "test.py")
     try:
         workspace_manager.validate_agent_path(agent_id, safe_path)
-        print(f"   ✅ Correctly allowed access to agent workspace")
+        print("   ✅ Correctly allowed access to agent workspace")
     except WorkspaceSecurityError:
-        print(f"   ❌ Incorrectly blocked access to safe path")
+        print("   ❌ Incorrectly blocked access to safe path")
 
     print("\n✅ Workspace integration test complete")
 

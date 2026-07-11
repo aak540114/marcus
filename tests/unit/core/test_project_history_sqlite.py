@@ -4,7 +4,6 @@ Unit tests for ProjectHistoryPersistence SQLite refactor.
 Tests the new SQLite-based storage for decisions and artifacts.
 """
 
-import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

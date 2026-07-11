@@ -4,10 +4,9 @@ Unit tests for Inspector (unified MCP client).
 Tests both stdio and HTTP connection types.
 """
 
-import asyncio
 import json
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 

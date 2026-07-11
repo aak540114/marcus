@@ -10,7 +10,6 @@ import tempfile
 from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
 

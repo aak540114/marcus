@@ -5,9 +5,6 @@ Tests the MCP tool logger with real conversation logger to verify
 log entries are created correctly in actual log files.
 """
 
-import json
-from datetime import datetime
-from pathlib import Path
 
 import pytest
 

@@ -224,7 +224,7 @@ class PerformanceBaseline:
         else:
             return {
                 "status": "fail",
-                "message": f"Performance outside baseline tolerance",
+                "message": "Performance outside baseline tolerance",
                 "baseline": baseline_value,
                 "current": current_value,
                 "tolerance": tolerance,
@@ -272,7 +272,7 @@ def performance_test(baseline_metric: str = "execution_time", tolerance: float =
 
                 return result
 
-            except Exception as e:
+            except Exception:
                 execution_time = time.time() - start_time
                 raise
 

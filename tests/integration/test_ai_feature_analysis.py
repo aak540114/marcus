@@ -5,7 +5,6 @@ Test AI-powered feature analysis in add_feature tool
 Tests that the AI engine methods are properly integrated.
 """
 
-import asyncio
 import json
 import os
 import sys

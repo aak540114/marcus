@@ -12,7 +12,6 @@ from src.ai.providers.llm_abstraction import LLMAbstraction
 from src.ai.validation.task_completeness_validator import (
     TaskCompletenessValidator,
 )
-from src.core.error_framework import ErrorContext
 
 
 @pytest.mark.integration

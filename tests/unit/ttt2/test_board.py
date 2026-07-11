@@ -346,7 +346,6 @@ class TestBoardEdgeCases:
 
     def test_box_drawing_detection_with_no_encoding(self):
         """Test box drawing detection when sys.stdout has no encoding attribute."""
-        import sys
         from unittest.mock import Mock, patch
 
         board = Board()
@@ -360,7 +359,6 @@ class TestBoardEdgeCases:
 
     def test_box_drawing_detection_with_exception(self):
         """Test box drawing detection handles exceptions gracefully."""
-        import sys
         from unittest.mock import Mock, patch
 
         board = Board()

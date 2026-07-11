@@ -13,7 +13,7 @@ external dependencies during testing.
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, List
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -21,7 +21,6 @@ import pytest
 from src.core.models import (
     BlockerReport,
     Priority,
-    ProjectRisk,
     ProjectState,
     RiskLevel,
     Task,

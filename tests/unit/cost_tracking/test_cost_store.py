@@ -8,7 +8,7 @@ v_event_cost view's price-versioning behavior.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest

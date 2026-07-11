@@ -15,7 +15,6 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -25,7 +24,6 @@ load_dotenv()
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from src.core.models import Priority
 from src.integrations.mcp_kanban_client import MCPKanbanClient
 
 

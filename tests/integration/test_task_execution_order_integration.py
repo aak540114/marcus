@@ -5,10 +5,8 @@ Tests the complete workflow of task classification, phase dependency enforcement
 and integration with the natural language processing tools.
 """
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, List
-from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -16,7 +14,7 @@ from src.core.models import Priority, Task, TaskStatus
 from src.core.phase_dependency_enforcer import PhaseDependencyEnforcer
 from src.integrations.enhanced_task_classifier import EnhancedTaskClassifier
 from src.integrations.nlp_base import NaturalLanguageTaskCreator
-from src.integrations.nlp_task_utils import SafetyChecker, TaskBuilder
+from src.integrations.nlp_task_utils import SafetyChecker
 
 
 class MockKanbanClient:

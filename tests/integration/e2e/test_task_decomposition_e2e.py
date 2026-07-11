@@ -5,10 +5,7 @@ Tests the complete workflow of task decomposition, subtask assignment,
 and parent task auto-completion focusing on integration points.
 """
 
-import asyncio
-from datetime import datetime
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 

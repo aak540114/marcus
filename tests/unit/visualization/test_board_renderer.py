@@ -5,11 +5,9 @@ Tests the Rich-based kanban board visualization that reads from
 SQLiteKanban and renders a 4-column board in the terminal.
 """
 
-import asyncio
 from datetime import datetime, timezone
 from io import StringIO
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any, List
 
 import pytest
 from rich.console import Console

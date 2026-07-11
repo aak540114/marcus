@@ -33,7 +33,6 @@ safety, not redundant.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Optional
 
 import pytest
 

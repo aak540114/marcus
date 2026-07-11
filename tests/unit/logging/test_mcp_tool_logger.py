@@ -8,7 +8,6 @@ root cause analysis.
 
 from unittest.mock import patch
 
-import pytest
 
 from src.logging.mcp_tool_logger import (
     _log_mcp_tool_failure,

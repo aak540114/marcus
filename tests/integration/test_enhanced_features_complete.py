@@ -13,12 +13,11 @@ Tests:
 """
 
 import asyncio
-import json
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -26,9 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.core.context import Context
 from src.core.events import Events, EventTypes
-from src.core.memory import Memory
 from src.core.memory_advanced import MemoryAdvanced
-from src.core.models import Priority, Task, TaskStatus, WorkerStatus
+from src.core.models import Priority, Task, TaskStatus
 from src.core.persistence import MemoryPersistence, Persistence
 from src.core.resilience import RetryConfig, with_fallback, with_retry
 
@@ -280,7 +278,6 @@ class TestEnhancedFeaturesComplete:
     @pytest.mark.asyncio
     async def test_granular_configuration(self):
         """Test granular configuration support with new config system"""
-        from unittest.mock import Mock
 
         from src.config.marcus_config import FeaturesSettings, MarcusConfig
 

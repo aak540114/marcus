@@ -5,7 +5,6 @@ Tests that NFR and infrastructure tasks are properly converted from metadata
 to Task objects in _generate_detailed_task (regression test for #139).
 """
 
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -15,7 +14,7 @@ from src.ai.advanced.prd.advanced_parser import (
     PRDAnalysis,
     ProjectConstraints,
 )
-from src.core.models import Priority, Task, TaskStatus
+from src.core.models import Task, TaskStatus
 
 
 class TestNFRTaskGeneration:

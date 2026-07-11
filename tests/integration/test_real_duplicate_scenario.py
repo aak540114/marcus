@@ -5,8 +5,6 @@ Integration test that reproduces the real duplicate assignment scenario.
 import asyncio
 import json
 import tempfile
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from mcp import ClientSession, StdioServerParameters

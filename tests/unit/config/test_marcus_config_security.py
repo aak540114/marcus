@@ -7,7 +7,6 @@ particularly network binding settings.
 import json
 from pathlib import Path
 
-import pytest
 
 from src.config.marcus_config import MarcusConfig, TransportSettings
 

@@ -28,7 +28,6 @@ from src.core.models import Priority, RecoveryInfo, Task, TaskStatus, WorkerStat
 from src.marcus_mcp.tools.task import (
     build_tiered_instructions,
     report_task_progress,
-    request_next_task,
 )
 
 
@@ -355,7 +354,6 @@ class TestAssignedToFilter:
         Design tasks are assigned to Marcus and handled internally.
         Agents should never grab them.
         """
-        from src.marcus_mcp.tools.task import _find_optimal_task_original_logic
 
         task = _make_task("design-1", name="Design: API Architecture")
         task.assigned_to = "Marcus"
@@ -912,7 +910,6 @@ class TestKillAndPickup:
         branch would be caught. Uses sed-level verification: the test
         fails if the `else` branch at task.py:1813 is removed.
         """
-        from src.marcus_mcp.tools.task import report_task_progress
 
         mock_kanban = AsyncMock()
         mock_kanban.update_task = AsyncMock()

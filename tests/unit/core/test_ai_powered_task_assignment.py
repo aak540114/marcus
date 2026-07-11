@@ -13,12 +13,11 @@ to ensure fast, isolated unit tests.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from typing import List
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from src.ai.types import AssignmentContext
 from src.core.ai_powered_task_assignment import (
     AITaskAssignmentEngine,
     find_optimal_task_for_agent_ai_powered,

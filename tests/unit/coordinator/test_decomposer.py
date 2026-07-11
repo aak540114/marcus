@@ -4,7 +4,6 @@ Unit tests for Task Decomposer.
 Tests the AI-driven task decomposition functionality.
 """
 
-import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock
 

@@ -7,7 +7,6 @@ session/parse wiring is covered without a live server.
 """
 
 import json
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest

@@ -25,7 +25,6 @@ import pytest
 
 from src.core.events import Events
 from src.core.ticket_lifecycle import (
-    InvalidTransitionError,
     TicketLifecycleManager,
     TicketState,
 )

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config.marcus_config import AISettings, KanbanSettings, MarcusConfig
+from src.config.marcus_config import MarcusConfig
 
 
 class TestMarcusConfigValidation:

@@ -3,7 +3,6 @@ Unit tests for SafetyChecker dependency setup
 """
 
 from datetime import datetime, timezone
-from unittest.mock import Mock
 
 import pytest
 

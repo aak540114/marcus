@@ -12,7 +12,6 @@ before accepting completion. If the branch exists but has no commits,
 the completion is rejected with a descriptive error.
 """
 
-import subprocess
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch

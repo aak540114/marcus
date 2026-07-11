@@ -11,9 +11,7 @@ context detector, and mode registry to ensure fast, isolated unit tests.
 """
 
 import logging
-from datetime import datetime
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import pytest_asyncio
@@ -21,7 +19,6 @@ import pytest_asyncio
 from src.core.models import Priority, Task, TaskStatus
 from src.detection.board_analyzer import BoardState, WorkflowPattern
 from src.detection.context_detector import MarcusMode, ModeRecommendation
-from src.modes.creator.template_library import ProjectSize
 from src.orchestration.hybrid_tools import HybridMarcusTools
 
 

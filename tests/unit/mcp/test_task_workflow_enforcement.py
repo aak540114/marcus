@@ -8,7 +8,6 @@ follow the proper workflow steps when receiving task assignments.
 from datetime import datetime, timezone
 from typing import Optional
 
-import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.marcus_mcp.tools.task import (

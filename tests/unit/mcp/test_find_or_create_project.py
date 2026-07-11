@@ -6,7 +6,7 @@ the "which project?" decision tree.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import List
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest

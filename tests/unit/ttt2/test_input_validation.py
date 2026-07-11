@@ -12,8 +12,6 @@ from src.ttt2.input.parser import parse_player_input
 from src.ttt2.validation.pipeline import validate_complete_move
 from src.ttt2.validation.results import (
     ERROR_CELL_OCCUPIED,
-    ERROR_EMPTY_INPUT,
-    ERROR_INVALID_FORMAT,
     ERROR_OUT_OF_RANGE,
     ValidationResult,
 )

@@ -7,13 +7,13 @@ simulating real-world usage of the Marcus system.
 
 import asyncio
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from src.marcus_mcp.handlers import handle_tool_call
 from src.marcus_mcp.server import MarcusServer
-from tests.fixtures.factories import AgentFactory, TaskFactory
+from tests.fixtures.factories import TaskFactory
 from tests.utils.base import BaseTestCase
 
 
@@ -190,7 +190,7 @@ class TestProjectLifecycle(BaseTestCase):
 
         # Verify some tasks were completed
         assert len(assigned_tasks) > 0
-        print(f"\n✅ Project lifecycle test completed successfully!")
+        print("\n✅ Project lifecycle test completed successfully!")
 
     async def _create_test_server(self) -> MarcusServer:
         """Create a test server with mocked dependencies."""

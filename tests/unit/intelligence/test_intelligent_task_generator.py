@@ -12,19 +12,17 @@ external dependencies during testing. All task generation and planning
 logic is thoroughly tested with various scenarios.
 """
 
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, Mock, patch
+from datetime import datetime, timezone
+from typing import List
+from unittest.mock import Mock, patch
 
 import pytest
 
-from src.core.models import Priority, RiskLevel, Task, TaskStatus
+from src.core.models import Priority, Task, TaskStatus
 from src.intelligence.intelligent_task_generator import (
     IntelligentTaskGenerator,
     ProjectContext,
     ProjectStructure,
-    TaskDescription,
 )
 from src.intelligence.prd_parser import (
     Feature,

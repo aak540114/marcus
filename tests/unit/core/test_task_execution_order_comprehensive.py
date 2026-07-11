@@ -11,19 +11,14 @@ This test suite validates the complete task execution order functionality includ
 
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-from unittest.mock import Mock, patch
 
 import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.core.phase_dependency_enforcer import (
-    DependencyType,
-    FeatureGroup,
     PhaseDependencyEnforcer,
-    TaskPhase,
 )
 from src.integrations.enhanced_task_classifier import (
-    ClassificationResult,
     EnhancedTaskClassifier,
 )
 from src.integrations.nlp_task_utils import TaskType
@@ -343,7 +338,7 @@ class TestTaskExecutionOrderComprehensive:
                     if dep_task:
                         assert (
                             feature in dep_task.labels
-                        ), f"Cross-feature dependency found"
+                        ), "Cross-feature dependency found"
 
     # Test Validation
     def test_validate_phase_ordering(self, enforcer):

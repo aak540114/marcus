@@ -2,12 +2,10 @@
 Focused tests for security fixes in resilience.py and service_registry.py
 """
 
-import json
-import logging
 import secrets
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 

@@ -6,12 +6,8 @@ multiple workers can be assigned the same task.
 """
 
 import asyncio
-import json
-import os
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 

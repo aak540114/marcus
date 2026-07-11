@@ -7,7 +7,7 @@ with configurable thresholds.
 
 import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 

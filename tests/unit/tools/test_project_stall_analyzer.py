@@ -3,8 +3,7 @@ Unit tests for project stall analyzer.
 """
 
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -14,7 +13,6 @@ from src.marcus_mcp.tools.project_stall_analyzer import (
     ConversationReplayAnalyzer,
     DependencyLockVisualizer,
     TaskCompletionAnalyzer,
-    TaskCompletionEvent,
 )
 
 

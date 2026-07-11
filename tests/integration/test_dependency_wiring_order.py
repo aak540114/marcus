@@ -54,7 +54,6 @@ The test specifically validates that:
 """
 
 import asyncio
-import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -473,8 +472,8 @@ async def test_cross_parent_dependency_validation(
             )
 
         print(
-            f"\n✅ Cross-parent dependency test passed! "
-            f"All cross-parent dependencies correctly enforced."
+            "\n✅ Cross-parent dependency test passed! "
+            "All cross-parent dependencies correctly enforced."
         )
 
 
@@ -506,7 +505,7 @@ async def main() -> None:
     if len(sys.argv) > 1:
         if "--http" in sys.argv:
             connection_type = "http"
-            print(f"\n✓ Using HTTP mode (connecting to running Marcus server)")
+            print("\n✓ Using HTTP mode (connecting to running Marcus server)")
         elif "--help" in sys.argv or "-h" in sys.argv:
             print("\nUsage: python test_dependency_wiring_order.py [--http]")
             print("\nOptions:")
@@ -515,7 +514,7 @@ async def main() -> None:
             return
 
     if connection_type == "stdio":
-        print(f"\n⚠️  Running in DEMO mode (stdio) - no tasks will be available")
+        print("\n⚠️  Running in DEMO mode (stdio) - no tasks will be available")
         print("   To test with real tasks, run: python {} --http".format(sys.argv[0]))
 
     try:

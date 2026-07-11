@@ -15,7 +15,7 @@ changes.  Stage 5 will sweep the now-unused ``project_name`` parameter.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, List, Optional
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest

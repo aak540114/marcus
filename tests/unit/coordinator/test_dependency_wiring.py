@@ -7,15 +7,13 @@ to automatically create dependencies between subtasks of different parent tasks.
 
 from datetime import datetime, timezone
 from typing import List
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.marcus_mcp.coordinator.dependency_wiring import (
-    detect_test_task,
-    extract_phase,
     filter_candidates_by_embeddings,
     hybrid_dependency_resolution,
     resolve_dependencies_with_llm,

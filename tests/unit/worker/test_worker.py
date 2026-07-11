@@ -2,7 +2,6 @@
 Unit tests for worker module.
 """
 
-from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 

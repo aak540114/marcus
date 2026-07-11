@@ -9,7 +9,7 @@ after request_next_task. Root cause: refresh_project_state() migration timing.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 

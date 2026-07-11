@@ -10,7 +10,7 @@ This uses TDD approach - tests written BEFORE implementation.
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 

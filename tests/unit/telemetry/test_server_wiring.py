@@ -18,7 +18,6 @@ Pure-unit tests; do NOT spin up the MCP server itself.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
 
 import pytest
 

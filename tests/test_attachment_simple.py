@@ -9,7 +9,6 @@ import asyncio
 import base64
 import json
 import os
-from typing import Any, Dict
 
 # Set environment variables if not already set
 os.environ.setdefault("PLANKA_BASE_URL", "http://localhost:3333")

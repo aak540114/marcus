@@ -4,7 +4,7 @@ Unit tests for the Context system
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -239,7 +239,6 @@ class TestContext:
         """Test analyzing task dependencies"""
         from datetime import datetime
 
-        from src.core.models import Priority, TaskStatus
 
         tasks = [
             Task(
@@ -296,7 +295,6 @@ class TestContext:
             # task_1 might have task_3 as dependent (inferred)
             # This depends on inference rules
 
-        import asyncio
 
         asyncio.run(run_test())
 
@@ -304,7 +302,6 @@ class TestContext:
         """Test dependency inference logic"""
         from datetime import datetime
 
-        from src.core.models import Priority, TaskStatus
 
         backend_task = Task(
             id="task_1",

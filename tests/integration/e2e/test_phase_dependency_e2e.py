@@ -5,16 +5,14 @@ Tests the complete flow from project creation through task assignment,
 ensuring tasks are assigned in the correct development lifecycle order.
 """
 
-import asyncio
 from datetime import datetime, timezone
 from typing import List
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.core.phase_dependency_enforcer import PhaseDependencyEnforcer
-from src.integrations.nlp_task_utils import TaskClassifier, TaskType
 
 
 @pytest.mark.integration

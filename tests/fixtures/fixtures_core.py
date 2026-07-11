@@ -6,7 +6,6 @@ tasks, projects, agents, and basic data structures.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
 
 import pytest
 
@@ -40,7 +39,7 @@ def sample_high_priority_task():
         name="Fix critical database bug",
         description="Database connection failing intermittently",
         status=TaskStatus.IN_PROGRESS,
-        priority=Priority.CRITICAL,
+        priority=Priority.URGENT,
         assigned_to="agent-001",
         created_at=datetime.now(timezone.utc) - timedelta(hours=2),
         updated_at=datetime.now(timezone.utc),
@@ -80,12 +79,19 @@ def sample_worker_status():
     return WorkerStatus(
         worker_id="worker-001",
         name="Backend Specialist",
-        available=True,
-        current_tasks=2,
-        max_capacity=5,
+        role="Backend Developer",
+        email="backend-specialist@example.com",
+        current_tasks=[],
+        completed_tasks_count=15,
+        capacity=5,
         skills=["python", "django", "postgresql", "redis"],
-        last_heartbeat=datetime.now(timezone.utc),
-        performance_metrics={"completed_tasks": 15, "average_time": 4.2},
+        availability={
+            "monday": True,
+            "tuesday": True,
+            "wednesday": True,
+            "thursday": True,
+            "friday": True,
+        },
     )
 
 
@@ -95,12 +101,19 @@ def sample_frontend_worker():
     return WorkerStatus(
         worker_id="worker-002",
         name="Frontend Developer",
-        available=True,
-        current_tasks=1,
-        max_capacity=4,
+        role="Frontend Developer",
+        email="frontend-dev@example.com",
+        current_tasks=[],
+        completed_tasks_count=12,
+        capacity=4,
         skills=["javascript", "react", "css", "html"],
-        last_heartbeat=datetime.now(timezone.utc),
-        performance_metrics={"completed_tasks": 12, "average_time": 3.8},
+        availability={
+            "monday": True,
+            "tuesday": True,
+            "wednesday": True,
+            "thursday": True,
+            "friday": True,
+        },
     )
 
 
@@ -112,13 +125,14 @@ def worker_list(sample_worker_status, sample_frontend_worker):
 
 @pytest.fixture
 def sample_context():
-    """Create a real context instance for testing."""
-    context = Context()
-    context.project_name = "Test Project"
-    context.technology_stack = ["python", "postgresql", "react"]
-    context.team_size = 3
-    context.deadline = datetime.now(timezone.utc) + timedelta(weeks=2)
-    return context
+    """Create a real Context instance for testing.
+
+    ``Context`` (src/core/context.py) is Marcus's implementation-tracking
+    service, not a project-metadata value object — it takes no
+    project-name/tech-stack/team-size fields, so a plain construction is
+    the correct "sample" here.
+    """
+    return Context(project_id="test-project")
 
 
 @pytest.fixture

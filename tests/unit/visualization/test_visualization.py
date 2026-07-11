@@ -2,9 +2,7 @@
 Unit tests for visualization module.
 """
 
-from unittest.mock import Mock, patch
 
-import pytest
 
 
 class TestVisualizationSystem:

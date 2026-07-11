@@ -7,9 +7,8 @@ Tests edge cases, error handling, and complex scenarios
 import asyncio
 import os
 import sys
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, Dict
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,7 +17,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from src.core.models import Priority, Task, TaskStatus
+from src.core.models import Priority, TaskStatus
 from src.integrations.kanban_client import KanbanClient
 
 

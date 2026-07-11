@@ -5,8 +5,6 @@ Tests that the server exposes current_project_id and current_project_name
 properties that tools can use to get the active project context.
 """
 
-import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest

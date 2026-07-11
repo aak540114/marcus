@@ -1,7 +1,5 @@
 """Test that create_project properly registers projects with ProjectRegistry."""
 
-import os
-from datetime import datetime, timezone
 from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
 

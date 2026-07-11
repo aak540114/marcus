@@ -5,7 +5,6 @@ Tests that bundled design tasks are properly converted from metadata dicts
 to Task objects in _generate_detailed_task (fix for bundled designs not being created).
 """
 
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest

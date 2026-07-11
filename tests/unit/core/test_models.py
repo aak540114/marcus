@@ -11,9 +11,7 @@ requiring external dependencies.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
 
-import pytest
 
 from src.core.models import (
     Priority,

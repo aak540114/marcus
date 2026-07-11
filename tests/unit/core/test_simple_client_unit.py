@@ -6,20 +6,17 @@ Tests the client logic without real MCP connections
 
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import Mock, mock_open, patch
+from unittest.mock import mock_open, patch
 
 import pytest
-import pytest_asyncio
 
 # Add parent directory to path
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from src.core.models import Priority, Task, TaskStatus
+from src.core.models import Priority, TaskStatus
 from src.integrations.kanban_client import KanbanClient
 
 

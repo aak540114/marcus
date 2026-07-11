@@ -14,9 +14,7 @@ The fix ensures:
 """
 
 from pathlib import Path
-from unittest.mock import Mock, patch
 
-import pytest
 
 
 class TestDatabasePathRegression:
@@ -68,7 +66,6 @@ class TestDatabasePathRegression:
         Related to GH issue #171.
         """
         # Test the path expansion logic directly without initializing MarcusServer
-        from pathlib import Path
 
         # Simulate what server.py does
         data_dir = "~/.marcus/data"
@@ -94,7 +91,6 @@ class TestDatabasePathRegression:
 
         Related to GH issue #171.
         """
-        from pathlib import Path
 
         # Test the path expansion logic directly
         data_dir = "./data"
@@ -114,7 +110,6 @@ class TestDatabasePathRegression:
         Related to GH issue #171.
         """
         import tempfile
-        from pathlib import Path
 
         # Test the path expansion logic directly
         # Use tempfile.gettempdir() instead of hardcoded /tmp

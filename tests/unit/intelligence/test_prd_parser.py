@@ -12,14 +12,10 @@ All parsing and analysis logic is thoroughly tested with various document format
 and edge cases to achieve 80%+ test coverage.
 """
 
-import asyncio
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from src.intelligence.prd_parser import (
-    Feature,
     ParsedPRD,
     PRDFormat,
     PRDParser,

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.core.models import Priority, Task, TaskStatus
-from src.integrations.nlp_task_utils import SafetyChecker, TaskType
+from src.integrations.nlp_task_utils import SafetyChecker
 
 
 def create_test_task(

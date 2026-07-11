@@ -13,7 +13,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, cast
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -22,12 +22,11 @@ from src.core.error_framework import (
     ErrorContext,
     KanbanIntegrationError,
 )
-from src.core.models import Priority, RiskLevel, TaskStatus, WorkerStatus
+from src.core.models import Priority, TaskStatus
 from src.marcus_mcp.handlers import handle_tool_call
 from src.marcus_mcp.server import MarcusServer
 from tests.fixtures.factories import (
     AgentFactory,
-    BlockerFactory,
     ProjectStateFactory,
     TaskFactory,
     reset_all_counters,

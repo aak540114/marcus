@@ -8,15 +8,12 @@ Marcus's performance at different scales.
 import asyncio
 import json
 import logging
-import multiprocessing as mp
 import random
 import statistics
-import string
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, cast
 
 import aiohttp
 import websockets
@@ -423,17 +420,17 @@ class LoadTester:
         print(f"\n{'='*60}")
         print(f"Scenario: {result.scenario}")
         print(f"{'='*60}")
-        print(f"Connections:")
+        print("Connections:")
         print(f"  Total:      {result.total_connections}")
         print(f"  Successful: {result.successful_connections}")
         print(f"  Failed:     {result.failed_connections}")
         print(f"  Rate:       {result.connections_per_second:.2f}/sec")
-        print(f"\nRequests:")
+        print("\nRequests:")
         print(f"  Total:      {result.total_requests}")
         print(f"  Successful: {result.successful_requests}")
         print(f"  Failed:     {result.failed_requests}")
         print(f"  Rate:       {result.requests_per_second:.2f}/sec")
-        print(f"\nResponse Times (ms):")
+        print("\nResponse Times (ms):")
         print(f"  Average:    {result.avg_response_time*1000:.2f}")
         print(f"  P50:        {result.p50_response_time*1000:.2f}")
         print(f"  P95:        {result.p95_response_time*1000:.2f}")
@@ -441,7 +438,7 @@ class LoadTester:
         print(f"\nDuration:     {result.total_duration:.2f} seconds")
 
         if result.errors:
-            print(f"\nErrors:")
+            print("\nErrors:")
             for error_type, count in result.errors.items():
                 print(f"  {error_type}: {count}")
 

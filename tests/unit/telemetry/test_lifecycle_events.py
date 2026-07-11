@@ -14,7 +14,6 @@ exceptions — telemetry must never crash the MCP tool path.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import MagicMock

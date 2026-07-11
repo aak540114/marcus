@@ -16,7 +16,6 @@ helper is the resilience layer that other modules depend on.
 from __future__ import annotations
 
 import json
-from typing import Any, List
 from unittest.mock import AsyncMock
 
 import pytest

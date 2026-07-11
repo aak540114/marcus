@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import List
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -108,7 +108,6 @@ class TestRefreshSubtaskDuplication:
         )
 
         # Import the actual refresh method
-        from src.marcus_mcp.server import MarcusServer
 
         # Create a minimal implementation of refresh_project_state
         async def refresh_project_state():

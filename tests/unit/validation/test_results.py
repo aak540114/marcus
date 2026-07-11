@@ -5,7 +5,6 @@ This test module verifies the ValidationResult dataclass used for
 representing input validation outcomes.
 """
 
-import pytest
 
 from src.ttt2.validation.results import ERROR_OUT_OF_RANGE, ValidationResult
 

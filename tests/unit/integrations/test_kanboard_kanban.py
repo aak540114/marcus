@@ -157,7 +157,6 @@ class TestConnectDisconnect:
         kanban._client.post = AsyncMock(side_effect=[project_resp, columns_resp])
         kanban._client.aclose = AsyncMock()
 
-        import httpx
 
         with patch("httpx.AsyncClient", return_value=kanban._client):
             result = await kanban.connect()
@@ -168,7 +167,6 @@ class TestConnectDisconnect:
     @pytest.mark.asyncio
     async def test_connect_returns_false_when_project_not_found(self, kanban):
         """connect() returns False if the project ID doesn't exist."""
-        import httpx
 
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(return_value=_rpc_response(None))

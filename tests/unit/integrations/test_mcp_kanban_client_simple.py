@@ -12,16 +12,13 @@ isolated unit tests that don't require external services.
 
 import asyncio
 import json
-import os
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, Mock, call, mock_open, patch
+from unittest.mock import AsyncMock, Mock, mock_open, patch
 
 import pytest
 
-from src.core.models import Priority, Task, TaskStatus
+from src.core.models import Priority, TaskStatus
 from src.integrations.kanban_client import KanbanClient
 
 

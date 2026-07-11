@@ -6,11 +6,9 @@ ensuring that sensitive information is handled appropriately and
 hardcoded defaults are properly justified.
 """
 
-import os
 from pathlib import Path
-from unittest.mock import Mock, mock_open, patch
+from unittest.mock import mock_open, patch
 
-import pytest
 
 from src.integrations.kanban_client import KanbanClient
 from src.integrations.kanban_client_with_create import KanbanClientWithCreate

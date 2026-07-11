@@ -9,11 +9,10 @@ Tests various scenarios including:
 - Error handling
 """
 
-import asyncio
 import os
 import sys
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -22,7 +21,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.core.models import Priority, Task, TaskStatus
 from src.integrations.nlp_tools import (
-    NaturalLanguageFeatureAdder,
     add_feature_natural_language,
 )
 

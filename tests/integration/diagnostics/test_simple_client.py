@@ -61,7 +61,7 @@ async def test_simple() -> None:
     try:
         # Note: Current implementation auto-initializes from config
         print("\n1. Checking client configuration...")
-        print(f"✅ Client created successfully")
+        print("✅ Client created successfully")
         print(f"  - Project ID: {client.project_id}")
         print(f"  - Board ID: {client.board_id}")
 
@@ -69,7 +69,7 @@ async def test_simple() -> None:
         print("\n2. Testing get_board_summary...")
         summary = await client.get_board_summary()
         stats = summary.get("stats", {})
-        print(f"✅ Board statistics:")
+        print("✅ Board statistics:")
         print(f"   - Total cards: {stats.get('totalCards', 0)}")
         print(f"   - In progress: {stats.get('inProgressCount', 0)}")
         print(f"   - Done: {stats.get('doneCount', 0)}")
@@ -105,7 +105,7 @@ async def test_simple() -> None:
 
                 print(f"   Assigning '{unassigned_task.name}' to {test_agent}")
                 await client.assign_task(unassigned_task.id, test_agent)
-                print(f"✅ Task assigned successfully")
+                print("✅ Task assigned successfully")
                 print("   (Check kanban board for comment and list change)")
             else:
                 print("\n4. No unassigned tasks available for assignment test")

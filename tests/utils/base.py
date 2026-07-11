@@ -5,8 +5,8 @@ Base test classes with common utilities for Marcus tests.
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union, cast
-from unittest.mock import AsyncMock, Mock
+from typing import Any, Dict, List, Optional, cast
+from unittest.mock import AsyncMock
 
 from src.core.models import Priority, Task, TaskStatus, WorkerStatus
 

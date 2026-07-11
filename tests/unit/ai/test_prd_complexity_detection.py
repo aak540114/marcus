@@ -8,7 +8,7 @@ This module tests the ability of the PRD parser to:
 4. Determine if design artifacts are needed
 """
 
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

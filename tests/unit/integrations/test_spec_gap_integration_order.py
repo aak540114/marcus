@@ -28,8 +28,7 @@ be in the integration verification task's ``dependencies``.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

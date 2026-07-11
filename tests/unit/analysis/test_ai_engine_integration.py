@@ -6,7 +6,7 @@ and response parsing for post-project analysis.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

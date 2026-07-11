@@ -7,14 +7,11 @@ Tests the MCP tools that expose Marcus's AI capabilities for:
 2. Adding features to existing projects
 """
 
-import asyncio
-import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from src.ai.advanced.prd.advanced_parser import TaskGenerationResult
 from src.core.models import Priority, Task, TaskStatus
 
 # Test imports

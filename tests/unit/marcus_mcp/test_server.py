@@ -9,9 +9,8 @@ and all server functionality with proper mocking of external dependencies.
 import json
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, Mock, mock_open, patch
 
 import pytest
@@ -22,16 +21,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 import mcp.types as types
 
 from src.core.error_framework import (
-    ConfigurationError,
-    ErrorContext,
     KanbanIntegrationError,
 )
 from src.core.models import (
-    Priority,
-    ProjectState,
     RiskLevel,
-    Task,
-    TaskAssignment,
     TaskStatus,
     WorkerStatus,
 )

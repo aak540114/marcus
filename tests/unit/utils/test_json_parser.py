@@ -2,7 +2,6 @@
 Unit tests for JSON parser utility
 """
 
-import json
 
 import pytest
 

@@ -4,8 +4,6 @@ Unit tests for project_auto_setup module.
 Tests provider-agnostic project auto-setup functionality.
 """
 
-from datetime import datetime
-from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest

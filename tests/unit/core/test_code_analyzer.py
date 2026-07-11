@@ -7,9 +7,8 @@ All external dependencies are mocked to ensure unit test isolation.
 """
 
 import base64
-import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 

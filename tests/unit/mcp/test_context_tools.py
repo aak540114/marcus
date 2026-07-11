@@ -6,7 +6,7 @@ Tests the get_task_context and log_decision functions in the context module.
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 

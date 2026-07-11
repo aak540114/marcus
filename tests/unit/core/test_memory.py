@@ -4,13 +4,12 @@ Unit tests for the Memory system
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from src.core.events import Events, EventTypes
-from src.core.memory import AgentProfile, Memory, TaskOutcome, TaskPattern
+from src.core.memory import AgentProfile, Memory, TaskOutcome
 from src.core.models import Priority, Task, TaskStatus
 from src.core.persistence import Persistence, SQLitePersistence
 

@@ -11,8 +11,7 @@ phrases from the description, verify each has at least one task covering it,
 and synthesize gap tasks for any uncovered features before agents start.
 """
 
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

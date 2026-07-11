@@ -2,7 +2,7 @@
 Unit tests for PRD parser robustness with varying AI response formats
 """
 
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import patch
 
 import pytest
 

@@ -409,9 +409,9 @@ class TestCompleteAgentLifecycle(BaseTestCase):
         print("\n✅ E2E Test Summary:")
         print(f"  - Agent registered: {agent_id}")
         print(f"  - Task assigned and completed: {assigned_task_id}")
-        print(f"  - Architectural decision logged")
+        print("  - Architectural decision logged")
         print(f"  - Artifacts created in temp directory: {self.project_root}")
-        print(f"  - Task context retrievable")
+        print("  - Task context retrievable")
 
         # Final verification: check temp directory structure
         docs_dir = Path(self.project_root) / "docs"

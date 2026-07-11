@@ -14,7 +14,7 @@ Both functions also must reject calls from agents who no longer hold the
 lease, so lease-expired agents cannot corrupt completed work.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

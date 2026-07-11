@@ -5,7 +5,7 @@ Tests that subtasks inherit the correct task type from their parent task
 when generating instructions.
 """
 
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 

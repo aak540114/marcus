@@ -14,8 +14,7 @@ the agent's registered project, preventing cross-project task theft.
 """
 
 from datetime import datetime, timezone
-from typing import Any
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 

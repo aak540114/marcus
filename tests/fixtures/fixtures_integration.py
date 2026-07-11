@@ -7,7 +7,6 @@ integrations, API clients, and cross-system communication.
 
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List
 
 import pytest
 

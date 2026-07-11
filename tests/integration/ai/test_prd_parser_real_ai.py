@@ -5,9 +5,6 @@ These tests use actual AI services to verify the parser handles real-world
 responses correctly. They help catch issues that mocked tests might miss.
 """
 
-import asyncio
-import os
-from datetime import datetime
 
 import pytest
 
@@ -100,13 +97,13 @@ class TestPRDParserRealAI:
             ), "Should have tasks for functional requirements"
 
             # Log task generation summary
-            print(f"\n=== Task Generation Summary ===")
+            print("\n=== Task Generation Summary ===")
             print(f"Total tasks generated: {len(result.tasks)}")
             print(f"Task types found: {task_types}")
             print(f"Functional requirement tasks: {len(func_req_tasks)}")
 
             # Print all task names and IDs to see what was generated
-            print(f"\n=== All Generated Tasks ===")
+            print("\n=== All Generated Tasks ===")
             for i, task in enumerate(result.tasks, 1):
                 print(f"{i}. [{task.id}] {task.name}")
 
@@ -127,7 +124,7 @@ class TestPRDParserRealAI:
                 if "validation" in t.name.lower() or "validation" in t.id.lower()
             ]
 
-            print(f"\n=== Task Analysis ===")
+            print("\n=== Task Analysis ===")
             print(f"CRUD tasks found: {len(crud_tasks)}")
             if crud_tasks:
                 for t in crud_tasks:
@@ -326,7 +323,7 @@ class TestPRDParserRealAI:
             ]
 
             if deviation_logs:
-                print(f"\n=== Template Deviations Detected ===")
+                print("\n=== Template Deviations Detected ===")
                 print(f"Number of deviations: {len(deviation_logs)}")
                 for log in deviation_logs[:5]:  # Show first 5
                     print(f"- {log.message}")
@@ -386,7 +383,7 @@ class TestPRDParserRealAI:
                 if any(keyword in name_lower for keyword in specific_keywords):
                     specific_count += 1
 
-            print(f"\n=== Task Name Specificity ===")
+            print("\n=== Task Name Specificity ===")
             print(f"Generic task names: {generic_count}")
             print(f"Specific task names: {specific_count}")
             print(f"Total tasks: {len(result.tasks)}")

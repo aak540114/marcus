@@ -11,11 +11,10 @@ Tests use mocked data and external dependencies to ensure reproducibility
 and avoid external dependencies during testing.
 """
 
-import json
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, Mock, patch
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+from unittest.mock import patch
 
 import pytest
 
@@ -26,7 +25,6 @@ from src.ai.learning.contextual_learner import (
     TeamLearnings,
     TechnologyLearnings,
 )
-from src.core.models import Priority, Task, TaskStatus
 
 
 class TestContextualLearningSystem:

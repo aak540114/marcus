@@ -5,7 +5,6 @@ These tests verify that the AI follows our specified JSON template format.
 They act as a contract between our code and the AI's expected behavior.
 """
 
-import json
 from typing import Any, Dict, List
 
 import pytest

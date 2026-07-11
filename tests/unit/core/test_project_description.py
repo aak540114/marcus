@@ -9,7 +9,6 @@ Tests cover:
 
 import pytest
 from pathlib import Path
-from unittest.mock import patch
 
 from src.core.project_description import (
     ProjectDescriptionManager,

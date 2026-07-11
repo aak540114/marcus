@@ -367,7 +367,6 @@ class TestMergeDefensiveReset:
         defensive ``git reset --hard HEAD`` discards the
         modification and the merge succeeds.
         """
-        from unittest.mock import patch
 
         from src.marcus_mcp.tools.task import _merge_agent_branch_to_main
 

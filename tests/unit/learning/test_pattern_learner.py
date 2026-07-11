@@ -12,8 +12,7 @@ Tests verify the learning algorithms without requiring actual project data.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,7 +21,6 @@ from src.learning.pattern_learner import (
     CompletedProject,
     Pattern,
     PatternLearner,
-    ProjectLearnings,
 )
 
 

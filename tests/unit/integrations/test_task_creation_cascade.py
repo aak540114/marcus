@@ -10,7 +10,6 @@ Two sub-problems are tested:
    traceback is never emitted.
 """
 
-import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path

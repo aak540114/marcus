@@ -6,18 +6,13 @@ JSON API, user-friendly messages, and logging formats.
 """
 
 import json
-from datetime import datetime
-from unittest.mock import Mock, patch
 
 import pytest
 
 from src.core.error_framework import (
     AuthorizationError,
-    ErrorContext,
-    ErrorSeverity,
     MarcusBaseError,
     NetworkTimeoutError,
-    RemediationSuggestion,
     TaskAssignmentError,
 )
 from src.core.error_responses import (

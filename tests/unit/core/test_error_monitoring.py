@@ -6,30 +6,26 @@ and health monitoring capabilities.
 """
 
 import asyncio
-import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Type
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import patch
 
 import pytest
 
 from src.core.error_framework import (
     AuthorizationError,
-    ErrorCategory,
     ErrorContext,
     ErrorSeverity,
     NetworkTimeoutError,
     TaskAssignmentError,
 )
 from src.core.error_monitoring import (
-    AlertSeverity,
     CorrelationGroup,
     ErrorMetrics,
     ErrorMonitor,
     ErrorPattern,
-    error_monitor,
     get_error_health_status,
     record_error_for_monitoring,
     setup_error_monitoring,

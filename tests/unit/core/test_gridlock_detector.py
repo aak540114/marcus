@@ -6,7 +6,7 @@ true gridlock (all tasks blocked, no progress possible) from
 normal steady state (agents polling while tasks are in-progress).
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Optional
 
 import pytest

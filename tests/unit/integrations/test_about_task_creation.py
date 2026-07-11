@@ -6,7 +6,7 @@ to ensure proper hierarchical formatting when tasks have subtasks.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 import pytest
 

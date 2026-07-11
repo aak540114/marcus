@@ -7,8 +7,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import mcp.types as types
 import pytest
@@ -17,12 +16,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.core.models import (
-    Priority,
     ProjectState,
     RiskLevel,
-    Task,
-    TaskAssignment,
-    TaskStatus,
     WorkerStatus,
 )
 from src.marcus_mcp.handlers import get_tool_definitions, handle_tool_call

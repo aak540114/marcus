@@ -10,10 +10,8 @@ All external dependencies are mocked to ensure isolated unit testing.
 Tests cover normal operations, edge cases, and error scenarios.
 """
 
-import re
 from datetime import datetime, timedelta, timezone
 from typing import List
-from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 

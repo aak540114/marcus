@@ -8,7 +8,7 @@ The goal is to ensure constraints like "vanilla-js" or "no-frameworks" are
 preserved throughout the process and influence task descriptions.
 """
 
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 

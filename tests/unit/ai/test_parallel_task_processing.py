@@ -14,8 +14,8 @@ All tests use mocked dependencies and verify:
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, Mock, call, patch
+from typing import Any, List
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -176,7 +176,7 @@ class TestParallelTaskDescriptionGeneration:
         # Note: call_count may be 0 if fallback descriptions were used
         if call_count > 0:
             # If there were calls, some should have failed per our mock
-            assert call_count >= 1, f"Expected AI calls when fallbacks aren't used"
+            assert call_count >= 1, "Expected AI calls when fallbacks aren't used"
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -342,7 +342,6 @@ class TestParallelSubtaskDecomposition:
         self, task_creator, sample_tasks
     ):
         """Test that task decompositions happen in parallel, not sequentially"""
-        from src.integrations.nlp_base import NaturalLanguageTaskCreator
 
         # Track call times
         call_times = []

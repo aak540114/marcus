@@ -6,13 +6,12 @@ import json
 import os
 import sys
 import tempfile
-from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from src.core.workspace import WorkspaceConfig, WorkspaceManager, WorkspaceSecurityError
+from src.core.workspace import WorkspaceManager, WorkspaceSecurityError
 
 
 class TestWorkspaceManager:

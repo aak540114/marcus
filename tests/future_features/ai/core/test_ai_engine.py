@@ -7,7 +7,7 @@ with AI intelligence while maintaining safety guarantees.
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -16,9 +16,8 @@ import pytest_asyncio
 # Will implement these after tests
 from src.ai.core.ai_engine import MarcusAIEngine
 from src.ai.decisions.hybrid_framework import HybridDecisionFramework
-from src.ai.providers.base_provider import SemanticAnalysis
 from src.ai.providers.llm_abstraction import LLMAbstraction
-from src.ai.types import AnalysisContext, AssignmentDecision, HybridAnalysis
+from src.ai.types import AnalysisContext
 from src.core.models import Priority, Task, TaskStatus
 
 

@@ -8,7 +8,6 @@ when projects are created via the create_project MCP tool.
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import pytest

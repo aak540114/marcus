@@ -4,13 +4,12 @@ Unit tests for src/core/dev_environment.py
 
 import socket
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.core.dev_environment import (
     DevEnvironmentConfig,
-    DevEnvironmentInfo,
     DevEnvironmentManager,
     PortAllocator,
     STACK_CONFIGS,

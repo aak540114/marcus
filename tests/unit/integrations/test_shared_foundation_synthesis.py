@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -726,7 +726,6 @@ class TestFeatureBasedFoundationWiring:
 
     async def test_foundation_tasks_prepended_before_domain_tasks(self) -> None:
         """When synthesis returns tasks, they appear first in the task list."""
-        from src.integrations.nlp_tools import NaturalLanguageProjectCreator
 
         creator = _make_creator()
 
@@ -783,7 +782,6 @@ class TestFeatureBasedFoundationWiring:
 
     async def test_domain_tasks_depend_on_foundation_tasks(self) -> None:
         """When foundation tasks exist, all domain tasks list them as dependencies."""
-        from src.integrations.nlp_tools import NaturalLanguageProjectCreator
 
         creator = _make_creator()
 
@@ -837,7 +835,6 @@ class TestFeatureBasedFoundationWiring:
 
     async def test_no_foundation_tasks_leaves_domain_tasks_unchanged(self) -> None:
         """When synthesis returns [], domain tasks have no injected dependencies."""
-        from src.integrations.nlp_tools import NaturalLanguageProjectCreator
 
         creator = _make_creator()
 

@@ -10,15 +10,13 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List
+from typing import List
 
 import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.marcus_mcp.coordinator.subtask_manager import (
-    Subtask,
     SubtaskManager,
-    SubtaskMetadata,
 )
 
 

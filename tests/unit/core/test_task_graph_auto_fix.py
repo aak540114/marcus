@@ -7,7 +7,6 @@ without raising exceptions.
 
 from datetime import datetime, timezone
 
-import pytest
 
 from src.core.models import Priority, Task, TaskStatus
 from src.core.task_graph_validator import TaskGraphValidator

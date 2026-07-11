@@ -26,7 +26,6 @@ class TestPhaseDependencyEnforcerSimple:
     def test_single_feature_phase_ordering(self, enforcer):
         """Test that tasks within a single feature follow phase ordering"""
         # Create sample tasks
-        from datetime import datetime
 
         tasks = [
             Task(
@@ -112,7 +111,6 @@ class TestPhaseDependencyEnforcerSimple:
 
     def test_multiple_features_isolation(self, enforcer):
         """Test that dependencies are isolated within features"""
-        from datetime import datetime
 
         tasks = [
             # Auth feature
@@ -218,7 +216,6 @@ class TestPhaseDependencyEnforcerSimple:
 
     def test_preserve_existing_dependencies(self, enforcer):
         """Test that existing manual dependencies are preserved"""
-        from datetime import datetime
 
         tasks = [
             Task(

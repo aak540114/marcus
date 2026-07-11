@@ -5,7 +5,6 @@ Tests filtering, searching, and analysis methods for project history queries.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest

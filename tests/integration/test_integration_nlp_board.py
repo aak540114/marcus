@@ -5,7 +5,6 @@ Tests that projects created via NLP tools actually appear on the board
 """
 
 import asyncio
-import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -50,7 +49,7 @@ class BoardIntegrationTest:
 
     async def test_create_project_on_board(self):
         """Test creating a project from natural language and verify it appears on board"""
-        print(f"\n📝 Test 1: Create project from natural language")
+        print("\n📝 Test 1: Create project from natural language")
 
         # Create the NLP tool with real kanban client
         creator = NaturalLanguageProjectCreator(self.kanban_client)
@@ -79,7 +78,7 @@ class BoardIntegrationTest:
             },
         )
 
-        print(f"\n✅ Project created successfully!")
+        print("\n✅ Project created successfully!")
         print(f"   - Tasks created: {result['tasks_created']}")
         print(f"   - Phases: {', '.join(result['phases'])}")
         print(f"   - Estimated days: {result['estimated_days']}")
@@ -112,7 +111,7 @@ class BoardIntegrationTest:
 
     async def test_add_feature_to_board(self):
         """Test adding a feature and verify it appears on board"""
-        print(f"\n📝 Test 2: Add feature using natural language")
+        print("\n📝 Test 2: Add feature using natural language")
 
         # Create feature adder with real kanban client
         adder = NaturalLanguageFeatureAdder(self.kanban_client)
@@ -128,7 +127,7 @@ class BoardIntegrationTest:
             feature_description=feature_description, integration_point="auto_detect"
         )
 
-        print(f"\n✅ Feature added successfully!")
+        print("\n✅ Feature added successfully!")
         print(f"   - Tasks created: {result['tasks_created']}")
         print(f"   - Integration detected: {result['integration_detected']}")
         print(f"   - Feature phase: {result['feature_phase']}")
@@ -157,7 +156,7 @@ class BoardIntegrationTest:
 
     async def test_task_visibility(self):
         """Test that we can query and see our created tasks"""
-        print(f"\n📝 Test 3: Verify task visibility and structure")
+        print("\n📝 Test 3: Verify task visibility and structure")
 
         # Get all tasks
         all_tasks = await self.kanban_client.get_tasks()
@@ -170,7 +169,7 @@ class BoardIntegrationTest:
             or self.test_project_name in (t.description or "")
         ]
 
-        print(f"📊 Task Statistics:")
+        print("📊 Task Statistics:")
         print(f"   - Total tasks on board: {len(all_tasks)}")
         print(f"   - Our test project tasks: {len(our_tasks)}")
 
@@ -192,12 +191,12 @@ class BoardIntegrationTest:
             if task.labels:
                 has_labels += 1
 
-        print(f"\n📈 Task Analysis:")
-        print(f"   By Status:")
+        print("\n📈 Task Analysis:")
+        print("   By Status:")
         for status, count in by_status.items():
             print(f"      - {status}: {count}")
 
-        print(f"   By Priority:")
+        print("   By Priority:")
         for priority, count in by_priority.items():
             print(f"      - {priority}: {count}")
 
@@ -232,7 +231,7 @@ async def main():
 
         # Summary
         print(f"\n{'='*60}")
-        print(f"✅ Integration Test Summary")
+        print("✅ Integration Test Summary")
         print(f"{'='*60}")
         print(f"Provider: {test.provider}")
         print(f"Project: {test.test_project_name}")

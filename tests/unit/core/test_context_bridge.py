@@ -3,11 +3,10 @@ Unit tests for Context Bridge enhancements
 """
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from src.core.context import Context, DependentTask, TaskContext
+from src.core.context import Context, DependentTask
 from src.core.models import Priority, Task, TaskStatus
 
 

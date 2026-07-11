@@ -11,10 +11,8 @@ Tests the new metrics methods added for experiment comparison:
 - Parallel efficiency
 """
 
-import os
 import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import patch
 
 import pytest
 

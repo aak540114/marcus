@@ -9,8 +9,8 @@ stub_warning_message so the agent knows to resolve the debt.
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from typing import Any, List, Optional
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 

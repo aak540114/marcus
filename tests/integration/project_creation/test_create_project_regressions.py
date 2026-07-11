@@ -10,17 +10,14 @@ e1bad09 (Dec 20, 2025) when pipeline_tracked_nlp.py was deleted:
 Without these tests, silent regressions can occur during refactoring.
 """
 
-import asyncio
-import json
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from src.core.models import Priority, Task, TaskStatus
-from src.core.project_registry import ProjectConfig, ProjectRegistry
+from src.core.models import Task
+from src.core.project_registry import ProjectConfig
 
 
 @pytest.mark.integration

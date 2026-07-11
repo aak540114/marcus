@@ -12,7 +12,6 @@ don't depend on external services or consume API quotas.
 
 from unittest.mock import patch
 
-import pytest
 
 from src.ai.enrichment.intelligent_enricher import IntelligentTaskEnricher
 

@@ -7,7 +7,6 @@ Unit tests for ``dev-tools/experiments/runners/run_experiment.py``.
 
 import subprocess
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest

@@ -12,8 +12,7 @@ don't depend on external services or consume API quotas.
 """
 
 import json
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx

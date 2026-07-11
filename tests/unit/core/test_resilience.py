@@ -2,10 +2,8 @@
 Unit tests for resilience patterns and security fixes.
 """
 
-import asyncio
 import secrets
-import time
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 

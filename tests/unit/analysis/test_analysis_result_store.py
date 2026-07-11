@@ -8,7 +8,6 @@ and retrieval of analysis outputs.
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import pytest
 

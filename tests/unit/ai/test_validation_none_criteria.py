@@ -1,7 +1,7 @@
 """Unit tests for validation with None completion_criteria."""
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 

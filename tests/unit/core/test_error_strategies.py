@@ -6,18 +6,14 @@ and error aggregation strategies.
 """
 
 import asyncio
-import time
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from src.core.error_framework import (
     AuthorizationError,
-    ErrorContext,
     ErrorSeverity,
     IntegrationError,
-    MarcusBaseError,
     NetworkTimeoutError,
     TransientError,
 )
@@ -30,8 +26,6 @@ from src.core.error_strategies import (
     FallbackHandler,
     RetryConfig,
     RetryHandler,
-    RetryPolicy,
-    error_strategy_registry,
     with_circuit_breaker,
     with_fallback,
     with_retry,

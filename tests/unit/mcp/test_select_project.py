@@ -67,7 +67,6 @@ class TestSelectProject:
         from unittest.mock import patch
 
         from src.marcus_mcp.tools.project_management import (
-            find_or_create_project,
             select_project,
         )
 
