@@ -43,6 +43,7 @@ import asyncio
 import logging
 import os
 import random
+import shlex
 import socket
 import subprocess
 from dataclasses import dataclass, field
@@ -479,7 +480,11 @@ class DevEnvironmentManager:
             f"{_BASE_APT}{' ' + apt_extras if apt_extras else ''}"
         )
 
-        steps = [apt_line, f"git checkout {branch_name}"]
+        # branch_name is interpreted as shell syntax by the `sh -c` this
+        # string is eventually passed to inside the container — quote it
+        # so shell metacharacters in an unsanitized caller's input can't
+        # break out of `git checkout` into arbitrary command execution.
+        steps = [apt_line, f"git checkout {shlex.quote(branch_name)}"]
         if install_cmd:
             steps.append(install_cmd)
 

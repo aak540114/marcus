@@ -30,8 +30,6 @@ ROLE_TOOLS = {
         "get_optimal_agent_count",  # Calculate optimal agent count using CPM
         # Analytics and monitoring (delegated to Cato)
         # Pipeline tools removed - functionality moved to Cato
-        # Project management (PMs need this)
-        "remove_project",  # Delete projects
         # System health monitoring
         "check_assignment_health",  # Debug assignments
         # Audit and usage analytics

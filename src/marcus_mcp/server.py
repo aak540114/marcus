@@ -10,6 +10,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import signal
 import sys
 from datetime import datetime, timezone
@@ -3283,6 +3284,24 @@ if __name__ == "__main__":
                 return HTMLResponse(
                     "<h1>Missing ticket_id</h1>"
                     "<p>Add <code>?ticket_id=&lt;id&gt;</code> to the URL.</p>",
+                    status_code=400,
+                )
+
+            # ticket_id/provider flow unescaped into a shell string that
+            # DevEnvironmentManager runs via `sh -c` inside a Docker
+            # container (`git checkout {branch_name}` in
+            # src/core/dev_environment.py::_build_entrypoint). This route
+            # has no authentication, so an unvalidated ticket_id/provider
+            # is a command-injection vector (e.g. `ticket_id=x; rm -rf /app`).
+            # Reject anything outside the same safe character set
+            # BranchManager.make_branch_name() already normalizes ticket
+            # ids to, rather than silently mangling a value that might
+            # otherwise resolve to the wrong ticket.
+            _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+            if not _SAFE_ID_RE.match(ticket_id) or not _SAFE_ID_RE.match(provider):
+                return HTMLResponse(
+                    "<h1>Invalid ticket_id or provider</h1>"
+                    "<p>Only letters, digits, dots, hyphens, and underscores are allowed.</p>",
                     status_code=400,
                 )
 

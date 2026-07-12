@@ -38,9 +38,19 @@ class SimpleMarcusClient:
         self.client_context = stdio_client(server_params)
         self.read_stream, self.write_stream = await self.client_context.__aenter__()
 
-        # Create and initialize session
-        self.session = ClientSession(self.read_stream, self.write_stream)
-        await self.session.initialize()
+        try:
+            # Create and initialize session
+            self.session = ClientSession(self.read_stream, self.write_stream)
+            await self.session.initialize()
+        except Exception:
+            # The subprocess was already spawned by __aenter__() above — if
+            # the MCP handshake fails here, the caller sees an exception
+            # from initialize(), not a live client to call close() on, so
+            # without this the child process leaks. Clean up before
+            # re-raising so a failed initialize() never leaves an orphan.
+            await self.client_context.__aexit__(None, None, None)
+            self.client_context = None
+            raise
 
         self._initialized = True
 

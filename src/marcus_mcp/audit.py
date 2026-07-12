@@ -211,39 +211,54 @@ class AuditLogger:
                 async for line in f:
                     try:
                         event: Dict[str, Any] = json.loads(line.strip())
-
-                        # Check date range
-                        event_time = datetime.fromisoformat(event["timestamp"])
-                        if start_date and event_time < start_date:
-                            continue
-                        if end_date and event_time > end_date:
-                            continue
-
-                        # Update statistics
-                        stats["total_events"] += 1
-
-                        if event.get("client_id"):
-                            stats["unique_clients"].add(event["client_id"])
-
-                        if event.get("client_type"):
-                            stats["by_client_type"][event["client_type"]] = (
-                                stats["by_client_type"].get(event["client_type"], 0) + 1
-                            )
-
-                        if event.get("tool_name"):
-                            stats["by_tool"][event["tool_name"]] = (
-                                stats["by_tool"].get(event["tool_name"], 0) + 1
-                            )
-
-                        stats["by_event_type"][event["event_type"]] = (
-                            stats["by_event_type"].get(event["event_type"], 0) + 1
-                        )
-
-                        if not event.get("success", True):
-                            stats["errors"] += 1
-
                     except json.JSONDecodeError:
                         continue
+
+                    # A record missing either required field can't be
+                    # meaningfully counted (timestamp is needed for date
+                    # filtering, event_type is needed for aggregation) —
+                    # skip it the same way a JSON-parse failure is
+                    # skipped, rather than raising and aborting every
+                    # other record in every other log file.
+                    timestamp = event.get("timestamp")
+                    event_type = event.get("event_type")
+                    if timestamp is None or event_type is None:
+                        continue
+
+                    try:
+                        event_time = datetime.fromisoformat(timestamp)
+                    except ValueError:
+                        continue
+                    if start_date and event_time < start_date:
+                        continue
+                    if end_date and event_time > end_date:
+                        continue
+
+                    # Update statistics — only now that the record is
+                    # known well-formed, so a record never counts toward
+                    # total_events without also being reflected in
+                    # by_event_type (and vice versa).
+                    stats["total_events"] += 1
+
+                    if event.get("client_id"):
+                        stats["unique_clients"].add(event["client_id"])
+
+                    if event.get("client_type"):
+                        stats["by_client_type"][event["client_type"]] = (
+                            stats["by_client_type"].get(event["client_type"], 0) + 1
+                        )
+
+                    if event.get("tool_name"):
+                        stats["by_tool"][event["tool_name"]] = (
+                            stats["by_tool"].get(event["tool_name"], 0) + 1
+                        )
+
+                    stats["by_event_type"][event_type] = (
+                        stats["by_event_type"].get(event_type, 0) + 1
+                    )
+
+                    if not event.get("success", True):
+                        stats["errors"] += 1
 
         # Convert set to count
         stats["unique_clients"] = len(stats["unique_clients"])

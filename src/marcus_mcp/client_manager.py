@@ -98,6 +98,28 @@ class ClientManager:
         if session_id in self.sessions:
             del self.sessions[session_id]
 
+    @staticmethod
+    def _is_expired(
+        session: ClientSession, now: datetime, timeout_seconds: float = 3600
+    ) -> bool:
+        """Return True if `session` has been inactive longer than `timeout_seconds`.
+
+        Parameters
+        ----------
+        session : ClientSession
+            Session to check.
+        now : datetime
+            Reference time (timezone-aware, UTC).
+        timeout_seconds : float
+            Inactivity threshold in seconds. Default 3600 (1 hour).
+
+        Returns
+        -------
+        bool
+            True if the session should be treated as expired.
+        """
+        return (now - session.last_activity).total_seconds() > timeout_seconds
+
     async def authenticate_client(
         self,
         session_id: str,
@@ -169,8 +191,7 @@ class ClientManager:
                 expired_sessions = []
 
                 for session_id, session in self.sessions.items():
-                    # Remove sessions inactive for more than 1 hour
-                    if (now - session.last_activity).seconds > 3600:
+                    if self._is_expired(session, now):
                         expired_sessions.append(session_id)
 
                 for session_id in expired_sessions:
