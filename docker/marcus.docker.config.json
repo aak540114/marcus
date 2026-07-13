@@ -3,8 +3,9 @@
     "provider": "kanboard"
   },
   "ai": {
-    "provider": "anthropic",
-    "anthropic_api_key": "${CLAUDE_API_KEY}"
+    "provider": "${MARCUS_AI_PROVIDER}",
+    "anthropic_api_key": "${CLAUDE_API_KEY}",
+    "claude_cli_model": "${MARCUS_CLAUDE_CLI_MODEL}"
   },
   "transport": {
     "type": "http",

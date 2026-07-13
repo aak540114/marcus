@@ -90,7 +90,7 @@ AI agents (Claude Code, Codex, etc.)
 
 - Docker Desktop (macOS/Linux) — **2 GB RAM** is plenty (Gitea is lightweight; no GitLab-sized allocation needed)
 - `curl`, `python3`, `openssl` (all preinstalled on macOS/most Linux distros)
-- A Claude API key from [console.anthropic.com](https://console.anthropic.com/) — the one thing that can't be automated. (Marcus also supports a `claude_subscription` provider that runs its own decomposition/analysis calls through a locally-installed, already-logged-in `claude` CLI instead of a metered key — see `ai.claude_cli_model` in [Marcus's configuration reference](https://marcus-ai.dev). This repo's `Dockerfile` doesn't install or authenticate a `claude` CLI inside the container, so it isn't wired up for the Docker Compose path above; it works today for Marcus's non-Docker deployments, e.g. `pip install -e .` + `python -m marcus --http` from the [Independent deployment](#independent-deployment) table.)
+- Either a **Claude Pro/Max subscription** (run `claude login` on this machine once, beforehand — the setup script picks it up automatically, no API key) **or** a Claude API key from [console.anthropic.com](https://console.anthropic.com/) if you'd rather pay per token. See [AI provider](#ai-provider) below.
 - An MCP-compatible AI agent (Claude Code, Codex, etc.)
 
 ### 1. Run the setup script
@@ -99,11 +99,11 @@ AI agents (Claude Code, Codex, etc.)
 ./scripts/setup.sh
 ```
 
-This one command does everything the individually-numbered steps below used to require by hand: starts Kanboard and Gitea, creates the Kanboard project and its six required columns, sets the Kanboard API token and webhook, creates the Gitea admin account and access token, then builds and starts Marcus itself. The only thing it asks you for is your Claude API key (paste it once when prompted — it's saved to `.env`, which is git-ignored).
+This one command does everything the individually-numbered steps below used to require by hand: starts Kanboard and Gitea, creates the Kanboard project and its six required columns, sets the Kanboard API token and webhook, creates the Gitea admin account and access token, picks and wires up an AI provider for Marcus's own decomposition/analysis calls (see [AI provider](#ai-provider) — no API key prompt), then builds and starts Marcus itself.
 
 It's safe to re-run — every step checks live state before creating or changing anything, so running it again after `docker compose down` is a fast no-op, and running it after `docker compose down -v` (which wipes volumes) re-provisions everything from scratch.
 
-When it finishes it prints the Kanboard/Gitea/Marcus URLs, the Gitea admin password, and the exact `claude mcp add` command for step 2 below.
+When it finishes it prints the Kanboard/Gitea/Marcus URLs, the Gitea admin password, which AI provider got selected, and the exact `claude mcp add` command for step 2 below — both for connecting from this machine and from a remote one.
 
 <details>
 <summary><strong>How the setup script works</strong> (click to expand)</summary>
@@ -115,6 +115,7 @@ When it finishes it prints the Kanboard/Gitea/Marcus URLs, the Gitea admin passw
 | Kanboard webhook | Set to `http://marcus:4298/webhooks/kanboard` so board changes reach Marcus instantly instead of on the next 30s poll | Kanboard has no API for this — it's two rows (`webhook_url`, `webhook_token`) in its own SQLite `settings` table, written directly via `docker compose exec kanboard php -r '...'` (PDO SQLite, the same DB driver Kanboard itself uses) |
 | Gitea admin account | Created non-interactively | `docker compose exec -u git gitea gitea admin user create ...` |
 | Gitea access token | Generated non-interactively | `docker compose exec -u git gitea gitea admin user generate-access-token ...` |
+| AI provider | `claude_subscription` if this machine has an authenticated `claude` CLI; `anthropic` if `CLAUDE_API_KEY` is already in `.env`; otherwise the script fails with instructions instead of prompting | See [AI provider](#ai-provider) |
 | Marcus | Built and started once everything above has produced the values it needs | `docker compose up -d --build marcus` |
 
 </details>
@@ -142,7 +143,7 @@ docker compose exec -u git gitea gitea admin user create \
 ```
 Then log in at http://localhost:3000 as `root` / `Marcus123!` → **Settings → Applications → Generate New Token** (scopes `write:repository`, `read:user`).
 
-**Configure and start Marcus** — put the values you just collected into `.env` (see `.env.example`), then:
+**Configure and start Marcus** — put the values you just collected into `.env` (see `.env.example`, including `MARCUS_AI_PROVIDER`/`CLAUDE_API_KEY` — see [AI provider](#ai-provider) below). If using `MARCUS_AI_PROVIDER=claude_subscription`, make sure `~/.claude.json` and `~/.claude/.credentials.json` exist on this host first (`docker compose up` fails if a bind-mounted file is missing entirely — `./scripts/setup.sh` creates empty placeholders automatically, this manual path doesn't). Then:
 ```bash
 docker compose up -d --build marcus
 ```
@@ -156,6 +157,30 @@ Point any MCP-compatible agent at `http://localhost:4298/mcp`. For Claude Code:
 ```bash
 claude mcp add --transport http marcus http://localhost:4298/mcp
 ```
+
+Marcus listens on `0.0.0.0` inside the container (see `docker/marcus.docker.config.json`'s `transport.http.host`), mapped to this host's `MARCUS_PORT` (default `4298`) — so an agent running on a **different machine** (another laptop, a remote VPS) can connect too, once your firewall/network allows reaching that port:
+
+```bash
+claude mcp add --transport http marcus http://<this-machine's-address>:4298/mcp
+```
+
+This is how a distributed setup works — Marcus, Kanboard, and Gitea can each run on separate hosts (see [Independent deployment](#independent-deployment)), with AI agents on individual machines all connecting to Marcus's one MCP endpoint over the network to pull tasks.
+
+---
+
+## AI provider
+
+Marcus's own decomposition, dependency-inference, and effort-estimation calls need an AI provider — separate from whatever auth the coding agents you connect via MCP use for their own work.
+
+`./scripts/setup.sh` never prompts for an API key. It picks a provider automatically, in this order:
+
+1. **`.env` already has `CLAUDE_API_KEY`** → uses the `anthropic` provider (pay-per-token, your existing choice respected).
+2. **Otherwise, this machine has an authenticated `claude` CLI** (you've run `claude login` here — the same login Claude Code itself uses) → uses the `claude_subscription` provider. The script bind-mounts your `~/.claude.json` and `~/.claude/.credentials.json` into the `marcus` container (see `docker-compose.yml`), so `claude` CLI calls made *inside* the container ride the same Claude Pro/Max subscription, with no separate API key. Marcus's `Dockerfile` installs the `claude` CLI itself (Node.js + `npm install -g @anthropic-ai/claude-code`) for this.
+3. **Neither is available** → the script fails with instructions (`claude login`, or set `CLAUDE_API_KEY` yourself) instead of prompting interactively.
+
+You can also set `MARCUS_AI_PROVIDER` in `.env` yourself to override this — see `.env.example`.
+
+**Trade-offs of `claude_subscription`:** each call spawns a full `claude` CLI process inside the container (several seconds to tens of seconds, versus sub-second for a direct API call), and it shares your subscription's usage limits with any interactive Claude Code sessions on the same account. Sharing `~/.claude.json`/`~/.claude/.credentials.json` into the container also means the container can act as that login for `claude` CLI calls — reasonable for the local/demo use this stack targets (see the Gitea admin password note above), less so for a shared or internet-exposed host. If you'd rather not share host credentials at all, set `CLAUDE_API_KEY` in `.env` before running `./scripts/setup.sh` to use the `anthropic` provider instead.
 
 ---
 

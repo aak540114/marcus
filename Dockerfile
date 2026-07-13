@@ -10,11 +10,26 @@ FROM python:3.11-slim
 
 # git    - src/integrations/gitea_manager.py shells out to `git` (subprocess)
 #          for repo init and push.
-# curl   - operator debugging only (docker compose exec marcus curl ...).
+# curl   - operator debugging only (docker compose exec marcus curl ...);
+#          also used below to fetch the NodeSource setup script.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Node.js + the `claude` CLI (npm package @anthropic-ai/claude-code) —
+# required by the claude_subscription AI provider
+# (src/ai/providers/claude_cli_provider.py), which runs Marcus's own
+# decomposition/dependency-inference/effort-estimation calls through a
+# non-interactive `claude -p` invocation instead of a metered Anthropic
+# API key. docker-compose.yml bind-mounts the host's ~/.claude.json and
+# ~/.claude/.credentials.json into this image so the CLI here is
+# authenticated the same way the host's `claude login` already is.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
 
 WORKDIR /app
 

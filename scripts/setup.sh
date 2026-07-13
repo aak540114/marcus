@@ -16,9 +16,15 @@
 # details). Re-running after `docker compose down` is a fast no-op pass;
 # re-running after `docker compose down -v` re-provisions everything.
 #
-# The only thing this script cannot generate for you is a Claude API key
-# — it will prompt for one interactively if `.env` doesn't already have
-# CLAUDE_API_KEY set.
+# AI provider: this script never prompts for a Claude API key. If this
+# machine already has an authenticated `claude` CLI (i.e. you've run
+# `claude login` here, the same login Claude Code itself uses), it
+# mounts that login into the marcus container and configures Marcus's
+# own decomposition/analysis calls to ride your Claude Pro/Max
+# subscription (MARCUS_AI_PROVIDER=claude_subscription) — no separate
+# API key, no prompt. If `.env` already has CLAUDE_API_KEY set, that
+# choice is respected instead (MARCUS_AI_PROVIDER=anthropic). If neither
+# is available, the script fails with instructions rather than prompting.
 
 set -euo pipefail
 
@@ -98,22 +104,39 @@ if [ -z "$(env_get GITEA_ADMIN_PASSWORD)" ]; then
     env_set GITEA_ADMIN_PASSWORD "Marcus123!"
 fi
 
-if [ -z "$(env_get CLAUDE_API_KEY)" ]; then
-    if [ -t 0 ]; then
-        read -r -s -p "Enter your Claude API key (from https://console.anthropic.com/): " claude_key
-        echo
-        if [ -z "$claude_key" ]; then
-            err "No API key entered."
-            exit 1
-        fi
-        env_set CLAUDE_API_KEY "$claude_key"
+log "Selecting AI provider..."
+
+if [ -n "$(env_get CLAUDE_API_KEY)" ]; then
+    # An API key is already configured — respect that explicit choice
+    # rather than silently switching it to the subscription provider.
+    if [ -z "$(env_get MARCUS_AI_PROVIDER)" ]; then
+        env_set MARCUS_AI_PROVIDER "anthropic"
+    fi
+    log "CLAUDE_API_KEY found in .env — using the 'anthropic' provider."
+elif [ -z "$(env_get MARCUS_AI_PROVIDER)" ]; then
+    if command -v claude >/dev/null 2>&1 && [ -f "$HOME/.claude.json" ]; then
+        env_set MARCUS_AI_PROVIDER "claude_subscription"
+        log "Found a local 'claude' CLI login — using the 'claude_subscription' provider (your Claude Pro/Max subscription, no API key)."
+        log "If Marcus's AI calls fail later (check: docker compose logs marcus), it usually means this login isn't actually authenticated —"
+        log "run 'claude login' again, or set CLAUDE_API_KEY in .env and re-run this script to switch to the API-key provider instead."
     else
-        err "CLAUDE_API_KEY is not set and this shell has no terminal to prompt with."
-        err "Set it first, e.g.: echo 'CLAUDE_API_KEY=sk-ant-...' >> .env"
-        err "then re-run ./scripts/setup.sh"
+        err "No Claude API key configured and no local 'claude' CLI login found on this machine."
+        err "Either:"
+        err "  - run 'claude login' here, then re-run ./scripts/setup.sh, or"
+        err "  - set an API key yourself: echo 'CLAUDE_API_KEY=sk-ant-...' >> .env, then re-run ./scripts/setup.sh"
         exit 1
     fi
+else
+    log "MARCUS_AI_PROVIDER=$(env_get MARCUS_AI_PROVIDER) already set in .env — leaving it as-is."
 fi
+
+# The claude-credential bind-mount sources in docker-compose.yml must
+# exist even when unused (MARCUS_AI_PROVIDER=anthropic) — `docker compose
+# up` fails outright if a file bind-mount's host source path is missing.
+# Never overwrites a real login if one is already there.
+mkdir -p "$HOME/.claude"
+[ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+[ -f "$HOME/.claude/.credentials.json" ] || echo '{}' > "$HOME/.claude/.credentials.json"
 
 # ---------------------------------------------------------------------
 # 3. Start Kanboard + Gitea only — Marcus needs values these produce.
@@ -225,7 +248,7 @@ fi
 
 log "Building and starting Marcus..."
 if ! docker compose up -d --build --wait --wait-timeout 60 marcus; then
-    err "Marcus did not become healthy in time — most likely a bad CLAUDE_API_KEY or a KANBOARD_API_TOKEN mismatch."
+    err "Marcus did not become healthy in time — most likely a KANBOARD_API_TOKEN mismatch, or a missing ~/.claude.json / ~/.claude/.credentials.json for the claude_subscription provider."
     docker compose logs marcus --tail=50 || true
     exit 1
 fi
@@ -238,15 +261,24 @@ echo
 echo "======================================================================"
 echo " Setup complete."
 echo "======================================================================"
+host_port="$(env_get MARCUS_PORT)"
+host_port="${host_port:-4298}"
+
 echo " Kanboard:  http://localhost:8080   (admin / admin)"
 echo " Gitea:     http://localhost:3000   (root / $(env_get GITEA_ADMIN_PASSWORD))"
-echo " Marcus:    http://localhost:4298/mcp"
+echo " Marcus:    http://localhost:${host_port}/mcp"
 echo
 echo " Kanboard project: $(env_get KANBOARD_PROJECT_NAME) (id $(env_get KANBOARD_PROJECT_ID))"
 echo " Webhook:   configured — board changes reach Marcus instantly."
+echo " AI provider: $(env_get MARCUS_AI_PROVIDER) (Marcus's own decomposition/analysis calls)"
 echo
-echo " Connect an AI agent:"
-echo "   claude mcp add --transport http marcus http://localhost:4298/mcp"
+echo " Connect an AI agent from this machine:"
+echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp"
+echo
+echo " Connect an AI agent from another machine (Marcus listens on 0.0.0.0"
+echo " inside the container, mapped to this host's port ${host_port} —"
+echo " reachable from elsewhere once your firewall/network allows it):"
+echo "   claude mcp add --transport http marcus http://<this-machine's-address>:${host_port}/mcp"
 echo
 echo " Save the Gitea admin password above if you plan to log in manually —"
 echo " it won't be printed again (it's also in .env, which is git-ignored)."

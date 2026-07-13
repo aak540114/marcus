@@ -113,6 +113,20 @@ services:
       # container runs as root so $HOME=/root. Kept under ./data so all
       # Marcus state lives under one host directory.
       - ./data/.marcus:/root/.marcus
+      # Only present/used when MARCUS_AI_PROVIDER=claude_subscription
+      # (scripts/setup.sh's default when the host already has an
+      # authenticated `claude` CLI — see its "AI provider" step). Shares
+      # the host's existing `claude login` state into the container so
+      # `claude -p` calls inside it use the same Claude Pro/Max
+      # subscription, with no separate API key. Deliberately scoped to
+      # just these two files (not the whole ~/.claude directory, which
+      # also holds unrelated project session transcripts under
+      # ~/.claude/projects). ${HOME} must be set in the shell that runs
+      # `docker compose up` — scripts/setup.sh always has it; if you
+      # invoke compose directly from an environment without it, either
+      # export HOME or switch to MARCUS_AI_PROVIDER=anthropic.
+      - ${HOME}/.claude.json:/root/.claude.json
+      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json
     environment:
       # Container-to-container URLs use Docker service names, not
       # localhost. Note Kanboard listens on port 80 *inside* the compose
@@ -143,6 +157,15 @@ services:
       # row for the full explanation.
       GITEA_URL: "http://gitea:3000"
       GITEA_TOKEN: "${GITEA_TOKEN:-}"
+      # Resolves docker/marcus.docker.config.json's "ai.provider" /
+      # "ai.claude_cli_model" placeholders. scripts/setup.sh sets
+      # MARCUS_AI_PROVIDER=claude_subscription in .env by default
+      # (no CLAUDE_API_KEY prompt) when the host has an authenticated
+      # `claude` CLI to mount in via the volumes above; it falls back to
+      # "anthropic" only when CLAUDE_API_KEY is already set in .env, or
+      # you can set MARCUS_AI_PROVIDER yourself to override either way.
+      MARCUS_AI_PROVIDER: "${MARCUS_AI_PROVIDER:-claude_subscription}"
+      MARCUS_CLAUDE_CLI_MODEL: "${MARCUS_CLAUDE_CLI_MODEL:-sonnet}"
       CLAUDE_API_KEY: "${CLAUDE_API_KEY:-}"
     healthcheck:
       # /mcp is a Streamable-HTTP JSON-RPC endpoint (POST-only) — a plain
