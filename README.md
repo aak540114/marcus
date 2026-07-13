@@ -90,7 +90,7 @@ AI agents (Claude Code, Codex, etc.)
 
 - Docker Desktop (macOS/Linux) — **2 GB RAM** is plenty (Gitea is lightweight; no GitLab-sized allocation needed)
 - `curl`, `python3`, `openssl` (all preinstalled on macOS/most Linux distros)
-- A Claude API key from [console.anthropic.com](https://console.anthropic.com/) — the one thing that can't be automated
+- A Claude API key from [console.anthropic.com](https://console.anthropic.com/) — the one thing that can't be automated. (Marcus also supports a `claude_subscription` provider that runs its own decomposition/analysis calls through a locally-installed, already-logged-in `claude` CLI instead of a metered key — see `ai.claude_cli_model` in [Marcus's configuration reference](https://marcus-ai.dev). This repo's `Dockerfile` doesn't install or authenticate a `claude` CLI inside the container, so it isn't wired up for the Docker Compose path above; it works today for Marcus's non-Docker deployments, e.g. `pip install -e .` + `python -m marcus --http` from the [Independent deployment](#independent-deployment) table.)
 - An MCP-compatible AI agent (Claude Code, Codex, etc.)
 
 ### 1. Run the setup script
