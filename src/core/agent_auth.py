@@ -141,7 +141,17 @@ class BearerAuthMiddleware:
         expected = self.token
         if provided is None or expected is None:
             return False
-        return secrets.compare_digest(provided, expected)
+        # Compare as bytes, not str: secrets.compare_digest() raises
+        # TypeError on a str containing non-ASCII characters, and the
+        # attacker controls `provided` (it comes from a latin-1 decode of
+        # the raw header, so bytes 0x80-0xFF become non-ASCII code points).
+        # Comparing UTF-8 bytes never raises on content, so a hostile
+        # `Authorization: Bearer \xff\xff` cleanly fails (401) instead of
+        # crashing the request with a 500. Valid tokens are ASCII (hex), so
+        # the encode round-trips identically on both sides.
+        return secrets.compare_digest(
+            provided.encode("utf-8"), expected.encode("utf-8")
+        )
 
     @staticmethod
     def _extract_bearer(scope: Scope) -> Optional[str]:

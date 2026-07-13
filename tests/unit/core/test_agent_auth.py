@@ -130,6 +130,20 @@ class TestBearerAuthMiddleware:
 
         assert inner.called is True
 
+    async def test_non_ascii_token_rejected_without_crashing(self) -> None:
+        """A hostile non-ASCII bearer value must cleanly 401, not raise a
+        TypeError from secrets.compare_digest (which would surface as a 500).
+        """
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="secret")
+        messages, send = await _drain_send()
+
+        # 0xFF decodes (latin-1) to U+00FF — non-ASCII — inside the middleware.
+        await mw(_http_scope(auth="Bearer ÿÿ"), _noop_receive, send)
+
+        assert inner.called is False
+        assert messages[0]["status"] == 401
+
     async def test_webhook_path_is_exempt(self) -> None:
         """The Kanboard webhook authenticates by its own ?token=, so the
         bearer middleware must let it through even with no header."""
