@@ -14,11 +14,13 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) can auto-create a Gitea repo per Kanboard project and push branches per ticket — the classes are complete and tested, but not yet instantiated by the running server (`src/marcus_mcp/server.py`), so this doesn't fire automatically today. Tracked as follow-up work. |
 | **MarcusDevEnv plugin** | Kanboard plugin that adds AI-aware UI to every board and task |
 | **Hot-reload dev environments** | One-click per-ticket preview URL; supports any language/framework via project description |
-| **Project Description system** | Per-project markdown doc that AI agents read to learn the tech stack; editable from the board |
+| **Project Description system** | Per-project markdown doc (tech stack, architecture notes) that AI agents read via the `get_project_description` MCP tool; editable from the board |
+| **Enriched ticket context** | `get_work_context` — the first call every agent makes — also returns priority, labels, due date, estimated hours, dependency links (`depends_on`/`blocks`/`relates_to`), and the ticket's last 10 comments, so a human's reply to a paused ticket is actually visible to the agent |
 | **Human Gate / AI Gate toggle** | Per-project and per-ticket control over whether humans review AI work before it merges |
 | **AI Verify** | Configurable N-round LLM code review before any AI-gate merge; each round posts a comment with findings; agent fixes issues between rounds; 0 rounds = disabled |
 | **Claude subscription provider** | Marcus's own planner calls (decomposition, dependency inference, effort estimation) can run through a locally logged-in `claude` CLI instead of a metered API key — see [AI provider](#ai-provider). No `CLAUDE_API_KEY` prompt during setup. |
 | **Remote agents + auth** | Opt in during setup to let AI agents on other machines connect; access is gated by a bearer token so unaccounted agents are rejected, with optional built-in HTTPS — see [Authenticating remote agents](#authenticating-remote-agents). |
+| **Remote Kanboard access for humans** | The same setup opt-in also makes Kanboard's UI reachable remotely — its `admin`/`admin` login is replaced with a generated account first, since Kanboard's API can't rotate an existing password — see [Network access](#network-access). |
 
 ---
 
@@ -88,7 +90,9 @@ AI agents (Claude Code, Codex, etc.)
 
 ### How AI agents reach tickets
 
-AI agents never call Kanboard's JSON-RPC API and never receive Kanboard's API token. They call Marcus's MCP tools (`get_work_context`, `post_ticket_progress`, `signal_ready_for_review`, …); Marcus alone holds `KANBOARD_API_TOKEN` and is the only thing that makes JSON-RPC calls to Kanboard, over the internal Docker network (`http://kanboard/jsonrpc.php`, not the host-published `:8080`). No tool response ever contains a Kanboard URL or credential — the richest one, `get_work_context`, returns ticket/branch/repo fields, never Kanboard's own address. This is why gating Marcus's HTTP endpoint with a bearer token (see [Authenticating remote agents](#authenticating-remote-agents)) is sufficient to control ticket access: it's the *only* door.
+AI agents never call Kanboard's JSON-RPC API and never receive Kanboard's API token. They call Marcus's MCP tools (`get_work_context`, `get_project_description`, `post_ticket_progress`, `signal_ready_for_review`, …); Marcus alone holds `KANBOARD_API_TOKEN` and is the only thing that makes JSON-RPC calls to Kanboard, over the internal Docker network (`http://kanboard/jsonrpc.php`, not the host-published `:8080`). No tool response ever contains a Kanboard URL or credential. This is why gating Marcus's HTTP endpoint with a bearer token (see [Authenticating remote agents](#authenticating-remote-agents)) is sufficient to control ticket access: it's the *only* door.
+
+`get_work_context` — the first call every agent makes — returns everything Marcus knows about a ticket: title, description, acceptance criteria, branch/repo info, priority, labels, due date, estimated hours, dependency links (`depends_on`/`blocks`/`relates_to`), and its last 10 comments (see `prompts/Kanboard_Agent_Prompt.md` for the full field reference). `get_project_description` returns the project-wide tech stack and architecture notes when per-ticket context isn't enough.
 
 Agents do talk to **Gitea** directly, but only for `git clone`/`fetch`/`push` on the one branch Marcus created for them — a different, narrower surface than the board itself.
 
