@@ -18,6 +18,7 @@ from src.marcus_mcp.server import (
     _get_dev_env_settings_mgr,
     _resolve_ticket_branch,
     _resolve_ticket_repo_path,
+    _verify_ticket_belongs_to_project,
     _wire_human_gated_workflow,
 )
 
@@ -335,3 +336,84 @@ class TestResolveTicketRepoPath:
         result = await _resolve_ticket_repo_path(server, "5")
 
         assert result is None
+
+
+def _make_task_with_project(project_id):
+    task = MagicMock()
+    task.source_context = {"kanboard_task": {"project_id": project_id}}
+    return task
+
+
+class TestVerifyTicketBelongsToProject:
+    """_verify_ticket_belongs_to_project fails closed unless verified true.
+
+    /dev-env/view is unauthenticated by default and project_id now drives
+    real external side effects (Gitea repo/webhook auto-provisioning) —
+    this guards against pairing an arbitrary real project_id with a
+    fabricated ticket_id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_false(self):
+        kanban = MagicMock()
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "") is False
+
+    @pytest.mark.asyncio
+    async def test_no_kanban_client_returns_false(self):
+        server = SimpleNamespace(kanban_client=None)
+        assert await _verify_ticket_belongs_to_project(server, "42", "1") is False
+
+    @pytest.mark.asyncio
+    async def test_kanban_without_get_task_by_id_returns_false(self):
+        kanban = MagicMock(spec=[])  # no get_task_by_id attribute
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "1") is False
+
+    @pytest.mark.asyncio
+    async def test_get_task_by_id_failure_returns_false(self):
+        kanban = MagicMock()
+        kanban.get_task_by_id = AsyncMock(side_effect=RuntimeError("kanban down"))
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "1") is False
+
+    @pytest.mark.asyncio
+    async def test_ticket_not_found_returns_false(self):
+        kanban = MagicMock()
+        kanban.get_task_by_id = AsyncMock(return_value=None)
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "1") is False
+
+    @pytest.mark.asyncio
+    async def test_matching_project_id_returns_true(self):
+        kanban = MagicMock()
+        kanban.get_task_by_id = AsyncMock(return_value=_make_task_with_project(1))
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "1") is True
+
+    @pytest.mark.asyncio
+    async def test_mismatched_project_id_returns_false(self):
+        """The core abuse case: real ticket, but a different, fabricated
+        project_id supplied by the caller."""
+        kanban = MagicMock()
+        kanban.get_task_by_id = AsyncMock(return_value=_make_task_with_project(1))
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "99") is False
+
+    @pytest.mark.asyncio
+    async def test_missing_source_context_returns_false(self):
+        task = MagicMock()
+        task.source_context = None
+        kanban = MagicMock()
+        kanban.get_task_by_id = AsyncMock(return_value=task)
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "1") is False
+
+    @pytest.mark.asyncio
+    async def test_project_id_as_int_matches_string_query_param(self):
+        """Kanboard's own project_id is typically an int; the query param
+        arrives as a string — comparison must not be type-sensitive."""
+        kanban = MagicMock()
+        kanban.get_task_by_id = AsyncMock(return_value=_make_task_with_project(7))
+        server = SimpleNamespace(kanban_client=kanban)
+        assert await _verify_ticket_belongs_to_project(server, "42", "7") is True

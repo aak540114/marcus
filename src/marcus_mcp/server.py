@@ -3192,6 +3192,63 @@ def _resolve_ticket_branch(server: "MarcusServer", ticket_id: str, provider: str
     return branch
 
 
+async def _verify_ticket_belongs_to_project(
+    server: "MarcusServer", ticket_id: str, project_id_str: str
+) -> bool:
+    """Confirm a ticket actually belongs to the claimed project.
+
+    ``/dev-env/view`` is unauthenticated by default (same as every other
+    Marcus HTTP route when ``MARCUS_AGENT_TOKEN`` is unset), and its
+    ``project_id`` query param now drives a real external side effect —
+    on-demand Gitea repo + webhook creation via
+    :func:`_resolve_ticket_repo_path`. Without this check, a caller could
+    pair an arbitrary real ``project_id`` with a fabricated ``ticket_id``
+    and force-provision that project's Gitea repo/webhook for a ticket
+    that was never actually assigned to it.
+
+    Looks the ticket up live via the connected kanban client rather than
+    trusting the caller-supplied ``project_id`` — the same
+    ``source_context["kanboard_task"]["project_id"]`` field
+    ``HumanGatedWorkflow.get_work_context`` already reads.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+    ticket_id : str
+        Provider ticket identifier from the request.
+    project_id_str : str
+        Raw ``project_id`` query param.
+
+    Returns
+    -------
+    bool
+        ``True`` only if the ticket was found via the live kanban client
+        AND its own project id matches ``project_id_str``. ``False``
+        (fail closed) if ``project_id_str`` is unset, the ticket can't be
+        found or looked up, or the provider doesn't expose enough
+        information to verify — callers should treat ``False`` as "don't
+        trust this project_id for provisioning."
+    """
+    if not project_id_str or server.kanban_client is None:
+        return False
+    get_task = getattr(server.kanban_client, "get_task_by_id", None)
+    if get_task is None:
+        return False
+    try:
+        task = await get_task(ticket_id)
+    except Exception:  # noqa: BLE001
+        return False
+    if task is None:
+        return False
+    src_ctx = getattr(task, "source_context", None) or {}
+    raw = src_ctx.get("kanboard_task", {})
+    actual_project_id = raw.get("project_id")
+    if actual_project_id is None:
+        return False
+    return str(actual_project_id) == str(project_id_str)
+
+
 async def _resolve_ticket_repo_path(
     server: "MarcusServer", project_id_str: str
 ) -> Optional[str]:
@@ -3583,6 +3640,29 @@ if __name__ == "__main__":
             try:
                 from src.core.dev_environment import DevEnvironmentManager
                 from src.core.project_description import ProjectDescriptionManager
+
+                # This route is unauthenticated by default, and project_id
+                # now drives a real side effect (on-demand Gitea repo +
+                # webhook provisioning below). Verify the ticket actually
+                # belongs to the claimed project before trusting it for
+                # anything — otherwise a caller could pair an arbitrary
+                # real project_id with a fabricated ticket_id to
+                # force-provision that project's repo. Unverifiable
+                # (ticket not found, provider doesn't support the lookup,
+                # transient error) degrades to the pre-existing "no
+                # project_id" behavior — file-based stack detection, no
+                # repo path override — rather than rejecting the request
+                # outright.
+                if project_id and not await _verify_ticket_belongs_to_project(
+                    server, ticket_id, project_id
+                ):
+                    logger.warning(
+                        "dev_env_view: ticket %s does not verifiably belong to "
+                        "project %s — ignoring project_id",
+                        ticket_id,
+                        project_id,
+                    )
+                    project_id = ""
 
                 dev_mgr = getattr(server, "_dev_env_manager", None)
                 if dev_mgr is None:
