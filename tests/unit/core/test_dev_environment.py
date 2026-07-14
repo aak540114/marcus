@@ -628,3 +628,80 @@ class TestRefresh:
         with patch("subprocess.Popen", return_value=mock_popen):
             await mgr.start("T-33", "kanboard", "b1")
         assert await mgr.refresh("T-33", "kanboard") is False
+
+
+# ---------------------------------------------------------------------------
+# Docker CLI call timeouts — an unresponsive daemon must fail fast, not hang
+# the calling coroutine (and the HTTP request/executor thread behind it).
+# ---------------------------------------------------------------------------
+
+
+class TestDockerCommandTimeouts:
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=True,
+            auto_detect=False,
+            dev_command="npm run dev -- --port {port}",
+            port_range=(19950, 20000),
+        )
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_docker_passes_a_timeout(self, docker_manager):
+        """docker run is called with an explicit timeout, not left unbounded."""
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await docker_manager.start("T-40", "kanboard", "ticket/kanboard/t-40")
+        assert mock_run.call_args.kwargs.get("timeout") is not None
+
+    @pytest.mark.asyncio
+    async def test_start_docker_timeout_raises_and_releases_port(self, docker_manager):
+        """A hung `docker run` raises RuntimeError instead of hanging forever,
+        and does not leak the port it had already allocated."""
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["docker", "run"], timeout=60),
+        ):
+            with pytest.raises(RuntimeError, match="timed out"):
+                await docker_manager.start("T-41", "kanboard", "ticket/kanboard/t-41")
+
+        assert docker_manager.get_info("T-41", "kanboard") is None
+        # The port must be free again — not leaked by the failed start.
+        alloc = docker_manager._allocator
+        port = alloc.allocate()
+        assert 19950 <= port <= 20000
+        alloc.release(port)
+
+    @pytest.mark.asyncio
+    async def test_stop_docker_timeout_does_not_raise(self, docker_manager):
+        """A hung `docker stop` is best-effort — stop() still completes."""
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
+            await docker_manager.start("T-42", "kanboard", "ticket/kanboard/t-42")
+
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["docker", "stop"], timeout=60),
+        ):
+            stopped = await docker_manager.stop("T-42", "kanboard")
+
+        assert stopped is True
+        assert docker_manager.get_info("T-42", "kanboard") is None
+
+    @pytest.mark.asyncio
+    async def test_refresh_timeout_returns_false(self, docker_manager):
+        """A hung `docker exec` during refresh returns False, not hangs."""
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")):
+            await docker_manager.start("T-43", "kanboard", "feature/x")
+
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["docker", "exec"], timeout=60),
+        ):
+            ok = await docker_manager.refresh("T-43", "kanboard")
+
+        assert ok is False

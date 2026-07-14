@@ -58,6 +58,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PORT_RANGE = (9100, 9900)
 _DEFAULT_IDLE_TIMEOUT = 4 * 3600  # 4 hours
 
+#: Hard ceiling on every `docker run`/`docker exec`/`docker stop` CLI call.
+#: Without this, an unresponsive Docker daemon (docker.sock permission
+#: wedge, daemon restarting) would block the asyncio executor thread
+#: handling the call indefinitely — including calls triggered by an
+#: incoming Gitea webhook POST, which would then hang that HTTP request
+#: (and, once the shared thread pool is exhausted, degrade unrelated
+#: run_in_executor work elsewhere in Marcus) rather than failing fast.
+_DOCKER_CMD_TIMEOUT = 60
+
 # ---------------------------------------------------------------------------
 # Project-type detection
 # ---------------------------------------------------------------------------
@@ -532,10 +541,21 @@ class DevEnvironmentManager:
             f"git fetch origin && git reset --hard {ref}",
         ]
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(cmd, capture_output=True, text=True),
-        )
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=_DOCKER_CMD_TIMEOUT
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Dev env refresh timed out for %s after %ds (Docker daemon "
+                "unresponsive?)",
+                key,
+                _DOCKER_CMD_TIMEOUT,
+            )
+            return False
         if result.returncode != 0:
             logger.warning("Dev env refresh failed for %s: %s", key, result.stderr[:400])
             return False
@@ -727,10 +747,19 @@ class DevEnvironmentManager:
         )
 
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(cmd, capture_output=True, text=True),
-        )
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=_DOCKER_CMD_TIMEOUT
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            self._allocator.release(port)
+            raise RuntimeError(
+                f"Docker container start timed out after {_DOCKER_CMD_TIMEOUT}s "
+                "(Docker daemon unresponsive?)"
+            ) from None
         if result.returncode != 0:
             self._allocator.release(port)
             raise RuntimeError(f"Docker container start failed: {result.stderr[:400]}")
@@ -747,13 +776,22 @@ class DevEnvironmentManager:
     async def _stop_docker(self, container_name: str) -> None:
         """Stop and remove a Docker container (best-effort)."""
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                ["docker", "stop", container_name],
-                capture_output=True,
-            ),
-        )
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["docker", "stop", container_name],
+                    capture_output=True,
+                    timeout=_DOCKER_CMD_TIMEOUT,
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "docker stop timed out for %s after %ds (Docker daemon "
+                "unresponsive?) — container may still be running",
+                container_name,
+                _DOCKER_CMD_TIMEOUT,
+            )
 
     # ------------------------------------------------------------------
     # Local process implementation
