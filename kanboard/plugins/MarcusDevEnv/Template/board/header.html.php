@@ -8,16 +8,25 @@
  * Section 4 — AI Verify counter (only visible when AI Gate is active)
  *             Shows [−] N [+] where N is the number of required LLM review
  *             rounds before a ticket's branch is auto-merged.  0 = disabled.
+ * Section 5 — Max dev environments counter (always visible, global —
+ *             not scoped per project).  Shows [−] N [+] where N is the
+ *             greatest number of "Open Dev Environment" Docker containers
+ *             allowed to run at once across ALL tickets.  Once reached,
+ *             starting a new one fails until an existing one is stopped.
+ *             &#8734; (infinity) means no limit — the default until a
+ *             human sets one here.
  *
  * The gate and verify_count settings persist via Marcus /api/gate-setting/project.
  * Default gate is "human"; default verify_count is 0.
  * Per-ticket overrides are in the task sidebar.
+ * The max-dev-envs setting persists via Marcus /api/dev-env-setting.
  */
-$marcusUrl   = getenv('MARCUS_URL') ?: 'http://localhost:4298';
-$apiUrl      = $marcusUrl . '/api/active-agents';
-$projectId   = $project['id'] ?? '';
-$descUrl     = $marcusUrl . '/project-description?project_id=' . urlencode((string) $projectId);
-$gateApiBase = $marcusUrl . '/api/gate-setting';
+$marcusUrl        = getenv('MARCUS_URL') ?: 'http://localhost:4298';
+$apiUrl           = $marcusUrl . '/api/active-agents';
+$projectId        = $project['id'] ?? '';
+$descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode((string) $projectId);
+$gateApiBase      = $marcusUrl . '/api/gate-setting';
+$devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 ?>
 <style>
 /* ── Active agents badge ──────────────────────────────────────────────── */
@@ -199,14 +208,28 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         <span class="marcus-gate-saving" id="marcus-verify-saving">saving&hellip;</span>
     </div>
 
+    <!-- Max parallel dev environments (global, always shown) -->
+    <div id="marcus-devenv-wrap" style="display:inline-flex;align-items:center;gap:6px;">
+        <span class="marcus-gate-label" title="Limits how many 'Open Dev Environment' Docker containers can run at once, across every ticket">Max dev environments:</span>
+        <div class="marcus-verify-counter">
+            <button class="marcus-verify-btn" id="marcus-devenv-dec"
+                    onclick="adjustMaxDevEnvs(-1)" title="Decrease the limit">&#8722;</button>
+            <span class="marcus-verify-val" id="marcus-devenv-val">&#8734;</span>
+            <button class="marcus-verify-btn" id="marcus-devenv-inc"
+                    onclick="adjustMaxDevEnvs(1)" title="Increase the limit">&#43;</button>
+        </div>
+        <span class="marcus-gate-saving" id="marcus-devenv-saving">saving&hellip;</span>
+    </div>
+
 </div>
 
 <script>
 (function () {
-    var AGENTS_URL  = <?= json_encode($apiUrl) ?>;
-    var GATE_URL    = <?= json_encode($gateApiBase) ?>;
-    var PROJECT_ID  = <?= json_encode((int) $projectId) ?>;
-    var INTERVAL    = 15000;
+    var AGENTS_URL       = <?= json_encode($apiUrl) ?>;
+    var GATE_URL         = <?= json_encode($gateApiBase) ?>;
+    var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
+    var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
+    var INTERVAL         = 15000;
 
     /* ── Active agents badge ─────────────────────────────────────────── */
     var badge   = document.getElementById('marcus-agent-badge');
@@ -328,6 +351,65 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
             verifyDecBtn.disabled = (parseInt(verifyValEl.textContent, 10) || 0) <= 0;
             verifyIncBtn.disabled = false;
             verifySaving.style.display = 'none';
+        });
+    };
+
+    /* ── Max parallel dev environments (global) ────────────────────── */
+    var devEnvSaving = document.getElementById('marcus-devenv-saving');
+    var devEnvValEl  = document.getElementById('marcus-devenv-val');
+    var devEnvDecBtn = document.getElementById('marcus-devenv-dec');
+    var devEnvIncBtn = document.getElementById('marcus-devenv-inc');
+    var INFINITY_CHAR = '∞';
+
+    function applyMaxDevEnvs(value) {
+        // value is null/undefined (unlimited) or a non-negative integer.
+        if (value === null || value === undefined) {
+            devEnvValEl.textContent = INFINITY_CHAR;
+            devEnvValEl.className = 'marcus-verify-val';
+            devEnvDecBtn.disabled = true; // nothing to decrement from unlimited
+        } else {
+            devEnvValEl.textContent = value;
+            devEnvValEl.className = 'marcus-verify-val' + (value > 0 ? ' active' : '');
+            devEnvDecBtn.disabled = (value <= 0);
+        }
+    }
+
+    // Load the current global limit on page load.
+    fetch(DEV_ENV_SETTING_URL, { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (data) { applyMaxDevEnvs(data.max_parallel_containers); })
+        .catch(function () { applyMaxDevEnvs(null); });
+
+    window.adjustMaxDevEnvs = function (delta) {
+        var curText = devEnvValEl.textContent;
+        var cur = (curText === INFINITY_CHAR) ? null : (parseInt(curText, 10) || 0);
+        var next;
+        if (cur === null) {
+            if (delta <= 0) { return; } // already unlimited; − is a no-op (button disabled)
+            next = 1; // first explicit cap
+        } else {
+            next = Math.max(0, cur + delta);
+            if (next === cur) { return; }
+        }
+        setMaxDevEnvs(next);
+    };
+
+    window.setMaxDevEnvs = function (count) {
+        devEnvSaving.style.display = 'inline';
+        devEnvDecBtn.disabled = devEnvIncBtn.disabled = true;
+
+        fetch(DEV_ENV_SETTING_URL, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ max_parallel_containers: count }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function () { applyMaxDevEnvs(count); })
+        .catch(function () { /* keep current visual state */ })
+        .finally(function () {
+            devEnvIncBtn.disabled = false;
+            devEnvDecBtn.disabled = (count <= 0);
+            devEnvSaving.style.display = 'none';
         });
     };
 }());
