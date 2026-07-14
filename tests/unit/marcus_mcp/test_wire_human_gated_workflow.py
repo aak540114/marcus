@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.marcus_mcp.server import _get_dev_env_settings_mgr, _wire_human_gated_workflow
+from src.marcus_mcp.server import (
+    _get_dev_env_settings_mgr,
+    _resolve_ticket_branch,
+    _resolve_ticket_repo_path,
+    _wire_human_gated_workflow,
+)
 
 
 def _make_server(events=MagicMock(), kanban_client=MagicMock(), provider="kanboard"):
@@ -213,3 +218,120 @@ class TestGetDevEnvSettingsMgr:
 
         mgr_cls.assert_not_called()
         assert result is existing
+
+
+class TestResolveTicketBranch:
+    """_resolve_ticket_branch prefers the lifecycle record over convention."""
+
+    def test_no_human_gated_workflow_uses_convention(self):
+        server = SimpleNamespace()
+        assert _resolve_ticket_branch(server, "42", "kanboard") == "ticket/kanboard/42"
+
+    def test_no_lifecycle_record_uses_convention(self):
+        workflow = MagicMock()
+        workflow._lifecycle.get = MagicMock(return_value=None)
+        server = SimpleNamespace(_human_gated_workflow=workflow)
+        assert _resolve_ticket_branch(server, "42", "kanboard") == "ticket/kanboard/42"
+
+    def test_uses_the_records_real_branch_name(self):
+        record = SimpleNamespace(branch_name="feature/custom-branch")
+        workflow = MagicMock()
+        workflow._lifecycle.get = MagicMock(return_value=record)
+        server = SimpleNamespace(_human_gated_workflow=workflow)
+        assert _resolve_ticket_branch(server, "42", "kanboard") == "feature/custom-branch"
+
+    def test_empty_branch_name_on_record_falls_back_to_convention(self):
+        record = SimpleNamespace(branch_name="")
+        workflow = MagicMock()
+        workflow._lifecycle.get = MagicMock(return_value=record)
+        server = SimpleNamespace(_human_gated_workflow=workflow)
+        assert _resolve_ticket_branch(server, "42", "kanboard") == "ticket/kanboard/42"
+
+
+class TestResolveTicketRepoPath:
+    """_resolve_ticket_repo_path resolves (or on-demand provisions) a repo path."""
+
+    @pytest.mark.asyncio
+    async def test_no_project_sync_returns_none(self):
+        server = SimpleNamespace(_project_sync=None, kanban_client=MagicMock())
+        assert await _resolve_ticket_repo_path(server, "1") is None
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_none(self):
+        server = SimpleNamespace(_project_sync=MagicMock(), kanban_client=MagicMock())
+        assert await _resolve_ticket_repo_path(server, "") is None
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_project_id_returns_none(self):
+        server = SimpleNamespace(_project_sync=MagicMock(), kanban_client=MagicMock())
+        assert await _resolve_ticket_repo_path(server, "not-a-number") is None
+
+    @pytest.mark.asyncio
+    async def test_returns_cached_mapping_without_provisioning(self):
+        project_sync = MagicMock()
+        project_sync.get_repo_for_project = MagicMock(
+            return_value={"local_repo_path": "./data/repos/shopping-cart"}
+        )
+        project_sync.ensure_repo = AsyncMock()
+        server = SimpleNamespace(_project_sync=project_sync, kanban_client=MagicMock())
+
+        result = await _resolve_ticket_repo_path(server, "1")
+
+        assert result == "./data/repos/shopping-cart"
+        project_sync.ensure_repo.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_provisions_on_demand_when_no_mapping_and_name_resolvable(self):
+        project_sync = MagicMock()
+        project_sync.get_repo_for_project = MagicMock(return_value=None)
+        project_sync.ensure_repo = AsyncMock(
+            return_value={"local_repo_path": "./data/repos/new-project"}
+        )
+        kanban = MagicMock()
+        kanban.get_project_name = AsyncMock(return_value="New Project")
+        server = SimpleNamespace(_project_sync=project_sync, kanban_client=kanban)
+
+        result = await _resolve_ticket_repo_path(server, "5")
+
+        project_sync.ensure_repo.assert_awaited_once_with(5, "New Project")
+        assert result == "./data/repos/new-project"
+
+    @pytest.mark.asyncio
+    async def test_kanban_without_get_project_name_returns_none(self):
+        project_sync = MagicMock()
+        project_sync.get_repo_for_project = MagicMock(return_value=None)
+        project_sync.ensure_repo = AsyncMock()
+        kanban = MagicMock(spec=[])  # no get_project_name attribute
+        server = SimpleNamespace(_project_sync=project_sync, kanban_client=kanban)
+
+        result = await _resolve_ticket_repo_path(server, "5")
+
+        assert result is None
+        project_sync.ensure_repo.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_project_name_failure_returns_none(self):
+        project_sync = MagicMock()
+        project_sync.get_repo_for_project = MagicMock(return_value=None)
+        project_sync.ensure_repo = AsyncMock()
+        kanban = MagicMock()
+        kanban.get_project_name = AsyncMock(side_effect=RuntimeError("kanban down"))
+        server = SimpleNamespace(_project_sync=project_sync, kanban_client=kanban)
+
+        result = await _resolve_ticket_repo_path(server, "5")
+
+        assert result is None
+        project_sync.ensure_repo.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_repo_failure_returns_none(self):
+        project_sync = MagicMock()
+        project_sync.get_repo_for_project = MagicMock(return_value=None)
+        project_sync.ensure_repo = AsyncMock(return_value=None)
+        kanban = MagicMock()
+        kanban.get_project_name = AsyncMock(return_value="New Project")
+        server = SimpleNamespace(_project_sync=project_sync, kanban_client=kanban)
+
+        result = await _resolve_ticket_repo_path(server, "5")
+
+        assert result is None

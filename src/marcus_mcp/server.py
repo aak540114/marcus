@@ -3160,6 +3160,84 @@ def _get_dev_env_settings_mgr(server: "MarcusServer") -> Any:
     return mgr
 
 
+def _resolve_ticket_branch(server: "MarcusServer", ticket_id: str, provider: str) -> str:
+    """Return a ticket's real persisted branch name, falling back to convention.
+
+    Prefers ``HumanGatedWorkflow``'s lifecycle record (the source of
+    truth once a ticket has been seen) over recomputing
+    ``BranchManager.make_branch_name()``'s naming convention, in case of
+    any drift between the two.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+    ticket_id : str
+        Provider ticket identifier.
+    provider : str
+        Kanban provider name.
+
+    Returns
+    -------
+    str
+        The branch name to use.
+    """
+    branch = f"ticket/{provider}/{ticket_id}"
+    human_gated_workflow = getattr(server, "_human_gated_workflow", None)
+    lifecycle = getattr(human_gated_workflow, "_lifecycle", None)
+    if lifecycle is not None:
+        record = lifecycle.get(ticket_id, provider)
+        if record and record.branch_name:
+            return str(record.branch_name)
+    return branch
+
+
+async def _resolve_ticket_repo_path(
+    server: "MarcusServer", project_id_str: str
+) -> Optional[str]:
+    """Resolve (provisioning on-demand if needed) a ticket's local repo path.
+
+    Mirrors ``HumanGatedWorkflow.get_work_context``'s on-demand
+    provisioning: ``ProjectSyncWorkflow.ensure_repo()`` is the only path
+    that actually creates a project's Gitea repo, since nothing publishes
+    ``project.created``. Used by the ``/dev-env/view`` route so a
+    ticket's preview container mounts the correct repo instead of
+    whatever ``DevEnvironmentManager.config.repo_path`` happens to
+    default to (fixed at construction, shared across every ticket).
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+    project_id_str : str
+        Raw ``project_id`` query param (may be empty or non-numeric).
+
+    Returns
+    -------
+    Optional[str]
+        The repo's local path, or ``None`` if unresolvable.
+    """
+    project_sync = getattr(server, "_project_sync", None)
+    if not project_sync or not project_id_str:
+        return None
+    try:
+        project_id = int(project_id_str)
+    except ValueError:
+        return None
+
+    mapping = project_sync.get_repo_for_project(project_id)
+    if mapping is None:
+        get_project_name = getattr(server.kanban_client, "get_project_name", None)
+        if get_project_name is not None:
+            try:
+                project_name = await get_project_name(project_id)
+            except Exception:  # noqa: BLE001
+                project_name = None
+            if project_name:
+                mapping = await project_sync.ensure_repo(project_id, project_name)
+    return mapping.get("local_repo_path") if mapping else None
+
+
 async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
     """Construct and start the human-gated ticket workflow subsystem.
 
@@ -3539,12 +3617,15 @@ if __name__ == "__main__":
 
                 info = dev_mgr.get_info(ticket_id, provider)
                 if info is None:
-                    branch = f"ticket/{provider}/{ticket_id}"
+                    branch = _resolve_ticket_branch(server, ticket_id, provider)
+                    repo_path = await _resolve_ticket_repo_path(server, project_id)
+
                     info = await dev_mgr.start(
                         ticket_id=ticket_id,
                         provider=provider,
                         branch_name=branch,
                         project_stack=project_stack,
+                        repo_path=repo_path,
                     )
 
                 if info and info.url:
