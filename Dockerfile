@@ -17,6 +17,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Docker CLI (client only, no daemon) — lets Marcus spawn SIBLING
+# containers on the HOST via a mounted /var/run/docker.sock
+# (Docker-outside-of-Docker; see docker-compose.yml's marcus.volumes
+# comment), for src/core/dev_environment.py's per-ticket hot-reload dev-
+# environment containers. Installed from Docker's own static-binary
+# distribution rather than `apt-get install docker.io`/docker-ce, which
+# would pull in the full daemon/containerd stack this image never runs.
+# Pinned for the same reason CLAUDE_CLI_VERSION is pinned below — an
+# unpinned client could silently drift from what this image's compose
+# file / host Docker Engine was tested against.
+ARG DOCKER_CLI_VERSION=26.1.4
+RUN ["bash", "-o", "pipefail", "-c", "\
+        arch=\"$(uname -m)\" \
+        && curl -fsSL \"https://download.docker.com/linux/static/stable/${arch}/docker-${DOCKER_CLI_VERSION}.tgz\" -o /tmp/docker-cli.tgz \
+        && tar -xzf /tmp/docker-cli.tgz -C /tmp \
+        && mv /tmp/docker/docker /usr/local/bin/docker \
+        && rm -rf /tmp/docker-cli.tgz /tmp/docker \
+        && docker --version \
+    "]
+
 # Node.js + the `claude` CLI (npm package @anthropic-ai/claude-code) —
 # required by the claude_subscription AI provider
 # (src/ai/providers/claude_cli_provider.py), which runs Marcus's own

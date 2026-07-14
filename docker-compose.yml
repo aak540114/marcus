@@ -170,6 +170,24 @@ services:
       # "AI provider" section.
       - ${HOME:?HOME must be set for the claude_subscription bind mounts; export HOME or set MARCUS_AI_PROVIDER=anthropic}/.claude.json:/root/.claude.json
       - ${HOME:?HOME must be set for the claude_subscription bind mounts; export HOME or set MARCUS_AI_PROVIDER=anthropic}/.claude/.credentials.json:/root/.claude/.credentials.json
+      # Docker-outside-of-Docker: lets Marcus spawn SIBLING containers on
+      # the HOST for per-ticket dev-environment previews
+      # (src/core/dev_environment.py's "Open Dev Environment" button) by
+      # talking to the HOST's Docker daemon directly, rather than running
+      # a nested daemon inside this container.
+      #
+      # SECURITY NOTE: a process with access to docker.sock can trivially
+      # escalate to full host root (e.g. `docker run -v /:/host ... chroot
+      # /host`). This is an accepted, deliberate tradeoff for this local-
+      # dev/demo stack, NOT something to enable on a shared or internet-
+      # facing host without understanding that risk. The
+      # `max_parallel_containers` Kanboard setting (see
+      # src/core/dev_env_settings.py) limits how many sibling containers
+      # can be spun up, but does not change this trust boundary — anyone
+      # who can reach Marcus's HTTP port with MARCUS_AGENT_TOKEN can
+      # already run arbitrary code as an agent, so this mount does not,
+      # on its own, expand what an authenticated caller could already do.
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       # Container-to-container URLs use Docker service names, not
       # localhost. Note Kanboard listens on port 80 *inside* the compose
@@ -198,16 +216,23 @@ services:
       # generates it when you opt into remote access. Empty = auth disabled
       # (fine for the localhost-only default; required before exposing).
       MARCUS_AGENT_TOKEN: "${MARCUS_AGENT_TOKEN:-}"
-      # GITEA_URL/GITEA_TOKEN: provisioned by scripts/setup.sh and correct,
-      # but not yet consumed by anything in src/ — GiteaManager and
-      # ProjectSyncWorkflow (src/integrations/gitea_manager.py,
-      # src/workflows/project_sync_workflow.py) exist and are tested but
-      # aren't instantiated by server.py yet. Setting these now is
-      # forward-compatible with that wiring landing later; it is not a
-      # currently-functioning feature. See README.md's Gitea integration
-      # row for the full explanation.
+      # GITEA_URL/GITEA_TOKEN: provisioned by scripts/setup.sh. Read by
+      # _wire_human_gated_workflow() in src/marcus_mcp/server.py at
+      # startup to construct GiteaManager -> ProjectSyncWorkflow, so
+      # tickets' projects get an auto-created Gitea repo (and, once
+      # GITEA_WEBHOOK_TOKEN is set, a push webhook) the first time an
+      # agent calls get_work_context.
       GITEA_URL: "http://gitea:3000"
       GITEA_TOKEN: "${GITEA_TOKEN:-}"
+      # See _resolve_host_repo_path() in src/core/dev_environment.py: a
+      # `docker run -v` mount source Marcus constructs must be a HOST
+      # filesystem path, since the docker.sock mount above makes `docker
+      # run` reach the HOST's daemon directly (Docker-outside-of-Docker),
+      # not a path inside Marcus's own container. ${PWD} is the host
+      # shell's working directory at `docker compose up` time —
+      # scripts/setup.sh always `cd`s to the repo root first, so this
+      # reliably resolves to the repo root on the host.
+      MARCUS_HOST_PROJECT_ROOT: "${PWD}"
       # Resolves docker/marcus.docker.config.json's "ai.provider" /
       # "ai.claude_cli_model" placeholders. scripts/setup.sh sets
       # MARCUS_AI_PROVIDER=claude_subscription in .env by default
