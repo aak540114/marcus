@@ -197,6 +197,72 @@ def find_or_create_project(base_url: str, token: str, name: str) -> int:
     return int(result)
 
 
+def ensure_admin_user(base_url: str, token: str, username: str, password: str) -> bool:
+    """Idempotently replace Kanboard's built-in ``admin``/``admin`` login.
+
+    Kanboard's JSON-RPC API has no method to rotate an existing user's
+    password (``updateUser`` covers only username/name/email/role) — so the
+    only way to stop the fixed, well-known ``admin``/``admin`` credential
+    from being usable is to create a *different* admin-role account (whose
+    password we choose) and disable the original ``admin`` account via
+    ``disableUser``. This is only called when Kanboard is being exposed
+    beyond localhost (see ``KANBOARD_BIND_HOST`` in ``docker-compose.yml``)
+    — for the default localhost-only deployment, admin/admin is left as-is,
+    matching every other "local/demo use" default in this stack.
+
+    Disabling ``admin`` does not affect Marcus's own JSON-RPC access:
+    that authenticates as Kanboard's separate app-level ``jsonrpc`` user
+    (HTTP Basic auth, password = ``API_AUTHENTICATION_TOKEN``), not as any
+    regular user account — see ``call_rpc``'s docstring.
+
+    Parameters
+    ----------
+    base_url : str
+        Kanboard JSON-RPC endpoint.
+    token : str
+        API_AUTHENTICATION_TOKEN value.
+    username : str
+        Username for the replacement admin account.
+    password : str
+        Password for the replacement admin account.
+
+    Returns
+    -------
+    bool
+        ``True`` if any change was made (account created and/or the
+        default admin disabled); ``False`` if everything was already in
+        the desired state (safe to call on every setup.sh re-run).
+
+    Raises
+    ------
+    KanboardRPCError
+        If ``createUser`` returns a falsy result.
+    """
+    changed = False
+
+    new_admin = call_rpc(base_url, token, "getUserByName", [username])
+    if not new_admin:
+        result = call_rpc(
+            base_url,
+            token,
+            "createUser",
+            [username, password, "Marcus Admin", "", "app-admin"],
+        )
+        if not result:
+            raise KanboardRPCError(f"createUser({username!r}) returned a falsy result")
+        changed = True
+        new_admin = {"id": result}
+
+    default_admin = call_rpc(base_url, token, "getUserByName", ["admin"])
+    if default_admin and str(default_admin.get("id")) != str(new_admin.get("id")):
+        # disableUser is idempotent — safe to call even if already disabled
+        # (e.g. a re-run of this script), so no extra is_active check needed.
+        call_rpc(base_url, token, "disableUser", [int(default_admin["id"])])
+        changed = True
+
+    return changed
+
+
 def reconcile_columns(
     base_url: str,
     token: str,
@@ -266,11 +332,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--url", required=True, help="Kanboard JSON-RPC URL")
     parser.add_argument("--token", required=True, help="API_AUTHENTICATION_TOKEN value")
     parser.add_argument("--project-name", required=True, help="Project name to find or create")
+    parser.add_argument(
+        "--secure-admin",
+        nargs=2,
+        metavar=("USERNAME", "PASSWORD"),
+        help=(
+            "Replace Kanboard's admin/admin login: create an admin-role "
+            "user with these credentials and disable the built-in 'admin' "
+            "account (which has no API-rotatable password). Only pass this "
+            "when Kanboard is being exposed beyond localhost."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
         project_id = find_or_create_project(args.url, args.token, args.project_name)
         added = reconcile_columns(args.url, args.token, project_id)
+        if args.secure_admin:
+            username, password = args.secure_admin
+            if ensure_admin_user(args.url, args.token, username, password):
+                print(f"Secured admin account (created {username!r}, disabled 'admin')", file=sys.stderr)
     except (KanboardAuthError, KanboardRPCError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

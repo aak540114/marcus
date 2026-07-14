@@ -208,6 +208,81 @@ class TestFindOrCreateProject:
                 pk.find_or_create_project("http://x/jsonrpc.php", "tok", "Marcus Project")
 
 
+class TestEnsureAdminUser:
+    """ensure_admin_user() — replace admin/admin since Kanboard's JSON-RPC
+    API has no method to rotate an existing user's password."""
+
+    def test_creates_user_and_disables_default_admin(self):
+        """Fresh install: no marcus-admin user yet, default admin active."""
+        responses = [
+            _rpc_response(False),  # getUserByName(new username): not found
+            _rpc_response(5),  # createUser: new user id
+            _rpc_response({"id": "1", "username": "admin"}),  # getUserByName("admin")
+            _rpc_response(True),  # disableUser
+        ]
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
+            changed = pk.ensure_admin_user(
+                "http://x/jsonrpc.php", "tok", "marcus_admin", "s3cret"
+            )
+        assert changed is True
+        assert m.call_count == 4
+
+    def test_idempotent_when_already_secured(self):
+        """Re-run: marcus-admin already exists, default admin already gone
+        (getUserByName returns falsy) — no RPC calls that mutate state."""
+        responses = [
+            _rpc_response({"id": "5", "username": "marcus_admin"}),  # already exists
+            _rpc_response(False),  # getUserByName("admin"): no longer present
+        ]
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
+            changed = pk.ensure_admin_user(
+                "http://x/jsonrpc.php", "tok", "marcus_admin", "s3cret"
+            )
+        assert changed is False
+        assert m.call_count == 2  # two lookups, no createUser/disableUser calls
+
+    def test_disables_admin_even_when_marcus_user_already_exists(self):
+        """User already created on a prior run, but default admin is still
+        active (e.g. setup.sh was interrupted between the two steps) —
+        must still disable it on this run."""
+        responses = [
+            _rpc_response({"id": "5", "username": "marcus_admin"}),
+            _rpc_response({"id": "1", "username": "admin"}),
+            _rpc_response(True),  # disableUser
+        ]
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
+            changed = pk.ensure_admin_user(
+                "http://x/jsonrpc.php", "tok", "marcus_admin", "s3cret"
+            )
+        assert changed is True
+        assert m.call_count == 3
+
+    def test_never_disables_the_account_it_just_created(self):
+        """Defensive check: if the new admin user happens to be named
+        'admin' itself (unlikely given the generated-username scheme, but
+        cheap to guard), never disable the account just created."""
+        responses = [
+            _rpc_response(False),  # getUserByName("admin"): not found yet
+            _rpc_response(1),  # createUser returns id 1
+            _rpc_response({"id": "1", "username": "admin"}),  # getUserByName("admin") now finds it
+        ]
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
+            changed = pk.ensure_admin_user("http://x/jsonrpc.php", "tok", "admin", "s3cret")
+        assert changed is True  # created, but NOT disabled
+        assert m.call_count == 3  # no disableUser call
+
+    def test_raises_if_create_user_returns_falsy(self):
+        """createUser returning a falsy result raises rather than silently
+        reporting success while admin/admin is still the only login."""
+        responses = [
+            _rpc_response(False),  # getUserByName: not found
+            _rpc_response(False),  # createUser failed
+        ]
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses):
+            with pytest.raises(pk.KanboardRPCError):
+                pk.ensure_admin_user("http://x/jsonrpc.php", "tok", "marcus_admin", "s3cret")
+
+
 class TestReconcileColumns:
     """reconcile_columns() — idempotent rename-defaults + add-missing."""
 

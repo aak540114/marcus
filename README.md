@@ -86,6 +86,12 @@ AI agents (Claude Code, Codex, etc.)
 
 \* Not wired into the running server yet — see the Gitea integration row above.
 
+### How AI agents reach tickets
+
+AI agents never call Kanboard's JSON-RPC API and never receive Kanboard's API token. They call Marcus's MCP tools (`get_work_context`, `post_ticket_progress`, `signal_ready_for_review`, …); Marcus alone holds `KANBOARD_API_TOKEN` and is the only thing that makes JSON-RPC calls to Kanboard, over the internal Docker network (`http://kanboard/jsonrpc.php`, not the host-published `:8080`). No tool response ever contains a Kanboard URL or credential — the richest one, `get_work_context`, returns ticket/branch/repo fields, never Kanboard's own address. This is why gating Marcus's HTTP endpoint with a bearer token (see [Authenticating remote agents](#authenticating-remote-agents)) is sufficient to control ticket access: it's the *only* door.
+
+Agents do talk to **Gitea** directly, but only for `git clone`/`fetch`/`push` on the one branch Marcus created for them — a different, narrower surface than the board itself.
+
 ---
 
 ## Quick Start
@@ -175,16 +181,23 @@ This always works from the same machine Marcus runs on. Connecting from a **diff
 
 ## Network access
 
-`./scripts/setup.sh` asks once, interactively: **"Allow OTHER machines to reach this stack?"** The answer is written to `.env` as `MARCUS_BIND_HOST` and controls which host interface Docker publishes the ports on — for **all three** services (Marcus, Kanboard, and Gitea), so "no" genuinely means the whole stack stays on this machine:
+`./scripts/setup.sh` asks once, interactively: **"Allow OTHER machines to reach this stack?"** One answer configures all three services — written to `.env` as `MARCUS_BIND_HOST` / `GITEA_BIND_HOST` / `KANBOARD_BIND_HOST` (separate variables, not one shared value, since each service is exposed for a different reason — see below):
 
-| Answer | `MARCUS_BIND_HOST` | Effect |
-|---|---|---|
-| No (default) | `127.0.0.1` | Marcus, Kanboard, and Gitea only accept connections from this machine. This is the default for a reason: it's the safer choice, and what most local/single-machine setups want. No agent token is needed. |
-| Yes | `0.0.0.0` (or loopback + HTTPS proxy) | Reachable from other machines. When you answer Yes, setup **also generates an agent token and offers HTTPS** — see [Authenticating remote agents](#authenticating-remote-agents) below. |
+| Answer | Effect |
+|---|---|
+| No (default) | Marcus, Gitea, and Kanboard only accept connections from this machine. This is the default for a reason: it's the safer choice, and what most local/single-machine setups want. No agent token is needed, and Kanboard's login stays `admin`/`admin` (fine — it's not reachable from anywhere else). |
+| Yes | All three become reachable from other machines. Setup also **generates an agent token, offers HTTPS for Marcus, and replaces Kanboard's `admin`/`admin` login** before ever publishing its port — see below and [Authenticating remote agents](#authenticating-remote-agents). |
 
-Answering **Yes** is what a distributed setup needs — Marcus, Kanboard, and Gitea can each run on separate hosts (see [Independent deployment](#independent-deployment)), with AI agents on individual machines all connecting to Marcus's one MCP endpoint over the network.
+Answering **Yes** is what a distributed setup needs — Marcus, Kanboard, and Gitea can each run on separate hosts (see [Independent deployment](#independent-deployment)): AI agents connect to Marcus's MCP endpoint and clone/push to Gitea, while humans use Kanboard's UI, all over the network.
 
-If there's no terminal to ask (e.g. running the script from CI), it defaults to **No** rather than guessing. To change your answer later, edit `MARCUS_BIND_HOST` in `.env` and run `docker compose up -d` again.
+If there's no terminal to ask (e.g. running the script from CI), it defaults to **No** rather than guessing. To change your answer later, edit the three `*_BIND_HOST` variables in `.env` and run `docker compose up -d` again.
+
+**Why Kanboard needs special handling.** AI agents never talk to Kanboard directly — they go through Marcus, which reaches Kanboard over the internal Docker network (see [How AI agents reach tickets](#how-ai-agents-reach-tickets)). Kanboard's port only matters for a *human* browsing its UI remotely. Unlike `KANBOARD_API_TOKEN`/`MARCUS_AGENT_TOKEN`/`GITEA_ADMIN_PASSWORD` (all randomly generated), Kanboard's JSON-RPC API has **no method to rotate an existing user's password** — so simply publishing its port with the fixed `admin`/`admin` default would hand anyone who finds it full read/write access to every ticket. Instead, when you answer Yes, setup:
+1. Generates `KANBOARD_ADMIN_USERNAME` (`marcus_admin`) / `KANBOARD_ADMIN_PASSWORD` (random) in `.env`.
+2. Creates that account via Kanboard's JSON-RPC API and **disables the built-in `admin` account** (`ensure_admin_user()` in `scripts/provision_kanboard.py`) — this doesn't affect Marcus's own Kanboard access, which authenticates as a separate app-level API user, not as `admin`.
+3. Only then publishes Kanboard's port.
+
+The new credentials are printed at the end of setup (and saved in `.env`) — log in with those, not `admin`/`admin`.
 
 ---
 
@@ -201,11 +214,11 @@ claude mcp add --transport http marcus http://<this-machine's-address>:4298/mcp 
 
 The exact command (with your real token filled in) is printed at the end of setup. Give the token only to the agents you want to admit; anyone with it can drive the board, so treat it like a password. The Kanboard webhook route is exempt — it authenticates with its own separate `?token=` secret that Kanboard sends. With no token set (the localhost-only default), auth is off, keeping local use frictionless.
 
-**2. HTTPS (protecting the token in transit).** A bearer token sent over plain HTTP can be sniffed on the network, so setup offers to terminate TLS with a built-in [Caddy](https://caddyserver.com/) reverse proxy (`docker-compose.tls.yml`). Enter a **public domain** when asked and Caddy automatically obtains and renews a real, browser-trusted **Let's Encrypt** certificate (requires the domain's DNS to point at this host and ports 80+443 open to the internet). In this mode only Caddy's `443` is exposed; Marcus/Kanboard/Gitea stay on loopback and are reached only through the proxy. Agents connect over `https://<domain>/mcp`.
+**2. HTTPS (protecting the token in transit).** A bearer token sent over plain HTTP can be sniffed on the network, so setup offers to terminate TLS with a built-in [Caddy](https://caddyserver.com/) reverse proxy (`docker-compose.tls.yml`), **for Marcus only**. Enter a **public domain** when asked and Caddy automatically obtains and renews a real, browser-trusted **Let's Encrypt** certificate (requires the domain's DNS to point at this host and ports 80+443 open to the internet). In this mode only Caddy's `443` is exposed for Marcus, which stays on loopback behind it and is reached only through the proxy — agents connect over `https://<domain>/mcp`. Gitea and Kanboard are **not** proxied by Caddy and keep their own directly-published ports (plain HTTP) regardless of this choice, since Caddy in this setup fronts Marcus specifically.
 
 If you don't provide a domain, setup leaves the stack on plain HTTP and tells you so — the token still authenticates agents, but **use a VPN or tunnel (Tailscale, WireGuard, Cloudflare Tunnel) to encrypt the connection**. (A self-signed cert without a domain isn't offered as a real option, because `claude mcp add` would reject the untrusted certificate.)
 
-> ⚠️ **Still change the defaults and firewall it.** Kanboard (`admin`/`admin`) and Gitea (`root`/the printed `GITEA_ADMIN_PASSWORD`) ship with well-known credentials and are exposed alongside Marcus when you answer Yes — change them before real use. Requiring the bearer token also closes the earlier CSRF gap (a browser can't attach the `Authorization` header cross-origin), but defense-in-depth still means restricting the stack to just the hosts your agents run on with a firewall/security-group, especially on a cloud VPS.
+> ⚠️ **Still firewall it.** Gitea's admin password and Kanboard's replacement login are both randomly generated by setup (printed once, saved in `.env`) — but they're still real credentials sitting on an internet-reachable port once you answer Yes. Requiring the bearer token closes the earlier CSRF gap (a browser can't attach the `Authorization` header cross-origin), but defense-in-depth still means restricting the stack to just the hosts your agents/users actually need, with a firewall/security-group, especially on a cloud VPS.
 
 > ℹ️ **Known limitation — the browser dashboard under a token.** The token gates *every* Marcus HTTP route (that's the point: a rogue agent can't read or change board state). But the MarcusDevEnv Kanboard-plugin widgets (Active Agents badge, gate toggle, project-description link) are fetched by your *browser*, which can't attach an `Authorization: Bearer` header — so with `MARCUS_AGENT_TOKEN` set, those widgets show errors and the dashboard degrades. Agent connectivity (the MCP endpoint) is unaffected. If you need the browser dashboard to work over an authenticated remote Marcus, the plugin needs to forward the token — not wired up yet; open an issue / ask if you want it.
 

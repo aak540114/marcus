@@ -29,6 +29,13 @@
 # exposed to other machines. The bearer-token check still runs inside
 # Marcus, so even an attacker who reached it directly on the internal
 # network could not use it without the token.
+#
+# Gitea is NOT covered by this proxy and stays on its own directly-
+# published port (GITEA_BIND_HOST=0.0.0.0, set independently of
+# MARCUS_BIND_HOST — see docker-compose.yml) — remote agents need direct
+# git clone/push access to it, and Caddy here only reverse-proxies Marcus.
+# Kanboard is never exposed by this or any remote-access setting; see
+# KANBOARD_BIND_HOST in docker-compose.yml.
 
 services:
   caddy:
@@ -39,9 +46,10 @@ services:
       marcus:
         condition: service_healthy
     ports:
-      # Published on all interfaces so remote agents can reach it. This is
-      # the ONLY port exposed off-host in TLS mode; keep MARCUS_BIND_HOST
-      # at 127.0.0.1 so Marcus/Kanboard/Gitea stay internal.
+      # Published on all interfaces so remote agents can reach Marcus via
+      # this proxy. Gitea is published separately (GITEA_BIND_HOST, see
+      # docker-compose.yml) since Caddy doesn't proxy it; Kanboard is never
+      # published by any remote-access setting (KANBOARD_BIND_HOST).
       - "80:80"
       - "443:443"
     environment:

@@ -111,11 +111,15 @@ if [ -z "$(env_get KANBOARD_PROJECT_NAME)" ]; then
     env_set KANBOARD_PROJECT_NAME "Marcus Project"
 fi
 if [ -z "$(env_get GITEA_ADMIN_PASSWORD)" ]; then
-    # Fixed, predictable default — matches Kanboard's own admin/admin
-    # default. This stack is intended for local/demo use, not exposed to
-    # the internet. Override by setting GITEA_ADMIN_PASSWORD in .env
-    # before running this script.
-    env_set GITEA_ADMIN_PASSWORD "Marcus123!"
+    # Randomly generated (unlike Kanboard's admin/admin, which Kanboard's
+    # own JSON-RPC API has no method to rotate — see the KANBOARD_BIND_HOST
+    # comment in docker-compose.yml — Gitea's admin account IS created by
+    # this script, so it can just pick a strong password up front instead
+    # of shipping a fixed, guessable default). Printed once at the end of
+    # this script and saved to .env (git-ignored) — that's the only place
+    # it's recorded going forward. Override by setting GITEA_ADMIN_PASSWORD
+    # in .env yourself before running this script.
+    env_set GITEA_ADMIN_PASSWORD "$(openssl rand -hex 12)"
 fi
 
 log "Selecting AI provider..."
@@ -182,38 +186,82 @@ if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
         read -r -p "Allow OTHER machines (e.g. a remote VPS, agents on other hosts) to reach this stack? [y/N]: " allow_remote || allow_remote=""
         case "$allow_remote" in
             [yY]|[yY][eE][sS])
-                # Remote access opted in. Two things make this safe(r):
-                # (1) a bearer token every agent must present, so
+                # Remote access opted in. Three things make this safe(r):
+                # (1) a bearer token every AGENT must present to Marcus, so
                 # unaccounted agents are rejected; (2) an optional HTTPS
-                # reverse proxy so the token isn't sent in cleartext.
+                # reverse proxy so that token isn't sent in cleartext;
+                # (3) Kanboard's admin/admin default — which has no
+                # API-rotatable password — is replaced with a generated
+                # account before its port is ever published, so opening it
+                # to HUMANS doesn't also open it to anyone who's read this
+                # script (see ensure_admin_user() in provision_kanboard.py).
                 if [ -z "$(env_get MARCUS_AGENT_TOKEN)" ]; then
                     env_set MARCUS_AGENT_TOKEN "$(openssl rand -hex 32)"
                     log "Generated MARCUS_AGENT_TOKEN — connecting agents must present it as 'Authorization: Bearer <token>'."
                 fi
 
+                # Gitea is NOT proxied by Caddy, so it needs its own direct
+                # exposure regardless of the HTTPS choice below — set this
+                # now, before that choice pins MARCUS_BIND_HOST to loopback
+                # in TLS mode (Gitea must NOT follow Marcus to loopback).
+                env_set GITEA_BIND_HOST "0.0.0.0"
+
+                # Kanboard is also NOT proxied by Caddy — same reasoning as
+                # Gitea, it gets its own direct port regardless of the TLS
+                # choice below. Unlike Gitea's, this account's credentials
+                # are generated here (not by Kanboard) since setup.sh is
+                # what will actually create them via ensure_admin_user()
+                # once Kanboard is up (see step 4 below).
+                env_set KANBOARD_BIND_HOST "0.0.0.0"
+                if [ -z "$(env_get KANBOARD_ADMIN_USERNAME)" ]; then
+                    env_set KANBOARD_ADMIN_USERNAME "marcus_admin"
+                fi
+                if [ -z "$(env_get KANBOARD_ADMIN_PASSWORD)" ]; then
+                    env_set KANBOARD_ADMIN_PASSWORD "$(openssl rand -hex 12)"
+                fi
+
                 tls_domain=""
-                read -r -p "Terminate HTTPS with a built-in proxy? Enter a public domain for a real (Let's Encrypt) cert, or leave blank for plain HTTP: " tls_domain || tls_domain=""
+                read -r -p "Terminate HTTPS with a built-in proxy for Marcus? Enter a public domain for a real (Let's Encrypt) cert, or leave blank for plain HTTP: " tls_domain || tls_domain=""
                 if [ -n "$tls_domain" ]; then
-                    # TLS mode: only Caddy (443) is exposed off-host; the
-                    # stack itself stays on loopback.
+                    # TLS mode: only Caddy (443) is exposed off-host for
+                    # Marcus. Gitea/Kanboard (set above) stay directly
+                    # published — Caddy here fronts Marcus only.
                     env_set MARCUS_BIND_HOST "127.0.0.1"
                     env_set MARCUS_PUBLIC_DOMAIN "$tls_domain"
                     acme_email=""
                     read -r -p "  Email for Let's Encrypt (optional, press Enter to skip): " acme_email || acme_email=""
                     env_set MARCUS_ACME_EMAIL "$acme_email"
                     COMPOSE_FILES+=(-f docker-compose.tls.yml)
-                    log "HTTPS enabled via built-in Caddy proxy for https://${tls_domain}/ — Marcus/Kanboard/Gitea stay on loopback; only 443 is exposed."
+                    # MARCUS_URL is embedded server-side into Kanboard's own
+                    # pages (kanboard/plugins/MarcusDevEnv/...) so a human's
+                    # BROWSER can fetch it — it must be an address that
+                    # browser can resolve, not "localhost" (which would
+                    # resolve to the visitor's own machine, not this host).
+                    # Deliberately only auto-set here (a real domain is a
+                    # known-good, deterministic value); the plain-HTTP branch
+                    # below has no reliable public address to guess at.
+                    if [ -z "$(env_get MARCUS_URL)" ]; then
+                        env_set MARCUS_URL "https://${tls_domain}"
+                    fi
+                    log "HTTPS enabled via built-in Caddy proxy for https://${tls_domain}/ — Marcus stays on loopback behind it; only 443 is exposed."
+                    log "Gitea's own port (3000/2222) and Kanboard's (8080) are still published directly over plain HTTP."
                     log "Requires DNS for ${tls_domain} to point at this host and ports 80+443 reachable from the internet."
                 else
                     env_set MARCUS_BIND_HOST "0.0.0.0"
                     log "Plain HTTP on all interfaces. Marcus is protected by the bearer token, but the token travels UNENCRYPTED —"
                     log "put the stack behind a VPN/tunnel (Tailscale, WireGuard, Cloudflare Tunnel), or re-run and provide a domain for HTTPS."
-                    log "Kanboard/Gitea also use default credentials — change them before real use."
+                    if [ -z "$(env_get MARCUS_URL)" ]; then
+                        log "NOTE: Kanboard's embedded widgets (Active Agents badge, Gate toggle) fetch Marcus from the"
+                        log "browser and default to localhost, which won't resolve for a remote visitor. Set MARCUS_URL"
+                        log "in .env to this host's real address if you want those widgets to work remotely."
+                    fi
                 fi
                 ;;
             *)
                 env_set MARCUS_BIND_HOST "127.0.0.1"
-                log "Marcus, Kanboard, and Gitea will only be reachable from this machine (127.0.0.1). No agent token needed for local-only use."
+                env_set GITEA_BIND_HOST "127.0.0.1"
+                env_set KANBOARD_BIND_HOST "127.0.0.1"
+                log "Marcus, Gitea, and Kanboard will only be reachable from this machine (127.0.0.1). No agent token needed for local-only use."
                 ;;
         esac
     else
@@ -221,8 +269,11 @@ if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
         # (localhost-only) instead of guessing "yes" and exposing a port
         # to the network without the operator explicitly opting in.
         env_set MARCUS_BIND_HOST "127.0.0.1"
+        env_set GITEA_BIND_HOST "127.0.0.1"
+        env_set KANBOARD_BIND_HOST "127.0.0.1"
         log "No terminal available to ask — defaulting to localhost-only access (127.0.0.1)."
-        log "To allow remote agents: set MARCUS_BIND_HOST=0.0.0.0 and MARCUS_AGENT_TOKEN=\$(openssl rand -hex 32) in .env before re-running."
+        log "To allow remote access: set MARCUS_BIND_HOST=0.0.0.0, GITEA_BIND_HOST=0.0.0.0, KANBOARD_BIND_HOST=0.0.0.0,"
+        log "and MARCUS_AGENT_TOKEN=\$(openssl rand -hex 32) in .env before re-running."
     fi
 else
     log "MARCUS_BIND_HOST=$(env_get MARCUS_BIND_HOST) already set in .env — leaving it as-is."
@@ -230,6 +281,32 @@ else
     if [ -n "$(env_get MARCUS_PUBLIC_DOMAIN)" ]; then
         COMPOSE_FILES+=(-f docker-compose.tls.yml)
         log "MARCUS_PUBLIC_DOMAIN set — including the HTTPS (Caddy) overlay."
+    fi
+    # Backfill GITEA_BIND_HOST/KANBOARD_BIND_HOST on a re-run against a .env
+    # from before these variables existed: if remote access was previously
+    # chosen (either MARCUS_BIND_HOST=0.0.0.0 directly, or TLS mode where
+    # it's 127.0.0.1 but remote access is still the operator's intent),
+    # Gitea/Kanboard need the same direct exposure they always had —
+    # defaulting to 127.0.0.1 on their own would silently break previously-
+    # working remote access. Never overwrites an explicit existing value.
+    _remote_was_chosen="false"
+    [ "$(env_get MARCUS_BIND_HOST)" = "0.0.0.0" ] && _remote_was_chosen="true"
+    [ -n "$(env_get MARCUS_PUBLIC_DOMAIN)" ] && _remote_was_chosen="true"
+    if [ "$_remote_was_chosen" = "true" ]; then
+        if [ -z "$(env_get GITEA_BIND_HOST)" ]; then
+            env_set GITEA_BIND_HOST "0.0.0.0"
+            log "Backfilled GITEA_BIND_HOST=0.0.0.0 to match your existing remote-access configuration."
+        fi
+        if [ -z "$(env_get KANBOARD_BIND_HOST)" ]; then
+            env_set KANBOARD_BIND_HOST "0.0.0.0"
+            log "Backfilled KANBOARD_BIND_HOST=0.0.0.0 to match your existing remote-access configuration."
+        fi
+        if [ -z "$(env_get KANBOARD_ADMIN_USERNAME)" ]; then
+            env_set KANBOARD_ADMIN_USERNAME "marcus_admin"
+        fi
+        if [ -z "$(env_get KANBOARD_ADMIN_PASSWORD)" ]; then
+            env_set KANBOARD_ADMIN_PASSWORD "$(openssl rand -hex 12)"
+        fi
     fi
 fi
 
@@ -249,10 +326,22 @@ fi
 # ---------------------------------------------------------------------
 
 log "Provisioning Kanboard project and columns..."
-project_id="$(python3 "$SCRIPT_DIR/provision_kanboard.py" \
-    --url "http://localhost:8080/jsonrpc.php" \
-    --token "$(env_get KANBOARD_API_TOKEN)" \
-    --project-name "$(env_get KANBOARD_PROJECT_NAME)")"
+provision_args=(
+    --url "http://localhost:8080/jsonrpc.php"
+    --token "$(env_get KANBOARD_API_TOKEN)"
+    --project-name "$(env_get KANBOARD_PROJECT_NAME)"
+)
+# Only replace admin/admin when Kanboard is actually being published beyond
+# localhost — for the default local-only deployment this stays as-is, same
+# as every other "local/demo use" default in this stack.
+if [ "$(env_get KANBOARD_BIND_HOST)" = "0.0.0.0" ]; then
+    provision_args+=(
+        --secure-admin
+        "$(env_get KANBOARD_ADMIN_USERNAME)"
+        "$(env_get KANBOARD_ADMIN_PASSWORD)"
+    )
+fi
+project_id="$(python3 "$SCRIPT_DIR/provision_kanboard.py" "${provision_args[@]}")"
 env_set KANBOARD_PROJECT_ID "$project_id"
 log "Kanboard project id: $project_id"
 
@@ -373,7 +462,11 @@ if [ -n "$agent_token" ]; then
      -H \"Authorization: Bearer ${agent_token}\""
 fi
 
-echo " Kanboard:  http://localhost:8080   (admin / admin)"
+if [ "$(env_get KANBOARD_BIND_HOST)" = "0.0.0.0" ]; then
+    echo " Kanboard:  http://localhost:8080   ($(env_get KANBOARD_ADMIN_USERNAME) / $(env_get KANBOARD_ADMIN_PASSWORD))"
+else
+    echo " Kanboard:  http://localhost:8080   (admin / admin)"
+fi
 echo " Gitea:     http://localhost:3000   (root / $(env_get GITEA_ADMIN_PASSWORD))"
 echo " Marcus:    http://localhost:${host_port}/mcp"
 echo
@@ -392,32 +485,51 @@ echo
 
 bind_host="$(env_get MARCUS_BIND_HOST)"
 tls_domain="$(env_get MARCUS_PUBLIC_DOMAIN)"
+gitea_bind="$(env_get GITEA_BIND_HOST)"
+gitea_bind="${gitea_bind:-127.0.0.1}"
 if [ -n "$tls_domain" ]; then
-    echo " Remote access: ENABLED over HTTPS via built-in proxy (https://${tls_domain}/)."
-    echo " The stack itself stays on loopback; only the proxy's 443 is exposed. From another machine:"
+    echo " Remote access (Marcus): ENABLED over HTTPS via built-in proxy (https://${tls_domain}/)."
+    echo " Marcus stays on loopback behind the proxy; only 443 is exposed for it. From another machine:"
     echo "   claude mcp add --transport http marcus https://${tls_domain}/mcp${auth_flag}"
     echo " (A real cert requires DNS for ${tls_domain} → this host and ports 80+443 open. Give"
     echo "  Caddy a minute on first run to obtain the certificate.)"
 else
     case "$bind_host" in
         127.0.0.1|localhost|"")
-            echo " Remote access: DISABLED — the stack only accepts connections from this machine."
-            echo " To allow other machines, re-run setup and answer yes (or set MARCUS_BIND_HOST=0.0.0.0"
-            echo " and MARCUS_AGENT_TOKEN in .env, then: docker compose up -d --build)."
+            echo " Remote access: DISABLED — Marcus, Gitea, and Kanboard only accept connections from this machine."
+            echo " To allow other machines, re-run setup and answer yes (or set MARCUS_BIND_HOST=0.0.0.0,"
+            echo " GITEA_BIND_HOST=0.0.0.0, KANBOARD_BIND_HOST=0.0.0.0, and MARCUS_AGENT_TOKEN in .env, then:"
+            echo " docker compose up -d --build)."
             ;;
         *)
             conn_host="$bind_host"
             [ "$conn_host" = "0.0.0.0" ] && conn_host="<this-machine's-address>"
-            echo " Remote access: ENABLED over plain HTTP (bound to ${bind_host}) — the bearer token"
-            echo " authenticates agents but is sent UNENCRYPTED; use a VPN/tunnel, or re-run for HTTPS."
+            echo " Remote access (Marcus): ENABLED over plain HTTP (bound to ${bind_host}) — the"
+            echo " bearer token authenticates agents but is sent UNENCRYPTED; use a VPN/tunnel, or re-run for HTTPS."
             echo " From another machine:"
             echo "   claude mcp add --transport http marcus http://${conn_host}:${host_port}/mcp${auth_flag}"
             ;;
     esac
 fi
+if [ "$gitea_bind" = "0.0.0.0" ]; then
+    echo " Remote access (Gitea): ENABLED (bound to ${gitea_bind}) — agents on other machines can git clone/push."
+else
+    echo " Remote access (Gitea): DISABLED — only reachable from this machine."
+fi
+
+kanboard_bind="$(env_get KANBOARD_BIND_HOST)"
+kanboard_bind="${kanboard_bind:-127.0.0.1}"
+if [ "$kanboard_bind" = "0.0.0.0" ]; then
+    echo " Remote access (Kanboard): ENABLED (bound to ${kanboard_bind}) — humans on other machines can use its UI."
+    echo " Its admin/admin login was replaced (see credentials above) since Kanboard's API can't rotate a"
+    echo " password on the built-in account — that account is now disabled."
+else
+    echo " Remote access (Kanboard): DISABLED — only reachable from this machine. Agents never need this open"
+    echo " (Marcus reaches Kanboard internally); this only matters if a human wants remote UI access."
+fi
 echo
-echo " Save the Gitea admin password above if you plan to log in manually —"
-echo " it won't be printed again (it's also in .env, which is git-ignored)."
+echo " Save the Gitea/Kanboard credentials above if you plan to log in manually —"
+echo " they won't be printed again (they're also in .env, which is git-ignored)."
 if [ -n "$agent_token" ]; then
     echo " The agent token is stored in .env (git-ignored). Anyone with it can drive the board."
 fi
