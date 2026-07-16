@@ -4307,11 +4307,30 @@ function save() {{
             response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
             return response
 
+        mcp_app = fastmcp.streamable_http_app()
+
         @contextlib.asynccontextmanager
         async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
-            """Wire (and later stop) HumanGatedWorkflow on uvicorn's own event loop.
+            """Start ``mcp_app``'s session manager, then wire HumanGatedWorkflow.
 
-            Wiring must happen here (Starlette's ``lifespan``), not inside
+            ``mcp_app`` (``fastmcp.streamable_http_app()``) is itself a full
+            Starlette app with its own required lifespan —
+            ``lifespan=lambda app: self.session_manager.run()`` inside the
+            ``mcp`` package — which starts the anyio task group backing
+            every ``/mcp`` request. Mounting it via ``Mount("/", app=mcp_app)``
+            does NOT cascade that lifespan into ours: Starlette's
+            ``Router.__call__`` only ever invokes the lifespan of the
+            *outermost* app object uvicorn was given (see
+            ``starlette.routing.Router.lifespan``/``_DefaultLifespan``,
+            which is a no-op) — a mounted sub-app's own ``lifespan=`` is
+            simply never entered on its own. Without composing it in here,
+            the very first ``/mcp`` request crashes with
+            ``RuntimeError: Task group is not initialized. Make sure to
+            use run().`` from ``StreamableHTTPSessionManager.handle_request``
+            — MCP clients (e.g. ``claude mcp list``) can never connect, even
+            though every other route on this same server works fine.
+
+            HumanGatedWorkflow wiring must also happen here, not inside
             ``setup_http_server()`` above — that coroutine runs on a
             throwaway ``asyncio.new_event_loop()`` that is discarded before
             uvicorn starts serving on its own loop. HumanGatedWorkflow.start()
@@ -4320,15 +4339,17 @@ function save() {{
             lines later means it would never run again — the entire
             ticket-lifecycle polling engine would silently never fire.
             """
-            await _wire_human_gated_workflow(server)
-            try:
-                yield
-            finally:
-                human_gated_workflow = getattr(server, "_human_gated_workflow", None)
-                if human_gated_workflow is not None:
-                    await human_gated_workflow.stop()
+            async with mcp_app.router.lifespan_context(mcp_app):
+                await _wire_human_gated_workflow(server)
+                try:
+                    yield
+                finally:
+                    human_gated_workflow = getattr(
+                        server, "_human_gated_workflow", None
+                    )
+                    if human_gated_workflow is not None:
+                        await human_gated_workflow.stop()
 
-        mcp_app = fastmcp.streamable_http_app()
         app = Starlette(
             routes=[
                 Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
