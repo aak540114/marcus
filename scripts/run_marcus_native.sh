@@ -140,5 +140,16 @@ export MARCUS_NATIVE_BIND_HOST="${bind_host:-127.0.0.1}"
 
 export MARCUS_CONFIG="$SCRIPT_DIR/marcus.native.config.json"
 
-log "Starting Marcus natively (KANBOARD_URL=$KANBOARD_URL, GITEA_URL=$GITEA_URL, bind=$MARCUS_NATIVE_BIND_HOST:4298)..."
+# Recorded so scripts/teardown.sh can find and stop this process later.
+# Written BEFORE exec, not after: exec replaces this shell with the
+# python process IN PLACE (same PID, no fork) — so $$ captured here stays
+# valid for the running Marcus process's entire lifetime. Deliberately no
+# EXIT trap to clean this up: exec discards bash's traps along with
+# everything else about the shell, so it would never fire on a normal
+# Marcus shutdown anyway. teardown.sh instead checks whether the recorded
+# PID is still alive and treats a stale file as harmless.
+PID_FILE="$REPO_ROOT/.marcus_native.pid"
+echo $$ > "$PID_FILE"
+
+log "Starting Marcus natively (PID $$, KANBOARD_URL=$KANBOARD_URL, GITEA_URL=$GITEA_URL, bind=$MARCUS_NATIVE_BIND_HOST:4298)..."
 exec python3 -m src.marcus_mcp.server --http

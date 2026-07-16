@@ -184,6 +184,14 @@ claude mcp add --transport http marcus http://localhost:4298/mcp
 
 This always works from the same machine Marcus runs on. Connecting from a **different machine** (another laptop, a remote VPS) additionally requires you to have opted in during setup — see [Network access](#network-access).
 
+### Tearing down
+
+```bash
+./scripts/teardown.sh
+```
+
+Stops every container (Kanboard, Gitea, Marcus, Caddy if you used HTTPS) and a natively-run Marcus process (hybrid mode), then prints every location that holds real data — `./data`, `./logs`, Docker's named volumes, `.env` — with rough sizes, so you can decide what to delete yourself. **It doesn't delete anything on its own** — re-running `./scripts/setup.sh` afterward picks up exactly where you left off. It also explicitly calls out `~/.claude.json` / `~/.claude/.credentials.json` as *not* Marcus's data (that's your real Claude Code login — Marcus only ever reads it), so you don't mistake it for something safe to clear out.
+
 ---
 
 ## Network access

@@ -34,6 +34,10 @@ __pycache__/
 # Local config — only the *.example.json variants are tracked
 config_marcus.json
 
+# Written by scripts/run_marcus_native.sh so scripts/teardown.sh can find
+# and stop a natively-run Marcus process; never meaningful to commit.
+.marcus_native.pid
+
 # Generated experiment / run artifacts
 logs/
 mlruns/
