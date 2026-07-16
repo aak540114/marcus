@@ -136,22 +136,64 @@ class BearerAuthMiddleware:
         await self._reject(send)
 
     def _authorized(self, scope: Scope) -> bool:
-        """Return True iff the request carries the correct bearer token."""
-        provided = self._extract_bearer(scope)
+        """Return True iff the request carries the correct token.
+
+        Accepted credentials, in order of preference:
+
+        1. ``Authorization: Bearer <token>`` header — what MCP clients and
+           AI agents send.
+        2. ``?token=<token>`` query parameter — what the Kanboard plugin's
+           browser-side widgets use. The plugin's JS ``fetch()`` calls and
+           plain navigation links (``/dev-env/view``, ``/project-description``)
+           run in the human's browser with no way to attach a custom header
+           to a link click, so they carry the same shared secret in the URL
+           instead — mirroring how Kanboard's own outbound webhook
+           authenticates to Marcus. The pages embedding these URLs are only
+           served to logged-in Kanboard users.
+        """
         expected = self.token
-        if provided is None or expected is None:
+        if expected is None:
             return False
+        expected_bytes = expected.encode("utf-8")
+
         # Compare as bytes, not str: secrets.compare_digest() raises
         # TypeError on a str containing non-ASCII characters, and the
-        # attacker controls `provided` (it comes from a latin-1 decode of
-        # the raw header, so bytes 0x80-0xFF become non-ASCII code points).
+        # attacker controls both candidate values (header bytes are
+        # latin-1-decoded, so 0x80-0xFF become non-ASCII code points).
         # Comparing UTF-8 bytes never raises on content, so a hostile
         # `Authorization: Bearer \xff\xff` cleanly fails (401) instead of
         # crashing the request with a 500. Valid tokens are ASCII (hex), so
         # the encode round-trips identically on both sides.
-        return secrets.compare_digest(
-            provided.encode("utf-8"), expected.encode("utf-8")
-        )
+        header_token = self._extract_bearer(scope)
+        if header_token is not None and secrets.compare_digest(
+            header_token.encode("utf-8"), expected_bytes
+        ):
+            return True
+
+        query_token = self._extract_query_token(scope)
+        if query_token is not None and secrets.compare_digest(
+            query_token.encode("utf-8"), expected_bytes
+        ):
+            return True
+
+        return False
+
+    @staticmethod
+    def _extract_query_token(scope: Scope) -> Optional[str]:
+        """Pull the ``token`` value out of the ASGI query string, if any.
+
+        Returns ``None`` when the parameter is absent or the query string
+        is malformed — never raises, since the bytes are attacker-supplied.
+        """
+        from urllib.parse import parse_qs
+
+        raw = scope.get("query_string", b"") or b""
+        try:
+            params = parse_qs(raw.decode("utf-8"), keep_blank_values=False)
+        except Exception:
+            return None
+        values = params.get("token")
+        return values[0] if values else None
 
     @staticmethod
     def _extract_bearer(scope: Scope) -> Optional[str]:

@@ -25,9 +25,15 @@
  * The max-dev-envs setting persists via Marcus /api/dev-env-setting.
  */
 $marcusUrl        = getenv('MARCUS_URL') ?: 'http://localhost:4298';
+// When Marcus requires bearer auth (MARCUS_AGENT_TOKEN set — remote-access
+// mode), the browser must present the same token: fetch() calls send it as
+// an Authorization header, plain navigation links carry ?token= (a link
+// click cannot attach a header). Empty = auth disabled = omitted entirely.
+$marcusToken      = getenv('MARCUS_AGENT_TOKEN') ?: '';
 $apiUrl           = $marcusUrl . '/api/active-agents';
 $projectId        = $project['id'] ?? '';
-$descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode((string) $projectId);
+$descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode((string) $projectId)
+                  . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
 $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 ?>
@@ -232,7 +238,16 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
     var GATE_URL         = <?= json_encode($gateApiBase) ?>;
     var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
+    var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
     var INTERVAL         = 15000;
+
+    // Every fetch below goes through this: attaches the bearer token when
+    // Marcus requires auth (MARCUS_AGENT_TOKEN set), no-op otherwise.
+    function marcusHeaders(extra) {
+        var h = extra || {};
+        if (MARCUS_TOKEN) { h['Authorization'] = 'Bearer ' + MARCUS_TOKEN; }
+        return h;
+    }
 
     /* ── Active agents badge ─────────────────────────────────────────── */
     var badge   = document.getElementById('marcus-agent-badge');
@@ -240,7 +255,7 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
     var tooltip = document.getElementById('marcus-agent-tooltip');
 
     function updateAgents() {
-        fetch(AGENTS_URL, { cache: 'no-store' })
+        fetch(AGENTS_URL, { cache: 'no-store', headers: marcusHeaders() })
             .then(function (r) { return r.json(); })
             .then(function (data) {
                 var count  = data.active_agent_count || 0;
@@ -296,7 +311,7 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
     }
 
     // Load current project gate + verify_count on page load
-    fetch(GATE_URL + '?project_id=' + PROJECT_ID, { cache: 'no-store' })
+    fetch(GATE_URL + '?project_id=' + PROJECT_ID, { cache: 'no-store', headers: marcusHeaders() })
         .then(function (r) { return r.json(); })
         .then(function (data) {
             applyProjectGate(data.project_gate || 'human');
@@ -315,7 +330,7 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 
         fetch(GATE_URL + '/project', {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: marcusHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ project_id: PROJECT_ID, gate: gate }),
         })
         .then(function (r) { return r.json(); })
@@ -340,7 +355,7 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 
         fetch(GATE_URL + '/project', {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: marcusHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
                 project_id: PROJECT_ID,
                 gate: document.getElementById('pgBtn-ai').classList.contains('active-ai') ? 'ai' : 'human',
@@ -378,7 +393,7 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
     }
 
     // Load the current global limit on page load.
-    fetch(DEV_ENV_SETTING_URL, { cache: 'no-store' })
+    fetch(DEV_ENV_SETTING_URL, { cache: 'no-store', headers: marcusHeaders() })
         .then(function (r) { return r.json(); })
         .then(function (data) { applyMaxDevEnvs(data.max_parallel_containers); })
         .catch(function () { applyMaxDevEnvs(null); });
@@ -403,7 +418,7 @@ $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 
         fetch(DEV_ENV_SETTING_URL, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: marcusHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ max_parallel_containers: count }),
         })
         .then(function (r) { return r.json(); })

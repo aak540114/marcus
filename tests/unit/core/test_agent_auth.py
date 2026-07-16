@@ -197,3 +197,108 @@ class TestBearerAuthMiddleware:
 
         assert inner.called is False
         assert messages[0]["status"] == 401
+
+
+def _http_scope_with_query(
+    path: str, query: str, auth: str | None = None
+) -> Dict[str, Any]:
+    """Build an ASGI HTTP scope carrying a raw query string."""
+    scope = _http_scope(path=path, auth=auth)
+    scope["query_string"] = query.encode("latin-1")
+    return scope
+
+
+@pytest.mark.asyncio
+class TestQueryParamToken:
+    """The Kanboard plugin's browser JS and plain navigation links cannot
+    attach an Authorization header, so the middleware must also accept the
+    shared secret as a ``?token=`` query parameter (mirroring how Kanboard's
+    own webhook authenticates)."""
+
+    async def test_correct_query_token_passes(self) -> None:
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="secret")
+        messages, send = await _drain_send()
+
+        await mw(
+            _http_scope_with_query("/api/active-agents", "token=secret"),
+            _noop_receive,
+            send,
+        )
+
+        assert inner.called is True
+        assert messages == []
+
+    async def test_wrong_query_token_rejected(self) -> None:
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="secret")
+        messages, send = await _drain_send()
+
+        await mw(
+            _http_scope_with_query("/api/active-agents", "token=wrong"),
+            _noop_receive,
+            send,
+        )
+
+        assert inner.called is False
+        assert messages[0]["status"] == 401
+
+    async def test_query_token_amid_other_params(self) -> None:
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="secret")
+        messages, send = await _drain_send()
+
+        await mw(
+            _http_scope_with_query(
+                "/dev-env/view", "ticket_id=7&token=secret&x=1"
+            ),
+            _noop_receive,
+            send,
+        )
+
+        assert inner.called is True
+
+    async def test_valid_header_wins_over_wrong_query_token(self) -> None:
+        """A correct Authorization header must authenticate even if a stale
+        or wrong ?token= also appears in the URL."""
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="secret")
+        messages, send = await _drain_send()
+
+        await mw(
+            _http_scope_with_query(
+                "/api/active-agents", "token=stale", auth="Bearer secret"
+            ),
+            _noop_receive,
+            send,
+        )
+
+        assert inner.called is True
+
+    async def test_url_encoded_query_token_passes(self) -> None:
+        """Percent-encoded token values must be decoded before comparison
+        (browsers encode special characters in query strings)."""
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="se+cret")
+        messages, send = await _drain_send()
+
+        await mw(
+            _http_scope_with_query("/api/active-agents", "token=se%2Bcret"),
+            _noop_receive,
+            send,
+        )
+
+        assert inner.called is True
+
+    async def test_malformed_query_string_rejected_without_crashing(self) -> None:
+        """A hostile/binary query string must cleanly 401, never 500."""
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="secret")
+        messages, send = await _drain_send()
+
+        scope = _http_scope("/api/active-agents")
+        scope["query_string"] = b"\xff\xfe=\xff&token"
+        await mw(scope, _noop_receive, send)
+
+        assert inner.called is False
+        assert messages[0]["status"] == 401

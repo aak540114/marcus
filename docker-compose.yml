@@ -68,6 +68,16 @@ services:
       # network). Tracks MARCUS_PORT so the host-published port stays in
       # sync if that's overridden.
       MARCUS_URL: "${MARCUS_URL:-http://localhost:${MARCUS_PORT:-4298}}"
+      # Also browser-facing, same templates as MARCUS_URL: when
+      # MARCUS_AGENT_TOKEN is set (remote-access mode), Marcus's
+      # BearerAuthMiddleware gates every API route the plugin's widgets
+      # call — the templates embed this token so the browser's fetch()
+      # calls (Authorization header) and navigation links (?token= query
+      # param) can authenticate. The plugin pages are only served to
+      # logged-in Kanboard users, so this shares the secret with exactly
+      # the humans already trusted to operate the board. Empty (the
+      # localhost-only default) = auth disabled = templates omit it.
+      MARCUS_AGENT_TOKEN: "${MARCUS_AGENT_TOKEN:-}"
       KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
       # Sets the app-level JSON-RPC API token to a known value so
       # scripts/setup.sh can provision Kanboard without any UI login —

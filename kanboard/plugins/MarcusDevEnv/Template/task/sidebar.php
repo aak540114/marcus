@@ -27,6 +27,11 @@
  */
 
 $marcusUrl  = getenv('MARCUS_URL') ?: 'http://localhost:4298';
+// See board/header.php: when Marcus requires bearer auth
+// (MARCUS_AGENT_TOKEN set — remote-access mode), fetch() calls send the
+// token as an Authorization header; navigation links (like Start Preview
+// below, a plain <a href> that cannot carry a header) embed it as ?token=.
+$marcusToken = getenv('MARCUS_AGENT_TOKEN') ?: '';
 $ticketId   = $task['id'] ?? '';
 $provider   = 'kanboard';
 $projectId  = $task['project_id'] ?? '';
@@ -35,7 +40,8 @@ $viewUrl = $marcusUrl
     . '/dev-env/view'
     . '?ticket_id='  . urlencode((string) $ticketId)
     . '&provider='   . urlencode($provider)
-    . '&project_id=' . urlencode((string) $projectId);
+    . '&project_id=' . urlencode((string) $projectId)
+    . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 
 $stopUrl = $marcusUrl
     . '/dev-env/stop'
@@ -316,6 +322,15 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     var GATE_URL     = <?= json_encode($gateApiBase) ?>;
     var TICKET_ID    = <?= json_encode((string) $ticketId) ?>;
     var PROJECT_ID   = <?= json_encode((int) $projectId) ?>;
+    var MARCUS_TOKEN = <?= json_encode($marcusToken) ?>;
+
+    // Every fetch below goes through this: attaches the bearer token when
+    // Marcus requires auth (MARCUS_AGENT_TOKEN set), no-op otherwise.
+    function marcusHeaders(extra) {
+        var h = extra || {};
+        if (MARCUS_TOKEN) { h['Authorization'] = 'Bearer ' + MARCUS_TOKEN; }
+        return h;
+    }
 
     /* ── Dev-environment panel ───────────────────────────────────── */
     var devPanel  = document.getElementById('marcus-dev-env-panel');
@@ -346,7 +361,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         document.getElementById('marcus-stop-btn').addEventListener('click', function () {
             this.disabled = true;
             this.textContent = 'Stopping…';
-            fetch(STOP_URL, { method: 'POST', cache: 'no-store' })
+            fetch(STOP_URL, { method: 'POST', cache: 'no-store', headers: marcusHeaders() })
                 .then(function (r) { return r.json(); })
                 .then(function () { renderStopped(); setMsg('Preview stopped.'); })
                 .catch(function () {
@@ -356,7 +371,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         });
     }
 
-    fetch(STATUS_URL, { cache: 'no-store' })
+    fetch(STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
         .then(function (r) { return r.json(); })
         .then(function (data) {
             if (data.running && data.url) { renderRunning(data.url); }
@@ -431,7 +446,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
 
     function loadGateSettings() {
         var url = GATE_URL + '?project_id=' + PROJECT_ID + '&ticket_id=' + encodeURIComponent(TICKET_ID);
-        fetch(url, { cache: 'no-store' })
+        fetch(url, { cache: 'no-store', headers: marcusHeaders() })
             .then(function (r) { return r.json(); })
             .then(function (data) {
                 applyProjectPills(data.project_gate || 'human');
@@ -461,7 +476,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
 
         fetch(GATE_URL + '/ticket', {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: marcusHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ ticket_id: TICKET_ID, gate: gate }),
         })
         .then(function (r) { return r.json(); })
@@ -490,7 +505,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
 
         fetch(GATE_URL + '/ticket', {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: marcusHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ ticket_id: TICKET_ID, verify_count: count }),
         })
         .then(function (r) { return r.json(); })
@@ -545,7 +560,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         });
     }
 
-    fetch(LINKS_URL, { cache: 'no-store' })
+    fetch(LINKS_URL, { cache: 'no-store', headers: marcusHeaders() })
         .then(function (r) { return r.json(); })
         .then(function (data) {
             loadingEl.style.display = 'none';
