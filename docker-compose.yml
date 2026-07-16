@@ -61,7 +61,7 @@ services:
       - ./kanboard/plugins:/var/www/app/plugins
     environment:
       # Browser-facing — embedded server-side into client-side fetch() URLs
-      # by kanboard/plugins/MarcusDevEnv/Template/{board,task}/*.html.php
+      # by kanboard/plugins/MarcusDevEnv/Template/{board,task}/*.php
       # (Active Agents badge, Project Description link, Gate toggle). Must
       # be an address the user's own browser can resolve, NOT the Docker
       # service name "marcus" (unreachable from outside the compose
