@@ -46,6 +46,15 @@ services:
       # simply exposing the fixed default would defeat the point of the
       # bearer-token work done for Marcus itself. Defaults to localhost-only.
       - "${KANBOARD_BIND_HOST:-127.0.0.1}:8080:80"
+    extra_hosts:
+      # Lets this container reach a NATIVELY-run Marcus (hybrid mode —
+      # see scripts/run_marcus_native.sh / README's "Hybrid mode" section)
+      # via http://host.docker.internal:4298/... — Docker Desktop
+      # (macOS/Windows) already resolves this name automatically; on
+      # Linux it needs this explicit mapping. Harmless when Marcus runs
+      # in Docker too (KANBOARD_WEBHOOK_TOKEN's webhook URL just isn't
+      # set to this address in that mode).
+      - "host.docker.internal:host-gateway"
     volumes:
       - kanboard_data:/var/www/app/data
       # Bind-mount the plugin from source so edits are immediately testable
@@ -95,6 +104,11 @@ services:
       # set your own.
       - "${GITEA_BIND_HOST:-127.0.0.1}:3000:3000"
       - "${GITEA_BIND_HOST:-127.0.0.1}:2222:22"
+    extra_hosts:
+      # See the identical mapping on the kanboard service above — this one
+      # is what makes GITEA_WEBHOOK_TARGET_URL=http://host.docker.internal:...
+      # (set by scripts/run_marcus_native.sh in hybrid mode) reachable.
+      - "host.docker.internal:host-gateway"
     volumes:
       - gitea_data:/data
     environment:
@@ -113,6 +127,12 @@ services:
       start_period: 10s
 
   marcus:
+    # Only started when explicitly requested (scripts/setup.sh passes
+    # `--profile docker-marcus` for the "Marcus in Docker" run-mode
+    # choice) — a bare `docker compose up -d` (e.g. after a reboot, when
+    # you've chosen hybrid/native mode — see scripts/run_marcus_native.sh)
+    # must NOT also try to build and start this container.
+    profiles: ["docker-marcus"]
     build:
       context: .
       dockerfile: Dockerfile

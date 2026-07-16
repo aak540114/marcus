@@ -9,7 +9,14 @@
 #   - Kanboard: the outbound webhook (instant board updates instead of
 #     Marcus's 30s poll)
 #   - Gitea: admin account + access token
-# then builds and starts all three containers.
+# then either builds and starts the Marcus container too, or (hybrid
+# mode — see the "how should Marcus run?" prompt below) leaves Marcus
+# for you to start yourself with ./scripts/run_marcus_native.sh while
+# Kanboard/Gitea stay in Docker. See README.md's "Hybrid mode: Marcus
+# outside Docker" section for when you'd want that (short version: macOS
+# + wanting Marcus's own AI calls to use your Claude Pro/Max subscription
+# — Docker's Linux container can't reach the macOS Keychain that login
+# lives in, a native process can).
 #
 # Safe to re-run: every step checks live state before creating or
 # updating anything (see README.md's "How the setup script works" for
@@ -18,13 +25,15 @@
 #
 # AI provider: this script never prompts for a Claude API key. If this
 # machine already has an authenticated `claude` CLI (i.e. you've run
-# `claude login` here, the same login Claude Code itself uses), it
-# mounts that login into the marcus container and configures Marcus's
-# own decomposition/analysis calls to ride your Claude Pro/Max
-# subscription (MARCUS_AI_PROVIDER=claude_subscription) — no separate
-# API key, no prompt. If `.env` already has CLAUDE_API_KEY set, that
-# choice is respected instead (MARCUS_AI_PROVIDER=anthropic). If neither
-# is available, the script fails with instructions rather than prompting.
+# `claude login` here, the same login Claude Code itself uses), it wires
+# that login into wherever Marcus runs (mounted into the container in
+# Docker mode; read directly from the host in native mode) and
+# configures Marcus's own decomposition/analysis calls to ride your
+# Claude Pro/Max subscription (MARCUS_AI_PROVIDER=claude_subscription) —
+# no separate API key, no prompt. If `.env` already has CLAUDE_API_KEY
+# set, that choice is respected instead (MARCUS_AI_PROVIDER=anthropic).
+# If neither is available, the script fails with instructions rather
+# than prompting.
 
 set -euo pipefail
 
@@ -131,6 +140,37 @@ if [ -z "$(env_get GITEA_ADMIN_PASSWORD)" ]; then
     env_set GITEA_ADMIN_PASSWORD "$(openssl rand -hex 12)"
 fi
 
+log "Choosing how Marcus itself runs..."
+
+if [ -z "$(env_get MARCUS_RUN_MODE)" ]; then
+    if [ -t 0 ]; then
+        echo "How should Marcus run?"
+        echo "  1) In Docker, as part of this compose stack (default)"
+        echo "  2) Natively on this host — Kanboard/Gitea stay in Docker, only Marcus runs outside it."
+        echo "     Recommended on macOS if you want Marcus's own AI calls to use your Claude Pro/Max"
+        echo "     subscription: Docker's Linux container can't reach the macOS Keychain where your"
+        echo "     'claude login' session actually lives, so the claude_subscription provider silently"
+        echo "     fails inside Docker on a Mac. Running natively sidesteps that entirely."
+        run_mode_choice=""
+        read -r -p "Choice [1/2, default 1]: " run_mode_choice || run_mode_choice=""
+        case "$run_mode_choice" in
+            2)
+                env_set MARCUS_RUN_MODE "native"
+                log "Marcus will run natively — this script provisions Kanboard/Gitea/tokens as usual, then"
+                log "prints instructions to start Marcus with ./scripts/run_marcus_native.sh instead of building a container for it."
+                ;;
+            *)
+                env_set MARCUS_RUN_MODE "docker"
+                ;;
+        esac
+    else
+        env_set MARCUS_RUN_MODE "docker"
+        log "No terminal available to ask — defaulting to Marcus in Docker."
+    fi
+else
+    log "MARCUS_RUN_MODE=$(env_get MARCUS_RUN_MODE) already set in .env — leaving it as-is."
+fi
+
 log "Selecting AI provider..."
 
 if [ -n "$(env_get MARCUS_AI_PROVIDER)" ]; then
@@ -144,18 +184,23 @@ elif [ -n "$(env_get CLAUDE_API_KEY)" ]; then
 elif claude_login_present; then
     env_set MARCUS_AI_PROVIDER "claude_subscription"
     log "Found an authenticated 'claude' CLI login — using the 'claude_subscription' provider (your Claude Pro/Max subscription, no API key)."
-    case "$(uname -s)" in
-        Darwin)
-            # On macOS the CLI keeps its OAuth token in the login Keychain,
-            # NOT in ~/.claude/.credentials.json — so the credential file
-            # bind-mounted into the (Linux) container is empty and the
-            # container's claude cannot authenticate. Warn loudly rather
-            # than let it fail silently at first AI call.
-            log "WARNING: on macOS the 'claude' login token lives in the Keychain, which cannot be shared into a Linux container."
-            log "         The claude_subscription provider will most likely FAIL inside Docker on this host. If Marcus's AI"
-            log "         calls error out (docker compose logs marcus), set CLAUDE_API_KEY in .env and re-run to use the API provider."
-            ;;
-    esac
+    if [ "$(env_get MARCUS_RUN_MODE)" = "docker" ]; then
+        case "$(uname -s)" in
+            Darwin)
+                # On macOS the CLI keeps its OAuth token in the login Keychain,
+                # NOT in ~/.claude/.credentials.json — so the credential file
+                # bind-mounted into the (Linux) container is empty and the
+                # container's claude cannot authenticate. Warn loudly rather
+                # than let it fail silently at first AI call. (Native mode
+                # doesn't have this problem at all — the claude subprocess
+                # IS a native macOS process there, so it reads the Keychain
+                # directly, same as your interactive `claude login` session.)
+                log "WARNING: on macOS the 'claude' login token lives in the Keychain, which cannot be shared into a Linux container."
+                log "         The claude_subscription provider will most likely FAIL inside Docker on this host. Either set CLAUDE_API_KEY"
+                log "         in .env and re-run, or re-run and choose native mode for Marcus (option 2) to use this login directly."
+                ;;
+        esac
+    fi
 else
     err "No Claude API key configured and no authenticated 'claude' CLI login found on this machine."
     err "Either:"
@@ -174,10 +219,13 @@ fi
 # `{}` here is only a placeholder to satisfy the mount; the
 # claude_login_present() check above deliberately ignores `{}` so a
 # leftover placeholder from a prior run can never be mistaken for a real
-# login on a re-run.
-mkdir -p "$HOME/.claude"
-[ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
-[ -f "$HOME/.claude/.credentials.json" ] || echo '{}' > "$HOME/.claude/.credentials.json"
+# login on a re-run. Only relevant in Docker mode — native mode has no
+# bind mount at all, the claude subprocess just reads the real files.
+if [ "$(env_get MARCUS_RUN_MODE)" = "docker" ]; then
+    mkdir -p "$HOME/.claude"
+    [ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+    [ -f "$HOME/.claude/.credentials.json" ] || echo '{}' > "$HOME/.claude/.credentials.json"
+fi
 
 log "Configuring network access..."
 
@@ -230,7 +278,13 @@ if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
                 fi
 
                 tls_domain=""
-                read -r -p "Terminate HTTPS with a built-in proxy for Marcus? Enter a public domain for a real (Let's Encrypt) cert, or leave blank for plain HTTP: " tls_domain || tls_domain=""
+                if [ "$(env_get MARCUS_RUN_MODE)" = "docker" ]; then
+                    read -r -p "Terminate HTTPS with a built-in proxy for Marcus? Enter a public domain for a real (Let's Encrypt) cert, or leave blank for plain HTTP: " tls_domain || tls_domain=""
+                else
+                    log "Marcus run mode is 'native' — the built-in HTTPS proxy (Caddy) only fronts the Marcus"
+                    log "Docker container, so it isn't available here. Put your own reverse proxy in front of the"
+                    log "native Marcus process if you need TLS, or keep plain HTTP behind a VPN/tunnel."
+                fi
                 if [ -n "$tls_domain" ]; then
                     # TLS mode: only Caddy (443) is exposed off-host for
                     # Marcus. Gitea/Kanboard (set above) stay directly
@@ -364,6 +418,17 @@ log "Kanboard project id: $project_id"
 # ---------------------------------------------------------------------
 
 log "Seeding Kanboard webhook..."
+# Kanboard (a container) needs a different address to reach Marcus
+# depending on where Marcus runs: the Docker service name only resolves
+# to another container on the same compose network; a natively-run
+# Marcus is reached via host.docker.internal instead (see
+# scripts/run_marcus_native.sh and the matching extra_hosts entries in
+# docker-compose.yml).
+if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
+    kanboard_webhook_url="http://host.docker.internal:4298/webhooks/kanboard"
+else
+    kanboard_webhook_url="http://marcus:4298/webhooks/kanboard"
+fi
 webhook_seeded="false"
 for webhook_attempt in 1 2 3 4 5; do
     # SQLite allows one writer at a time; Kanboard's own PHP process can
@@ -372,14 +437,15 @@ for webhook_attempt in 1 2 3 4 5; do
     # rather than treat a transient "database is locked" as fatal.
     if docker compose exec -T kanboard php -r '
 $token = $argv[1];
+$webhook_url = $argv[2];
 $pdo = new PDO("sqlite:/var/www/app/data/db.sqlite");
 $stmt = $pdo->prepare(
     "INSERT INTO settings (option, value) VALUES (?, ?) " .
     "ON CONFLICT(option) DO UPDATE SET value=excluded.value"
 );
-$stmt->execute(["webhook_url", "http://marcus:4298/webhooks/kanboard"]);
+$stmt->execute(["webhook_url", $webhook_url]);
 $stmt->execute(["webhook_token", $token]);
-' -- "$(env_get KANBOARD_WEBHOOK_TOKEN)"; then
+' -- "$(env_get KANBOARD_WEBHOOK_TOKEN)" "$kanboard_webhook_url"; then
         webhook_seeded="true"
         break
     fi
@@ -390,7 +456,7 @@ if [ "$webhook_seeded" != "true" ]; then
     err "Could not seed the Kanboard webhook after 5 attempts."
     exit 1
 fi
-log "Webhook configured: http://marcus:4298/webhooks/kanboard"
+log "Webhook configured: $kanboard_webhook_url"
 
 # ---------------------------------------------------------------------
 # 6. Gitea: admin account + access token.
@@ -436,20 +502,28 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# 7. Build and start Marcus now that .env has everything it needs.
+# 7. Build and start Marcus now that .env has everything it needs —
+#    OR, in native mode, hand off to scripts/run_marcus_native.sh instead
+#    of building a container for it.
 # ---------------------------------------------------------------------
 
-log "Building and starting Marcus..."
-# Start marcus (always) plus caddy (only when the TLS overlay is active —
-# MARCUS_PUBLIC_DOMAIN set adds -f docker-compose.tls.yml to COMPOSE_FILES).
-start_services=(marcus)
-if [ -n "$(env_get MARCUS_PUBLIC_DOMAIN)" ]; then
-    start_services+=(caddy)
-fi
-if ! docker compose "${COMPOSE_FILES[@]}" up -d --build --wait --wait-timeout 90 "${start_services[@]}"; then
-    err "Marcus (or the TLS proxy) did not become healthy in time — most likely a KANBOARD_API_TOKEN mismatch, a missing ~/.claude.json / ~/.claude/.credentials.json for the claude_subscription provider, or (TLS) DNS/ports for MARCUS_PUBLIC_DOMAIN not yet reachable."
-    docker compose "${COMPOSE_FILES[@]}" logs "${start_services[@]}" --tail=50 || true
-    exit 1
+if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
+    log "Marcus run mode is 'native' — skipping the marcus container build."
+    log "Kanboard, Gitea, and every token/webhook they need are provisioned; start Marcus with:"
+    log "  ./scripts/run_marcus_native.sh"
+else
+    log "Building and starting Marcus..."
+    # Start marcus (always) plus caddy (only when the TLS overlay is active —
+    # MARCUS_PUBLIC_DOMAIN set adds -f docker-compose.tls.yml to COMPOSE_FILES).
+    start_services=(marcus)
+    if [ -n "$(env_get MARCUS_PUBLIC_DOMAIN)" ]; then
+        start_services+=(caddy)
+    fi
+    if ! docker compose "${COMPOSE_FILES[@]}" --profile docker-marcus up -d --build --wait --wait-timeout 90 "${start_services[@]}"; then
+        err "Marcus (or the TLS proxy) did not become healthy in time — most likely a KANBOARD_API_TOKEN mismatch, a missing ~/.claude.json / ~/.claude/.credentials.json for the claude_subscription provider, or (TLS) DNS/ports for MARCUS_PUBLIC_DOMAIN not yet reachable."
+        docker compose "${COMPOSE_FILES[@]}" --profile docker-marcus logs "${start_services[@]}" --tail=50 || true
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------
@@ -477,8 +551,13 @@ else
     echo " Kanboard:  http://localhost:8080   (admin / admin)"
 fi
 echo " Gitea:     http://localhost:3000   (root / $(env_get GITEA_ADMIN_PASSWORD))"
-echo " Marcus:    http://localhost:${host_port}/mcp"
+if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
+    echo " Marcus:    NOT STARTED YET — run ./scripts/run_marcus_native.sh (will listen on http://localhost:${host_port}/mcp)"
+else
+    echo " Marcus:    http://localhost:${host_port}/mcp"
+fi
 echo
+echo " Marcus run mode: $(env_get MARCUS_RUN_MODE)"
 echo " Kanboard project: $(env_get KANBOARD_PROJECT_NAME) (id $(env_get KANBOARD_PROJECT_ID))"
 echo " Webhook:   configured — board changes reach Marcus instantly."
 echo " AI provider: $(env_get MARCUS_AI_PROVIDER) (Marcus's own decomposition/analysis calls)"
@@ -488,8 +567,14 @@ else
     echo " Agent auth: none (localhost-only). Set MARCUS_AGENT_TOKEN before exposing remotely."
 fi
 echo
-echo " Connect an AI agent from this machine:"
-echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp${auth_flag}"
+if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
+    echo " Start Marcus, then connect an AI agent from this machine:"
+    echo "   ./scripts/run_marcus_native.sh &"
+    echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp${auth_flag}"
+else
+    echo " Connect an AI agent from this machine:"
+    echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp${auth_flag}"
+fi
 echo
 
 bind_host="$(env_get MARCUS_BIND_HOST)"
@@ -508,7 +593,11 @@ else
             echo " Remote access: DISABLED — Marcus, Gitea, and Kanboard only accept connections from this machine."
             echo " To allow other machines, re-run setup and answer yes (or set MARCUS_BIND_HOST=0.0.0.0,"
             echo " GITEA_BIND_HOST=0.0.0.0, KANBOARD_BIND_HOST=0.0.0.0, and MARCUS_AGENT_TOKEN in .env, then:"
-            echo " docker compose up -d --build)."
+            if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
+                echo " docker compose up -d kanboard gitea && ./scripts/run_marcus_native.sh)."
+            else
+                echo " docker compose --profile docker-marcus up -d --build)."
+            fi
             ;;
         *)
             conn_host="$bind_host"

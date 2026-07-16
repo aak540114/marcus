@@ -114,7 +114,7 @@ Agents do talk to **Gitea** directly, but only for `git clone`/`fetch`/`push` on
 ./scripts/setup.sh
 ```
 
-This one command does everything the individually-numbered steps below used to require by hand: starts Kanboard and Gitea, creates the Kanboard project and its six required columns, sets the Kanboard API token and webhook, creates the Gitea admin account and access token, picks and wires up an AI provider for Marcus's own decomposition/analysis calls (see [AI provider](#ai-provider) — no API key prompt), then builds and starts Marcus itself.
+This one command does everything the individually-numbered steps below used to require by hand: asks how Marcus itself should run (in Docker, or natively on this host — see [Hybrid mode: Marcus outside Docker](#hybrid-mode-marcus-outside-docker)), starts Kanboard and Gitea, creates the Kanboard project and its six required columns, sets the Kanboard API token and webhook, creates the Gitea admin account and access token, picks and wires up an AI provider for Marcus's own decomposition/analysis calls (see [AI provider](#ai-provider) — no API key prompt), then builds and starts Marcus itself (Docker mode) or prints the command to start it (native mode).
 
 It's safe to re-run — every step checks live state before creating or changing anything, so running it again after `docker compose down` is a fast no-op, and running it after `docker compose down -v` (which wipes volumes) re-provisions everything from scratch.
 
@@ -125,14 +125,15 @@ When it finishes it prints the Kanboard/Gitea/Marcus URLs, the Gitea admin passw
 
 | Step | What happens | How |
 |---|---|---|
+| Marcus run mode | Asks once: run Marcus in Docker, or natively on this host? Defaults to Docker | See [Hybrid mode: Marcus outside Docker](#hybrid-mode-marcus-outside-docker) |
 | Kanboard API token | Set to a known, generated value — no UI login needed | `API_AUTHENTICATION_TOKEN` env var on the `kanboard` container (Kanboard's own app-level auth mechanism) |
 | Kanboard project + columns | Created if missing; columns reconciled to `Todo, Ready, In Progress, Waiting for Human, Blocked, Done` | JSON-RPC calls (`createProject`, `getColumns`, `updateColumn`, `addColumn`) via `scripts/provision_kanboard.py` |
-| Kanboard webhook | Set to `http://marcus:4298/webhooks/kanboard` so board changes reach Marcus instantly instead of on the next 30s poll | Kanboard has no API for this — it's two rows (`webhook_url`, `webhook_token`) in its own SQLite `settings` table, written directly via `docker compose exec kanboard php -r '...'` (PDO SQLite, the same DB driver Kanboard itself uses) |
+| Kanboard webhook | Set to `http://marcus:4298/webhooks/kanboard` (Docker mode) or `http://host.docker.internal:4298/webhooks/kanboard` (native mode) so board changes reach Marcus instantly instead of on the next 30s poll | Kanboard has no API for this — it's two rows (`webhook_url`, `webhook_token`) in its own SQLite `settings` table, written directly via `docker compose exec kanboard php -r '...'` (PDO SQLite, the same DB driver Kanboard itself uses) |
 | Gitea admin account | Created non-interactively | `docker compose exec -u git gitea gitea admin user create ...` |
 | Gitea access token | Generated non-interactively | `docker compose exec -u git gitea gitea admin user generate-access-token ...` |
 | AI provider | `claude_subscription` if this machine has an authenticated `claude` CLI; `anthropic` if `CLAUDE_API_KEY` is already in `.env`; otherwise the script fails with instructions instead of prompting | See [AI provider](#ai-provider) |
 | Network access | Asks once: allow AI agents on other machines to connect to Marcus, or localhost-only? Defaults to localhost-only if there's no terminal to ask | See [Network access](#network-access) |
-| Marcus | Built and started once everything above has produced the values it needs | `docker compose up -d --build marcus` |
+| Marcus | Docker mode: built and started once everything above has produced the values it needs. Native mode: skipped — the script prints the command to start it yourself | `docker compose --profile docker-marcus up -d --build marcus`, or `./scripts/run_marcus_native.sh` |
 
 </details>
 
@@ -167,8 +168,9 @@ mkdir -p ~/.claude && [ -f ~/.claude.json ] || echo '{}' > ~/.claude.json && [ -
 ```
 This matters because Docker does **not** fail when a bind-mount source is missing — it silently creates a **root-owned directory** at that path, which would break both the container's `claude` CLI and your host's own Claude Code. (`./scripts/setup.sh` does this step for you.) Then:
 ```bash
-docker compose up -d --build marcus
+docker compose --profile docker-marcus up -d --build marcus
 ```
+(The `marcus` service only starts when this profile is passed — see [Hybrid mode: Marcus outside Docker](#hybrid-mode-marcus-outside-docker) for why, and for the alternative of running Marcus natively instead.)
 
 </details>
 
@@ -241,12 +243,46 @@ Marcus's own decomposition, dependency-inference, and effort-estimation calls ne
 
 You can also set `MARCUS_AI_PROVIDER` in `.env` yourself to override this — an explicit value always wins over the auto-detection above — see `.env.example`.
 
-> ⚠️ **macOS hosts:** on macOS the `claude` CLI stores its login token in the **login Keychain**, not in `~/.claude/.credentials.json`. That file can't be shared into a Linux container, so `claude_subscription` will **not** authenticate inside Docker on a Mac host — every AI call fails. `setup.sh` detects macOS and warns you. On a Mac, use the API-key path instead: set `CLAUDE_API_KEY` in `.env` before running setup. (Linux hosts, where the token lives in the credentials file, are unaffected.)
+> ⚠️ **macOS hosts:** on macOS the `claude` CLI stores its login token in the **login Keychain**, not in `~/.claude/.credentials.json`. That file can't be shared into a Linux container, so `claude_subscription` will **not** authenticate inside Docker on a Mac host — every AI call fails. `setup.sh` detects macOS and warns you (only in Docker mode — see below). Two ways to actually fix this on a Mac, instead of just working around it with an API key:
+> 1. **Run Marcus natively** (recommended) — see [Hybrid mode: Marcus outside Docker](#hybrid-mode-marcus-outside-docker). A native macOS process reads the Keychain directly, the same way your interactive `claude login` session does, so this isn't a workaround — it's the actual fix.
+> 2. **Use the API-key path** instead: set `CLAUDE_API_KEY` in `.env` before running setup. (Linux hosts, where the token lives in the credentials file, are unaffected by any of this.)
 
 **Trade-offs of `claude_subscription`:**
 - Each call spawns a full `claude` CLI process inside the container (several seconds to tens of seconds, versus sub-second for a direct API call), and shares your subscription's usage limits with any interactive Claude Code sessions on the same account.
 - The container mounts your **live** `~/.claude.json` / `~/.claude/.credentials.json` read-write and acts as that login. Running interactive Claude Code on the host *at the same time* as Marcus means both share one login — an OAuth token refresh on either side can momentarily invalidate the other, so you may occasionally have to re-run `claude login`. Fine for the local/demo use this stack targets; think twice on a shared host.
 - If you'd rather not share host credentials at all, set `CLAUDE_API_KEY` in `.env` before running `./scripts/setup.sh` to use the `anthropic` provider instead.
+
+---
+
+## Hybrid mode: Marcus outside Docker
+
+Kanboard and Gitea always run in Docker (`docker-compose.yml`), but Marcus itself doesn't have to. `./scripts/setup.sh` asks once, up front: run Marcus **in Docker** (default) or **natively on this host**?
+
+**Why you'd choose native.** The whole reason this exists is the macOS Keychain problem described above: Docker Desktop on a Mac runs Linux in a VM, so the `claude` CLI process Marcus spawns inside a container is a Linux process with no access to the macOS Keychain, no matter what files you bind-mount into it. A **native** Marcus process, running directly on macOS, is a genuine macOS process — it reads the Keychain exactly the way your interactive `claude login` session does. No credential extraction, no staleness, no workaround. (Everything else about hybrid mode — reaching Kanboard/Gitea, dev-environment previews — works identically to Docker mode; this is the one thing it actually *fixes*, not just a different way to run the same thing.)
+
+**What "hybrid" means concretely:**
+- Kanboard and Gitea keep running exactly as before: `docker compose up -d kanboard gitea`.
+- Marcus runs as a normal process on your host: `./scripts/run_marcus_native.sh`.
+- They talk to each other over `localhost` ports instead of Docker's internal service names — Marcus reaches Kanboard at `http://localhost:8080/jsonrpc.php` and Gitea at `http://localhost:3000` (the same host-published ports a human's browser already uses), and Kanboard/Gitea reach back OUT to Marcus at `http://host.docker.internal:4298/...` for their webhooks (the standard Docker mechanism for a container to reach a process on its host).
+
+**Setup:**
+```bash
+./scripts/setup.sh
+# → "How should Marcus run?" → choose 2 (native)
+```
+This provisions Kanboard, Gitea, every token, and the webhooks exactly like Docker mode — it just skips building a container for Marcus and prints the next command instead:
+```bash
+./scripts/run_marcus_native.sh
+```
+Requires Python 3.11+ and Marcus's dependencies installed on the host (`pip install -r requirements.txt && pip install --no-deps -e .`) — `run_marcus_native.sh` checks for this and tells you the exact commands if they're missing. If you're using `claude_subscription`, it also checks that `claude login` is active on this host before starting.
+
+**What's different from Docker mode:**
+- Marcus's own state (`~/.marcus/costs.db`, ticket lifecycle, etc.) lives under the repo's `./data/` directory either way (both modes resolve these as paths relative to Marcus's own working directory, which `run_marcus_native.sh` sets to the repo root) — so switching modes doesn't lose anything, but the two modes don't share `~/.marcus/costs.db` outside that (Docker's copy is bind-mounted from `./data/.marcus`; native mode's is wherever `~/.marcus` really is on your host — usually the same place, but worth knowing if they ever diverge).
+- The dev-environment preview containers (`docker-compose.yml`'s Docker-outside-of-Docker setup) get *simpler* in native mode: a native Marcus talks to your host's Docker daemon directly, so there's no container-to-host path translation to worry about.
+- The built-in HTTPS proxy ([Authenticating remote agents](#authenticating-remote-agents)'s Caddy option) isn't available in native mode — it only fronts the Marcus *container*. `setup.sh` skips that question when you choose native; put your own reverse proxy in front of the native Marcus process if you need TLS, or keep plain HTTP behind a VPN/tunnel.
+- Everything else — the bearer token, `MARCUS_BIND_HOST`, remote access, the Kanboard plugin, AI Verify, hot-reload dev environments — works exactly the same regardless of which mode Marcus runs in.
+
+**Switching modes later:** edit `MARCUS_RUN_MODE` in `.env` (`docker` or `native`) and re-run `./scripts/setup.sh` to pick up the change (it re-seeds the Kanboard webhook URL for the new mode). If you'd previously enabled the HTTPS proxy under Docker mode, clear `MARCUS_PUBLIC_DOMAIN` from `.env` too before switching to native.
 
 ---
 
