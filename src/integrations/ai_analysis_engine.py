@@ -21,6 +21,7 @@ Examples
 
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -78,46 +79,75 @@ class AIAnalysisEngine:
         """
         Initialize the AI Analysis Engine.
 
-        Attempts to set up the Anthropic client with various compatibility
-        approaches for different library versions.
+        Selects the LLM transport from ``config.ai.provider``:
+        ``claude_subscription`` routes every call through the local
+        ``claude`` CLI (whatever login it carries — no API key involved);
+        anything else builds an **async** Anthropic client from the
+        configured API key. The async client matters: this engine's
+        methods run on the server's single event loop, and the previous
+        synchronous client froze the entire process (webhooks, board
+        polling, all MCP calls) for the duration of every LLM round-trip.
         """
-        # Initialize Anthropic client with better error handling
-        self.client: Optional[anthropic.Anthropic] = None
+        self.client: Optional[anthropic.AsyncAnthropic] = None
+        #: CLI transport for the claude_subscription provider; when set,
+        #: _call_claude shells out via ClaudeCliProvider._call_claude_cli
+        #: instead of using self.client.
+        self._cli_provider: Optional[Any] = None
         self.current_project_id: Optional[str] = None
         self.current_agent_id: Optional[str] = None
+        #: Strong references to fire-and-forget token-tracking tasks —
+        #: asyncio keeps only weak refs to tasks, so without this a
+        #: pending tracker task can be garbage-collected mid-flight.
+        self._bg_tasks: set[Any] = set()
         try:
             # Get API key from config first, fall back to environment
             from src.config.marcus_config import get_config
 
             config = get_config()
-            api_key = config.ai.anthropic_api_key or os.environ.get("CLAUDE_API_KEY")
-            if not api_key:
-                print(
-                    "⚠️  Anthropic API key not found - "
-                    "AI features will use fallback mode",
-                    file=sys.stderr,
+            provider = getattr(config.ai, "provider", None)
+
+            if provider == "claude_subscription":
+                # Deliberately keyless: the claude CLI's own login is the
+                # auth. Constructing an Anthropic client (or warning about
+                # a missing API key) would be wrong here — this mirrors
+                # how LLMAbstraction already dispatches this provider.
+                from src.ai.providers.claude_cli_provider import (
+                    ClaudeCliProvider,
                 )
-                self.client = None
+
+                cli_model = getattr(config.ai, "claude_cli_model", None)
+                self._cli_provider = ClaudeCliProvider(model=cli_model or None)
             else:
-                # Try different initialization approaches based on version
-                try:
-                    # First try simple initialization
-                    self.client = anthropic.Anthropic(api_key=api_key)
-                    # Don't print during initialization - it interferes with MCP stdio
-                except TypeError as te:
-                    # If we get a TypeError about proxies, just use basic initialization
-                    if "proxies" in str(te):
-                        # Retry without any extra parameters
-                        self.client = anthropic.Anthropic(api_key=api_key)
-                        # Successfully initialized
-                    else:
-                        raise te
+                api_key = config.ai.anthropic_api_key or os.environ.get(
+                    "CLAUDE_API_KEY"
+                )
+                if not api_key:
+                    print(
+                        "⚠️  Anthropic API key not found - "
+                        "AI features will use fallback mode",
+                        file=sys.stderr,
+                    )
+                    self.client = None
+                else:
+                    # Async client — never block the event loop on LLM I/O.
+                    try:
+                        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+                    except TypeError as te:
+                        # Older library versions choke on proxy kwargs
+                        # injected by some environments; retry bare.
+                        if "proxies" in str(te):
+                            self.client = anthropic.AsyncAnthropic(
+                                api_key=api_key
+                            )
+                        else:
+                            raise te
 
         except Exception:
-            # Failed to initialize Anthropic client
+            # Failed to initialize any LLM transport.
             # AI features will use fallback responses
             # Don't print to stderr as it interferes with MCP stdio protocol
             self.client = None
+            self._cli_provider = None
             config = None
 
         self.model: str = (
@@ -250,6 +280,17 @@ Identify risks and provide JSON:
 }}""",
         }
 
+    @property
+    def _llm_available(self) -> bool:
+        """Whether any LLM transport (API client or claude CLI) is usable.
+
+        Every business method gates its LLM path on this instead of
+        ``self.client`` — checking only the client wrongly forced the
+        rule-based fallbacks for the ``claude_subscription`` provider,
+        which is deliberately keyless and has no API client at all.
+        """
+        return self.client is not None or self._cli_provider is not None
+
     async def initialize(self) -> None:
         """
         Initialize the AI engine and test connectivity.
@@ -263,16 +304,29 @@ Identify risks and provide JSON:
         >>> await engine.initialize()
         ✅ AI Engine connection verified
         """
-        if not self.client:
+        if self._cli_provider is not None:
+            # CLI transport: no API connection to test — just confirm the
+            # binary exists so a missing install degrades loudly here
+            # rather than as a cryptic subprocess error on the first call.
+            if shutil.which("claude") is None:
+                print(
+                    "⚠️  'claude' CLI not found on PATH - "
+                    "AI features will use fallback mode",
+                    file=sys.stderr,
+                )
+                self._cli_provider = None
+            return
+
+        if self.client is None:
             print(
-                "⚠️  AI Engine running in fallback mode (no Anthropic client)",
+                "⚠️  AI Engine running in fallback mode (no LLM backend)",
                 file=sys.stderr,
             )
             return
 
         # Test connection
         try:
-            self.client.messages.create(
+            await self.client.messages.create(
                 model=self.model,
                 max_tokens=10,
                 messages=[{"role": "user", "content": "test"}],
@@ -325,7 +379,7 @@ Identify risks and provide JSON:
         if not available_tasks:
             return None
 
-        if not self.client:
+        if not self._llm_available:
             # Fallback: Simple skill-based matching
             return self._fallback_task_matching(available_tasks, agent)
 
@@ -475,7 +529,7 @@ Identify risks and provide JSON:
         Uses AI to generate context-aware instructions when available,
         otherwise provides structured fallback instructions.
         """
-        if not self.client:
+        if not self._llm_available:
             # Fallback instructions when AI is not available
             return self._generate_fallback_instructions(task, agent)
 
@@ -707,7 +761,7 @@ Good luck with your task!"""
         >>> print(analysis['resolution_steps'])
         ['Check database server status', ...]
         """
-        if not self.client:
+        if not self._llm_available:
             return self._generate_fallback_blocker_analysis(
                 description, severity, agent, task
             )
@@ -871,7 +925,7 @@ Task Details:
         ...     "Working on user authentication"
         ... )
         """
-        if not self.client:
+        if not self._llm_available:
             return (
                 f"Please clarify: {question}\n\nTask: {task.name}\nContext: {context}"
             )
@@ -931,7 +985,7 @@ Provide a helpful clarification that guides the developer."""
         Analyzes up to 10 recent blockers to identify patterns.
         Falls back to basic risk assessment if AI unavailable.
         """
-        if not self.client:
+        if not self._llm_available:
             return self._generate_fallback_risk_analysis(project_state)
 
         # Prepare data
@@ -1074,7 +1128,7 @@ Provide a helpful clarification that guides the developer."""
             Project health analysis with overall health, timeline prediction,
             risk factors, recommendations, and resource optimization
         """
-        if not self.client:
+        if not self._llm_available:
             return self._generate_fallback_health_analysis(project_state, team_status)
 
         # Serialize ProjectState dataclass to JSON
@@ -1297,7 +1351,7 @@ Return JSON in this format:
         >>> tasks = result["required_tasks"]
         """
         # Fallback for when Claude is unavailable
-        if not self.client:
+        if not self._llm_available:
             return self._analyze_feature_request_fallback(feature_description)
 
         try:
@@ -1461,7 +1515,7 @@ and assignable to a developer."""
         >>> phase = integration["suggested_phase"]
         """
         # Fallback for when Claude is unavailable
-        if not self.client:
+        if not self._llm_available:
             return self._analyze_integration_fallback(feature_tasks, existing_tasks)
 
         try:
@@ -1597,8 +1651,10 @@ Return JSON with this format:
         Exception
             If the API call fails or client is unavailable
         """
-        if not self.client:
-            raise Exception("Anthropic client not available")
+        if not self._llm_available:
+            raise Exception(
+                "No LLM backend available (no Anthropic client or claude CLI)"
+            )
 
         try:
             # Set context for token tracking if available
@@ -1607,44 +1663,61 @@ Return JSON with this format:
                     self.current_agent_id, self.current_project_id
                 )
 
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                temperature=0.7,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            # Extract token usage if available
-            if hasattr(response, "usage"):
-                usage = response.usage
-                if self.current_project_id:
-                    # Manually track tokens since we're calling the API directly
-                    import asyncio
-
-                    from src.cost_tracking.token_tracker import token_tracker
-
-                    asyncio.create_task(
-                        token_tracker.track_tokens(
-                            project_id=self.current_project_id,
-                            input_tokens=usage.input_tokens,
-                            output_tokens=usage.output_tokens,
-                            model=self.model,
-                            metadata={
-                                "agent_id": self.current_agent_id,
-                                "function": "ai_analysis_engine",
-                                "prompt_length": len(prompt),
-                            },
-                        )
-                    )
-
-            # Handle different response block types
-            content = response.content[0]
-            if hasattr(content, "text"):
-                text = str(content.text).strip()
+            if self._cli_provider is not None:
+                # claude_subscription: shell out through the CLI (its own
+                # subprocess handling is already async + timeout-guarded;
+                # ClaudeCliProvider records its own cost events).
+                text = str(
+                    await self._cli_provider._call_claude_cli(prompt)
+                ).strip()
             else:
-                text = str(content).strip()
+                assert self.client is not None  # narrowed by _llm_available
+                response = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=2000,
+                    temperature=0.7,
+                    messages=[{"role": "user", "content": prompt}],
+                )
 
-            # Extract JSON from response (LLMs often wrap in fences or add prose)
+                # Extract token usage if available
+                if hasattr(response, "usage"):
+                    usage = response.usage
+                    if self.current_project_id:
+                        # Manually track tokens since we're calling the API
+                        # directly. Keep a strong reference to the task —
+                        # asyncio holds only weak refs, and an unreferenced
+                        # task can be GC'd before it runs.
+                        import asyncio
+
+                        from src.cost_tracking.token_tracker import (
+                            token_tracker,
+                        )
+
+                        task = asyncio.create_task(
+                            token_tracker.track_tokens(
+                                project_id=self.current_project_id,
+                                input_tokens=usage.input_tokens,
+                                output_tokens=usage.output_tokens,
+                                model=self.model,
+                                metadata={
+                                    "agent_id": self.current_agent_id,
+                                    "function": "ai_analysis_engine",
+                                    "prompt_length": len(prompt),
+                                },
+                            )
+                        )
+                        self._bg_tasks.add(task)
+                        task.add_done_callback(self._bg_tasks.discard)
+
+                # Handle different response block types
+                content = response.content[0]
+                if hasattr(content, "text"):
+                    text = str(content.text).strip()
+                else:
+                    text = str(content).strip()
+
+            # Extract JSON from response (LLMs often wrap in fences or add
+            # prose) — applies identically to both transports.
             start = text.find("{") if "{" in text else text.find("[")
             if start != -1:
                 end = text.rfind("}") if "{" in text else text.rfind("]")

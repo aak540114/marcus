@@ -53,7 +53,7 @@ class TestAIAnalysisEngine:
         The Anthropic client is mocked to avoid real API calls during tests.
         This fixture runs before each test method.
         """
-        with patch("anthropic.Anthropic") as mock_anthropic:
+        with patch("anthropic.AsyncAnthropic"):
             engine = AIAnalysisEngine()
             # Mock the client to avoid real API calls in tests
             engine.client = Mock()
@@ -597,13 +597,15 @@ Remember: Take your time, test thoroughly, and ask questions!"""
                 "src.integrations.ai_analysis_engine.anthropic"
             ) as mock_anthropic:
                 mock_client = Mock()
-                mock_anthropic.Anthropic.return_value = mock_client
+                mock_anthropic.AsyncAnthropic.return_value = mock_client
 
                 # Create engine - should initialize client
                 engine = AIAnalysisEngine()
 
                 assert engine.client == mock_client
-                mock_anthropic.Anthropic.assert_called_once_with(api_key="test-api-key")
+                mock_anthropic.AsyncAnthropic.assert_called_once_with(
+                    api_key="test-api-key"
+                )
 
     @pytest.mark.asyncio
     async def test_client_initialization_failure(self, monkeypatch, capsys):
@@ -619,7 +621,9 @@ Remember: Take your time, test thoroughly, and ask questions!"""
             with patch(
                 "src.integrations.ai_analysis_engine.anthropic"
             ) as mock_anthropic:
-                mock_anthropic.Anthropic.side_effect = Exception("Connection failed")
+                mock_anthropic.AsyncAnthropic.side_effect = Exception(
+                    "Connection failed"
+                )
 
                 engine = AIAnalysisEngine()
 
@@ -808,12 +812,12 @@ Write unit tests for auth flow
         mock_response.content = [Mock(text="AI response")]
 
         ai_engine.client = Mock()
-        ai_engine.client.messages.create.return_value = mock_response
+        ai_engine.client.messages.create = AsyncMock(return_value=mock_response)
 
         result = await ai_engine._call_claude("test prompt")
 
         assert result == "AI response"
-        ai_engine.client.messages.create.assert_called_once_with(
+        ai_engine.client.messages.create.assert_awaited_once_with(
             model=ai_engine.model,
             max_tokens=2000,
             temperature=0.7,
@@ -824,15 +828,18 @@ Write unit tests for auth flow
     async def test_call_claude_no_client(self, ai_engine):
         """Test Claude call when client is None"""
         ai_engine.client = None
+        ai_engine._cli_provider = None
 
-        with pytest.raises(Exception, match="Anthropic client not available"):
+        with pytest.raises(Exception, match="No LLM backend available"):
             await ai_engine._call_claude("test prompt")
 
     @pytest.mark.asyncio
     async def test_call_claude_api_error(self, ai_engine, capsys):
         """Test Claude call with API error"""
         ai_engine.client = Mock()
-        ai_engine.client.messages.create.side_effect = Exception("API rate limit")
+        ai_engine.client.messages.create = AsyncMock(
+            side_effect=Exception("API rate limit")
+        )
 
         with pytest.raises(Exception):
             await ai_engine._call_claude("test prompt")
@@ -881,7 +888,7 @@ Write unit tests for auth flow
         mock_response.usage = None
 
         ai_engine.client = Mock()
-        ai_engine.client.messages.create.return_value = mock_response
+        ai_engine.client.messages.create = AsyncMock(return_value=mock_response)
 
         result = await ai_engine._call_claude("test prompt")
         assert result == expected
@@ -903,7 +910,7 @@ Write unit tests for auth flow
         mock_response.usage = None
 
         ai_engine.client = Mock()
-        ai_engine.client.messages.create.return_value = mock_response
+        ai_engine.client.messages.create = AsyncMock(return_value=mock_response)
 
         result = await ai_engine._call_claude("blocker prompt")
         parsed = json.loads(result)
@@ -1217,8 +1224,8 @@ Write unit tests for auth flow
             mock_client = Mock()
             mock_response = Mock()
             mock_response.content = [Mock(text="test")]
-            mock_client.messages.create.return_value = mock_response
-            mock_anthropic.Anthropic.return_value = mock_client
+            mock_client.messages.create = AsyncMock(return_value=mock_response)
+            mock_anthropic.AsyncAnthropic.return_value = mock_client
 
             with patch.dict(os.environ, {"CLAUDE_API_KEY": "test-key"}):
                 engine = AIAnalysisEngine()
@@ -1245,8 +1252,10 @@ Write unit tests for auth flow
         """Test initialize when connection test fails"""
         with patch("src.integrations.ai_analysis_engine.anthropic") as mock_anthropic:
             mock_client = Mock()
-            mock_client.messages.create.side_effect = Exception("Connection failed")
-            mock_anthropic.Anthropic.return_value = mock_client
+            mock_client.messages.create = AsyncMock(
+                side_effect=Exception("Connection failed")
+            )
+            mock_anthropic.AsyncAnthropic.return_value = mock_client
 
             with patch.dict(os.environ, {"CLAUDE_API_KEY": "test-key"}):
                 engine = AIAnalysisEngine()
@@ -1256,3 +1265,108 @@ Write unit tests for auth flow
                 # Note: Error logging removed to avoid MCP stdio interference
                 # Verify client is disabled on failure
                 assert engine.client is None
+
+
+class TestClaudeSubscriptionMode:
+    """AIAnalysisEngine must support the claude_subscription provider.
+
+    Previously this engine only knew how to build a raw Anthropic API
+    client from an API key — under claude_subscription (deliberately
+    keyless: the `claude` CLI's own login carries auth) it printed the
+    misleading "Anthropic API key not found - AI features will use
+    fallback mode" warning and silently ran every feature (task
+    matching, instruction generation, blocker analysis) as rule-based
+    fallbacks, even though the CLI login was valid and Marcus's other
+    LLM subsystem (LLMAbstraction/ClaudeCliProvider) was using it fine.
+    """
+
+    @pytest.fixture
+    def ai_engine(self) -> AIAnalysisEngine:
+        """Engine with no real client (mirrors the main suite's fixture,
+        which is class-scoped there and not visible here)."""
+        with patch("anthropic.AsyncAnthropic"):
+            engine = AIAnalysisEngine()
+            engine.client = Mock()
+            return engine
+
+    def _subscription_config(self):
+        cfg = Mock()
+        cfg.ai.provider = "claude_subscription"
+        cfg.ai.anthropic_api_key = None
+        cfg.ai.claude_cli_model = "sonnet"
+        cfg.ai.model = None
+        cfg.ai.max_tokens = 2000
+        cfg.ai.temperature = 0.7
+        return cfg
+
+    @pytest.mark.asyncio
+    async def test_init_subscription_mode_uses_cli_not_fallback(self, capsys):
+        """provider=claude_subscription → CLI transport, no fallback warning."""
+        with patch("src.config.marcus_config.get_config") as mock_get_config:
+            mock_get_config.return_value = self._subscription_config()
+            engine = AIAnalysisEngine()
+
+        assert engine._cli_provider is not None
+        assert engine.client is None
+        captured = capsys.readouterr()
+        assert "fallback mode" not in captured.err
+        assert "API key not found" not in captured.err
+
+    @pytest.mark.asyncio
+    async def test_call_claude_routes_through_cli(self, ai_engine):
+        """_call_claude uses the CLI transport when it is configured."""
+        ai_engine.client = None
+        cli = Mock()
+        cli._call_claude_cli = AsyncMock(
+            return_value='Here you go: {"key": "value"} enjoy!'
+        )
+        ai_engine._cli_provider = cli
+
+        result = await ai_engine._call_claude("test prompt")
+
+        # Same JSON extraction as the API path applies to CLI output.
+        assert result == '{"key": "value"}'
+        cli._call_claude_cli.assert_awaited_once_with("test prompt")
+
+    @pytest.mark.asyncio
+    async def test_initialize_cli_present_keeps_provider(self, ai_engine, capsys):
+        """initialize() keeps CLI mode when the claude binary exists."""
+        ai_engine.client = None
+        ai_engine._cli_provider = Mock()
+
+        with patch(
+            "src.integrations.ai_analysis_engine.shutil.which",
+            return_value="/usr/local/bin/claude",
+        ):
+            await ai_engine.initialize()
+
+        assert ai_engine._cli_provider is not None
+        captured = capsys.readouterr()
+        assert "fallback mode" not in captured.err
+
+    @pytest.mark.asyncio
+    async def test_initialize_cli_missing_falls_back(self, ai_engine, capsys):
+        """initialize() degrades to fallback mode when claude is not on PATH."""
+        ai_engine.client = None
+        ai_engine._cli_provider = Mock()
+
+        with patch(
+            "src.integrations.ai_analysis_engine.shutil.which", return_value=None
+        ):
+            await ai_engine.initialize()
+
+        assert ai_engine._cli_provider is None
+        captured = capsys.readouterr()
+        assert "claude" in captured.err.lower()
+
+    def test_llm_available_with_cli_only(self, ai_engine):
+        """_llm_available is True with only the CLI transport configured."""
+        ai_engine.client = None
+        ai_engine._cli_provider = Mock()
+        assert ai_engine._llm_available is True
+
+    def test_llm_available_false_with_neither(self, ai_engine):
+        """_llm_available is False with no client and no CLI."""
+        ai_engine.client = None
+        ai_engine._cli_provider = None
+        assert ai_engine._llm_available is False
