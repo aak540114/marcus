@@ -67,6 +67,12 @@ class Events:
         self.history: List[Event] = []
         self._event_counter = 0
         self.persistence = persistence
+        #: Strong references to fire-and-forget handler tasks (the
+        #: wait_for_handlers=False path). asyncio keeps only weak refs to
+        #: tasks — without these, a pending handler task can be
+        #: garbage-collected mid-flight and its event silently never
+        #: delivered.
+        self._bg_tasks: set[Any] = set()
 
     def subscribe(self, event_type: str, handler: Callable[..., Any]) -> None:
         """
@@ -176,9 +182,13 @@ class Events:
                 # Current behavior: wait for all handlers to complete
                 await asyncio.gather(*tasks)
             else:
-                # New behavior: fire-and-forget for performance
+                # New behavior: fire-and-forget for performance. Keep a
+                # strong reference until each task finishes — see
+                # __init__._bg_tasks.
                 for task in tasks:
-                    asyncio.create_task(task)
+                    t = asyncio.create_task(task)
+                    self._bg_tasks.add(t)
+                    t.add_done_callback(self._bg_tasks.discard)
 
         logger.debug(f"Published {event_type} event from {source}")
         return event

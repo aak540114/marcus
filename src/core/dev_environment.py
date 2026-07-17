@@ -678,6 +678,80 @@ class DevEnvironmentManager:
             provider, ticket_id = key.split(":", 1)
             await self.stop(ticket_id, provider)
 
+    async def prune_if_dead(self, ticket_id: str, provider: str) -> bool:
+        """Purge a registered env whose container has actually died.
+
+        Containers run with ``--rm`` and everything meaningful (dependency
+        install, git checkout, dev server start) happens AFTER
+        ``docker run -d`` returns — a failure seconds later removes the
+        container entirely while the registry keeps reporting the env as
+        running: ``get_info`` hands out a dead URL and the port/slot stay
+        consumed against the parallel limit. Status queries call this
+        first so a died environment is noticed at the first check and its
+        slot freed.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+
+        Returns
+        -------
+        bool
+            ``True`` if a dead registration was pruned. ``False`` when the
+            container is alive, nothing is registered, this is a
+            non-Docker env, or the container's true state is unknown
+            (docker error) — unknown state deliberately keeps the
+            registration, mirroring ``stop()``'s bookkeeping rule.
+        """
+        key = f"{provider}:{ticket_id}"
+        info = self._envs.get(key)
+        if info is None or not self.config.use_docker:
+            return False
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [
+                        "docker",
+                        "inspect",
+                        "-f",
+                        "{{.State.Running}}",
+                        info.container_name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=_DOCKER_CMD_TIMEOUT,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - daemon down/binary missing
+            logger.warning(
+                "Dev env liveness check failed for %s: %s — keeping it tracked",
+                key,
+                exc,
+            )
+            return False
+
+        if result.returncode == 0 and result.stdout.strip() == "true":
+            return False
+
+        # Dead: a --rm container vanishes entirely (inspect exits non-zero);
+        # a stopped one reports Running=false. Either way nothing serves.
+        del self._envs[key]
+        self._allocator.release(info.port)
+        logger.warning(
+            "Dev env for %s is dead (container %s no longer running) — "
+            "pruned; port %d released",
+            key,
+            info.container_name,
+            info.port,
+        )
+        return True
+
     async def reconcile_orphans(self) -> int:
         """Remove ``marcus-dev-*`` containers left over from a dead run.
 

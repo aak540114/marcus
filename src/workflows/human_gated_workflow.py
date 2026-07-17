@@ -531,6 +531,9 @@ class HumanGatedWorkflow:
             await self._post_comment(ticket_id, comment)
             logger.info("Ticket %s done and merged to %s", ticket_id, main_branch)
 
+            # This completion may unblock other tickets.
+            await self._resume_tickets_blocked_by(ticket_id)
+
             # Agent is now free — pick up the next ticket in dependency order.
             await self._pickup_next_ticket()
         else:
@@ -975,6 +978,14 @@ class HumanGatedWorkflow:
             logger.error("Cannot set %s to BLOCKED: %s", ticket_id, exc)
             return False
 
+        # Record the blocker structurally (not just in transition history)
+        # so completing the blocking ticket can auto-resume this one — see
+        # _resume_tickets_blocked_by.
+        try:
+            self._lifecycle.set_blocked_by(ticket_id, self._provider, blocked_by)
+        except KeyError:
+            pass
+
         try:
             await self._kanban.move_task_to_column(ticket_id, "blocked")
         except Exception as exc:  # noqa: BLE001
@@ -988,6 +999,45 @@ class HumanGatedWorkflow:
         await self._pickup_next_ticket()
 
         return True
+
+    async def _resume_tickets_blocked_by(self, closed_ticket_id: str) -> None:
+        """Auto-resume BLOCKED tickets whose blocker just completed.
+
+        ``signal_blocked`` used to be a one-way street: nothing ever
+        watched for the blocking work finishing, so a blocked ticket
+        stayed blocked until a human manually dragged the card out of
+        the blocked column. Called after a ticket is merged and marked
+        DONE (both the human-gate close and the AI-gate autocomplete).
+
+        Assigned matches restart through the normal ``_start_ai_work``
+        path (which handles BLOCKED → IN_PROGRESS and re-claims);
+        unassigned matches just get a visible comment — assignment is
+        still the human's "please work on this" signal.
+
+        Parameters
+        ----------
+        closed_ticket_id : str
+            The ticket that just completed.
+        """
+        matches = self._lifecycle.get_records_blocked_by(closed_ticket_id)
+        for record in matches:
+            blocked_id = record.ticket_id
+            logger.info(
+                "Ticket %s completed — unblocking dependent ticket %s "
+                "(was blocked by: %s)",
+                closed_ticket_id,
+                blocked_id,
+                record.blocked_by,
+            )
+            if self._is_unassigned(record):
+                await self._post_comment(
+                    blocked_id,
+                    f"🔓 Ticket #{closed_ticket_id} (recorded as this "
+                    "ticket's blocker) is done and merged. Assign this "
+                    "ticket to resume AI work on it.",
+                )
+                continue
+            await self._start_ai_work(blocked_id, record)
 
     async def _resolve_project_repo_mapping(
         self, kanboard_project_id: Optional[int]
@@ -1387,6 +1437,21 @@ class HumanGatedWorkflow:
         record : TicketRecord
             Current lifecycle record.
         """
+        # A DONE record means "reopen in progress": BoardWatcher emits
+        # ticket.status_changed BEFORE ticket.reopened for the same poll
+        # diff, so this method used to fire first — claiming the ticket
+        # and posting "Started" while the record still said DONE — and
+        # _on_ticket_reopened then had to unwind it (releasing the claim,
+        # rebasing, re-transitioning), leaving a duplicate contradictory
+        # "Started" comment behind. Let the reopen handler own that flow.
+        if record.state == TicketState.DONE:
+            logger.debug(
+                "Ticket %s record is DONE — leaving restart to the "
+                "reopen handler",
+                ticket_id,
+            )
+            return
+
         # One-ticket-per-agent: refuse if this agent is already working on
         # a different ticket.
         current_ticket = self._lifecycle.get_agent_ticket(self._agent_id)
@@ -1767,6 +1832,9 @@ class HumanGatedWorkflow:
             "AI gate: ticket %s auto-completed and merged to %s", ticket_id, main_branch
         )
 
+        # This completion may unblock other tickets.
+        await self._resume_tickets_blocked_by(ticket_id)
+
         await self._pickup_next_ticket()
         return True
 
@@ -1846,6 +1914,9 @@ class HumanGatedWorkflow:
                 branch_name,
                 exc,
             )
+            await self._post_verification_skipped_notice(
+                ticket_id, f"could not read the branch diff ({exc})"
+            )
             return VerificationResult(passed=True, findings=[], raw_response="")
 
         ac_items = self._get_ac_items(record)
@@ -1870,7 +1941,40 @@ class HumanGatedWorkflow:
                 ticket_id,
                 exc,
             )
+            await self._post_verification_skipped_notice(
+                ticket_id, f"the verification LLM call failed ({exc})"
+            )
             return VerificationResult(passed=True, findings=[], raw_response="")
+
+    async def _post_verification_skipped_notice(
+        self, ticket_id: str, cause: str
+    ) -> None:
+        """Post a visible notice that an AI-verify round was skipped.
+
+        The fail-open behavior itself is deliberate (a transient diff or
+        LLM failure should not block an auto-merge forever), but it was
+        previously SILENT — under a persistent failure (bad LLM
+        credentials, wrong repo path) every round "passed" at
+        warning-log level and AI-gate verification quietly degraded to
+        zero review. The human configured verification precisely to get
+        review before merges, so the skip must be visible where they
+        look: on the ticket.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        cause : str
+            Short human-readable reason the round could not run.
+        """
+        notice = (
+            "⚠️ **AI verification round skipped** — this round was counted "
+            f"as passed because {cause}.\n\n"
+            "If this keeps happening, the AI-gate verification you "
+            "configured is NOT actually reviewing changes — check "
+            "Marcus's logs before trusting auto-merged tickets."
+        )
+        await self._post_comment(ticket_id, notice)
 
     async def _get_effective_verify_count(self, ticket_id: str) -> int:
         """Resolve how many verification rounds are configured for a ticket.

@@ -401,6 +401,83 @@ class TestStatusChangedTrigger:
 
 
 # ---------------------------------------------------------------------------
+# BLOCKED auto-resume when the blocking ticket completes
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedAutoResume:
+    """Closing a blocker resumes tickets recorded as blocked on it.
+
+    set_blocked() now stores the blocker structurally
+    (record.blocked_by); when a ticket is closed and merged, BLOCKED
+    tickets whose blocked_by references it resume automatically —
+    previously the agent's signal_blocked was a one-way street and only
+    a manual column drag could ever resume work.
+    """
+
+    def _block_on(self, workflow, lifecycle, tid, blocker):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+
+    @pytest.mark.asyncio
+    async def test_set_blocked_records_blocker(self, workflow, lifecycle):
+        """set_blocked stores blocked_by on the lifecycle record."""
+        self._block_on(workflow, lifecycle, "90", "89")
+        await workflow.set_blocked("90", blocked_by="89")
+
+        rec = lifecycle.get("90", "kanboard")
+        assert rec.state == TicketState.BLOCKED
+        assert rec.blocked_by == "89"
+
+    @pytest.mark.asyncio
+    async def test_closing_blocker_resumes_blocked_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Blocker merged+closed → dependent ticket back to work, claimed."""
+        # Blocker ticket 89, in progress and claimed.
+        lifecycle.get_or_create("89", "kanboard")
+        lifecycle.transition("89", "kanboard", TicketState.READY)
+        lifecycle.transition("89", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("89", "kanboard", "alice")
+        # Dependent ticket 90, blocked on 89.
+        self._block_on(workflow, lifecycle, "90", "89")
+        await workflow.set_blocked("90", blocked_by="ticket #89")
+
+        close_event = _make_event({"ticket_id": "89", "provider": "kanboard"})
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/90",
+        ):
+            await workflow._on_ticket_closed(close_event)
+
+        rec = lifecycle.get("90", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.ai_agent_id is not None
+        assert rec.blocked_by is None  # cleared on leaving BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_unrelated_blocker_stays_blocked(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A ticket blocked on something else is untouched."""
+        lifecycle.get_or_create("89", "kanboard")
+        lifecycle.transition("89", "kanboard", TicketState.READY)
+        lifecycle.transition("89", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("89", "kanboard", "alice")
+        self._block_on(workflow, lifecycle, "91", "77")
+        await workflow.set_blocked("91", blocked_by="external API access #77")
+
+        close_event = _make_event({"ticket_id": "89", "provider": "kanboard"})
+        await workflow._on_ticket_closed(close_event)
+
+        rec = lifecycle.get("91", "kanboard")
+        assert rec.state == TicketState.BLOCKED
+        assert rec.blocked_by == "external API access #77"
+
+
+# ---------------------------------------------------------------------------
 # Dead-end states: BLOCKED / WAITING_FOR_HUMAN re-entry into work
 # ---------------------------------------------------------------------------
 

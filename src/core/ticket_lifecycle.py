@@ -67,6 +67,7 @@ TicketLifecycleManager
 import json
 import logging
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -169,6 +170,11 @@ class TicketRecord:
         TCP port the hot-reload dev environment is running on, if active.
     ai_agent_id : Optional[str]
         Identifier of the AI agent currently working on this ticket.
+    blocked_by : Optional[str]
+        Free-text blocker recorded by ``set_blocked`` (a ticket id or
+        resource name). Set while state is ``BLOCKED``; cleared
+        automatically on any transition out of ``BLOCKED``. Old state
+        files without this key load with ``None``.
     """
 
     ticket_id: str
@@ -184,6 +190,7 @@ class TicketRecord:
     merged_at: Optional[datetime] = None
     dev_env_port: Optional[int] = None
     ai_agent_id: Optional[str] = None
+    blocked_by: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Serialisation helpers
@@ -343,6 +350,10 @@ class TicketLifecycleManager:
         from_state = record.state
         record.state = to_state
         record.updated_at = datetime.now(timezone.utc)
+        if from_state == TicketState.BLOCKED and to_state != TicketState.BLOCKED:
+            # Leaving BLOCKED always clears the recorded blocker — the
+            # field only ever describes the CURRENT blockage.
+            record.blocked_by = None
 
         if assignee is not None:
             record.assignee = assignee
@@ -546,6 +557,10 @@ class TicketLifecycleManager:
         from_state = record.state
         record.state = to_state
         record.updated_at = datetime.now(timezone.utc)
+        if from_state == TicketState.BLOCKED and to_state != TicketState.BLOCKED:
+            # Leaving BLOCKED always clears the recorded blocker — the
+            # field only ever describes the CURRENT blockage.
+            record.blocked_by = None
 
         if assignee is not None:
             record.assignee = assignee
@@ -703,6 +718,61 @@ class TicketLifecycleManager:
         if released:
             self._save()
         return released
+
+    def set_blocked_by(self, ticket_id: str, provider: str, blocker: str) -> None:
+        """Record what a BLOCKED ticket is blocked on.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+        blocker : str
+            Free-text blocker (ticket id or resource name).
+
+        Raises
+        ------
+        KeyError
+            If the ticket is not tracked.
+        """
+        key = f"{provider}:{ticket_id}"
+        record = self._records.get(key)
+        if record is None:
+            raise KeyError(f"Ticket {key} is not tracked by lifecycle manager")
+        record.blocked_by = blocker
+        self._save()
+
+    def get_records_blocked_by(self, blocker_ticket_id: str) -> List[TicketRecord]:
+        """Return BLOCKED records whose recorded blocker references a ticket.
+
+        Matching is deliberately permissive over the free-text
+        ``blocked_by`` field: an exact id match, a ``#<id>`` reference,
+        or the id appearing as a standalone token all count. A false
+        positive merely resumes a ticket that the agent can immediately
+        re-block, while a false negative leaves it stuck forever — so
+        recall wins.
+
+        Parameters
+        ----------
+        blocker_ticket_id : str
+            The ticket id that just completed.
+
+        Returns
+        -------
+        List[TicketRecord]
+            Matching BLOCKED records (possibly empty).
+        """
+        tid = blocker_ticket_id.strip()
+        matches: List[TicketRecord] = []
+        for record in self._records.values():
+            if record.state != TicketState.BLOCKED or not record.blocked_by:
+                continue
+            text = record.blocked_by.strip()
+            tokens = re.split(r"[^A-Za-z0-9_-]+", text)
+            if text == tid or f"#{tid}" in text or tid in tokens:
+                matches.append(record)
+        return matches
 
     def get_agent_ticket(self, agent_id: str) -> Optional[str]:
         """Return the ``ticket_id`` currently claimed by *agent_id*, or ``None``.

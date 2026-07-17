@@ -901,3 +901,94 @@ class TestReconcileOrphans:
         ):
             removed = await docker_manager.reconcile_orphans()
         assert removed == 0
+
+
+class TestPruneIfDead:
+    """A registered env whose container died must stop reading as running.
+
+    Containers run with --rm and their app (dependency install, git
+    checkout, dev server) starts AFTER `docker run -d` returns — a
+    failure seconds later deletes the container entirely, while the
+    registry still reports the env as running, get_info hands out a
+    dead URL, and the port/slot stay consumed. prune_if_dead() checks
+    the container's actual state and purges dead registrations.
+    """
+
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        from src.core.dev_environment import DevEnvironmentConfig
+
+        return DevEnvironmentManager(
+            config=DevEnvironmentConfig(repo_path=str(tmp_path), use_docker=True)
+        )
+
+    def _register_env(self, manager, tid="T-1", provider="kanboard", port=19650):
+        from src.core.dev_environment import DevEnvironmentInfo
+
+        info = DevEnvironmentInfo(
+            ticket_id=tid,
+            provider=provider,
+            branch_name=f"ticket/{provider}/{tid.lower()}",
+            port=port,
+            container_name=f"marcus-dev-{provider}-{tid.lower()}",
+            url=f"http://localhost:{port}",
+        )
+        manager._envs[f"{provider}:{tid}"] = info
+        return info
+
+    @pytest.mark.asyncio
+    async def test_dead_container_is_pruned(self, docker_manager):
+        """Container gone (--rm removed it) → registration purged."""
+        self._register_env(docker_manager)
+
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 1  # docker inspect: no such container
+            result.stdout = ""
+            return result
+
+        with patch(
+            "src.core.dev_environment.subprocess.run", side_effect=fake_run
+        ):
+            pruned = await docker_manager.prune_if_dead("T-1", "kanboard")
+
+        assert pruned is True
+        assert docker_manager.get_info("T-1", "kanboard") is None
+
+    @pytest.mark.asyncio
+    async def test_live_container_is_kept(self, docker_manager):
+        """Running container → registration untouched."""
+        self._register_env(docker_manager)
+
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "true\n"
+            return result
+
+        with patch(
+            "src.core.dev_environment.subprocess.run", side_effect=fake_run
+        ):
+            pruned = await docker_manager.prune_if_dead("T-1", "kanboard")
+
+        assert pruned is False
+        assert docker_manager.get_info("T-1", "kanboard") is not None
+
+    @pytest.mark.asyncio
+    async def test_docker_error_keeps_registration(self, docker_manager):
+        """Daemon unreachable → true state unknown → do not prune."""
+        self._register_env(docker_manager)
+
+        with patch(
+            "src.core.dev_environment.subprocess.run",
+            side_effect=OSError("daemon down"),
+        ):
+            pruned = await docker_manager.prune_if_dead("T-1", "kanboard")
+
+        assert pruned is False
+        assert docker_manager.get_info("T-1", "kanboard") is not None
+
+    @pytest.mark.asyncio
+    async def test_unregistered_ticket_is_noop(self, docker_manager):
+        """No env registered → nothing to prune."""
+        assert await docker_manager.prune_if_dead("T-9", "kanboard") is False

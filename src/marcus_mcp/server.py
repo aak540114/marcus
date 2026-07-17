@@ -4165,6 +4165,17 @@ function save() {{
             provider = request.query_params.get("provider", server.provider)
 
             dev_mgr = getattr(server, "_dev_env_manager", None)
+            if dev_mgr and ticket_id:
+                # Registration alone lies: --rm containers that crash
+                # after startup vanish while staying registered. Check
+                # actual container liveness (and free the dead env's
+                # port/slot) before answering.
+                prune = getattr(dev_mgr, "prune_if_dead", None)
+                if prune is not None:
+                    try:
+                        await prune(ticket_id, provider)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Dev env liveness check failed: %s", exc)
             info = dev_mgr.get_info(ticket_id, provider) if dev_mgr and ticket_id else None
             response = JSONResponse(
                 {"running": info is not None, "url": info.url if info else None}
