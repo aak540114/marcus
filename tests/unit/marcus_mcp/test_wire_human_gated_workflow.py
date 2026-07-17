@@ -16,6 +16,7 @@ import pytest
 
 from src.marcus_mcp.server import (
     _get_dev_env_settings_mgr,
+    _get_gate_settings_mgr,
     _read_bounded_body,
     _resolve_ticket_branch,
     _resolve_ticket_repo_path,
@@ -220,6 +221,62 @@ class TestGetDevEnvSettingsMgr:
 
         mgr_cls.assert_not_called()
         assert result is existing
+
+
+class TestGetGateSettingsMgr:
+    """_get_gate_settings_mgr must return one shared instance per server.
+
+    GateSettingManager loads its JSON file into memory once at
+    construction and never re-reads it, so two instances silently
+    diverge. The concrete failure this pins: a human flipping a project
+    from "ai" to "human" gate via /api/gate-setting wrote through the
+    route's instance while the workflow kept auto-merging off its own
+    stale cache — unsupervised merges continuing AFTER the human turned
+    them off, until the next restart.
+    """
+
+    def test_constructs_once_and_caches_on_server(self):
+        server = SimpleNamespace()
+        with patch("src.core.gate_settings.GateSettingManager") as mgr_cls:
+            mgr_cls.return_value = MagicMock()
+            first = _get_gate_settings_mgr(server)
+            second = _get_gate_settings_mgr(server)
+
+        mgr_cls.assert_called_once()
+        assert first is second
+        assert server._gate_mgr is first
+
+    def test_reuses_a_preexisting_instance(self):
+        server = SimpleNamespace()
+        existing = MagicMock()
+        server._gate_mgr = existing
+
+        with patch("src.core.gate_settings.GateSettingManager") as mgr_cls:
+            result = _get_gate_settings_mgr(server)
+
+        mgr_cls.assert_not_called()
+        assert result is existing
+
+    @pytest.mark.asyncio
+    async def test_workflow_receives_the_shared_gate_manager(self, monkeypatch):
+        """_wire_human_gated_workflow passes the SAME instance the
+        /api/gate-setting routes resolve — not a fresh one."""
+        monkeypatch.delenv("GITEA_URL", raising=False)
+        monkeypatch.delenv("GITEA_TOKEN", raising=False)
+        server = _make_server()
+        shared = MagicMock()
+        server._gate_mgr = shared
+
+        with (
+            patch(
+                "src.workflows.human_gated_workflow.HumanGatedWorkflow",
+                return_value=AsyncMock(),
+            ) as wf_cls,
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+        ):
+            await _wire_human_gated_workflow(server)
+
+        assert wf_cls.call_args.kwargs["gate_settings"] is shared
 
 
 class TestResolveTicketBranch:

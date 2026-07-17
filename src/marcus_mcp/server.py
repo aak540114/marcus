@@ -3212,6 +3212,40 @@ def _get_dev_env_settings_mgr(server: "MarcusServer") -> Any:
     return mgr
 
 
+def _get_gate_settings_mgr(server: "MarcusServer") -> Any:
+    """Return the shared GateSettingManager singleton, constructing it once.
+
+    Must be shared between the ``/api/gate-setting`` routes AND
+    ``HumanGatedWorkflow`` — same reasoning as
+    :func:`_get_dev_env_settings_mgr` above: ``GateSettingManager`` loads
+    its JSON file into memory once at construction and never re-reads it,
+    so two separate instances silently diverge. Concretely: a human
+    flipping a project from "ai" to "human" gate in the Kanboard UI wrote
+    through the route's instance while the workflow kept auto-merging off
+    its stale cache — unsupervised merges continuing AFTER the human
+    turned them off, until the next restart. (The reverse flip silently
+    never activated, and the stale instance's legacy-format migration
+    saves could clobber the route's writes wholesale.)
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    GateSettingManager
+        The shared gate settings manager.
+    """
+    from src.core.gate_settings import GateSettingManager
+
+    mgr = getattr(server, "_gate_mgr", None)
+    if mgr is None:
+        mgr = GateSettingManager()
+        server._gate_mgr = mgr  # type: ignore[attr-defined]
+    return mgr
+
+
 def _resolve_ticket_branch(server: "MarcusServer", ticket_id: str, provider: str) -> str:
     """Return a ticket's real persisted branch name, falling back to convention.
 
@@ -3439,6 +3473,12 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
         provider_name=server.provider,
         project_sync=project_sync,
         dev_env_manager=dev_env_mgr,
+        # MUST be the same instance the /api/gate-setting routes write
+        # through (see _get_gate_settings_mgr) — GateSettingManager caches
+        # its file in memory at construction, so a separate instance here
+        # would keep auto-merging off a stale "ai" gate after a human
+        # switched the project back to human-gated in the UI.
+        gate_settings=_get_gate_settings_mgr(server),
     )
     register_workflow(workflow)
     await workflow.start()
@@ -3911,12 +3951,7 @@ function save() {{
                 Body (JSON): {"ticket_id": str, "gate": "human"|"ai"|null}
                   (null resets the ticket to inherit the project setting)
             """
-            from src.core.gate_settings import GateSettingManager
-
-            gate_mgr = getattr(server, "_gate_mgr", None)
-            if gate_mgr is None:
-                gate_mgr = GateSettingManager()
-                server._gate_mgr = gate_mgr  # type: ignore[attr-defined]
+            gate_mgr = _get_gate_settings_mgr(server)
 
             path = request.url.path  # e.g. /api/gate-setting/project
 
