@@ -401,6 +401,100 @@ class TestStatusChangedTrigger:
 
 
 # ---------------------------------------------------------------------------
+# Per-project branch manager resolution
+# ---------------------------------------------------------------------------
+
+
+class TestPerProjectBranchManager:
+    """Branch operations must target the ticket's project repo.
+
+    A single default BranchManager binds to os.getcwd() — Marcus's own
+    directory, never the project's clone under data/repos/<slug>. Branch
+    create/merge/rebase/diff running there either all fail (CWD not a git
+    repo) or, worse, "succeed" against the wrong repository — tickets get
+    marked DONE and Merged while the agent's real commits are never merged.
+    _branch_for_ticket resolves the ticket → project → local_repo_path
+    mapping and returns a BranchManager bound to that path.
+    """
+
+    def _wire_project(self, workflow, mock_kanban, repo_path="/data/repos/app"):
+        """Wire a project_sync mock + a kanban task that resolves project 3."""
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        project_sync = MagicMock()
+        project_sync.get_repo_for_project = MagicMock(
+            return_value={
+                "local_repo_path": repo_path,
+                "gitea_repo_url": "http://gitea:3000/root/app.git",
+            }
+        )
+        workflow._project_sync = project_sync
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_default_without_project_sync(
+        self, workflow, mock_branch
+    ):
+        """No project sync wired → the constructor-supplied manager is used."""
+        mgr = await workflow._branch_for_ticket("5")
+        assert mgr is mock_branch
+
+    @pytest.mark.asyncio
+    async def test_resolves_manager_bound_to_project_repo(
+        self, workflow, mock_kanban, mock_branch
+    ):
+        """With a repo mapping, the manager's repo_path is the project clone."""
+        self._wire_project(workflow, mock_kanban)
+
+        mgr = await workflow._branch_for_ticket("5")
+
+        assert mgr is not mock_branch
+        assert mgr.config.repo_path == "/data/repos/app"
+
+    @pytest.mark.asyncio
+    async def test_manager_is_cached_per_repo_path(
+        self, workflow, mock_kanban
+    ):
+        """Two tickets in the same project share one BranchManager."""
+        self._wire_project(workflow, mock_kanban)
+
+        first = await workflow._branch_for_ticket("5")
+        second = await workflow._branch_for_ticket("6")
+
+        assert first is second
+
+    @pytest.mark.asyncio
+    async def test_start_ai_work_uses_project_branch_manager(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """_start_ai_work creates the branch in the PROJECT repo, not CWD."""
+        self._wire_project(workflow, mock_kanban)
+        per_project = MagicMock()
+        per_project.create_branch = AsyncMock(return_value=True)
+        per_project.config = MagicMock()
+        per_project.config.main_branch = "main"
+        workflow._branch_managers["/data/repos/app"] = per_project
+
+        lifecycle.get_or_create("40", "kanboard")
+        lifecycle.set_assignee("40", "kanboard", "alice")
+        rec = lifecycle.get("40", "kanboard")
+
+        # The tech-stack gate is not under test here (it consults a real
+        # ProjectDescriptionManager once a project id resolves, which this
+        # test's mock task makes possible for the first time in this suite).
+        workflow._check_project_stack = AsyncMock(return_value=True)
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/40",
+        ):
+            await workflow._start_ai_work("40", rec)
+
+        per_project.create_branch.assert_called_once()
+        mock_branch.create_branch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Trigger: ticket seen for the first time already assigned + workable
 # ---------------------------------------------------------------------------
 

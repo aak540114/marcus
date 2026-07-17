@@ -59,7 +59,7 @@ from src.core.comment_protocol import CommentFormatter, CommentParser
 from src.core.dev_environment import DevEnvironmentManager
 from src.core.events import Events
 from src.core.gate_settings import GateMode, GateSettingManager
-from src.core.git_branch_manager import BranchManager
+from src.core.git_branch_manager import BranchManager, BranchManagerConfig
 from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
     InvalidTransitionError,
@@ -131,6 +131,11 @@ class HumanGatedWorkflow:
         self._provider = provider_name
         self._lifecycle = lifecycle or TicketLifecycleManager()
         self._branch = branch_manager or BranchManager()
+        # Per-project BranchManagers keyed by local repo path — see
+        # _branch_for_ticket. self._branch is only the fallback for
+        # deployments with no project sync (and for tests that inject a
+        # mock branch manager directly).
+        self._branch_managers: Dict[str, BranchManager] = {}
         self._dev_env = dev_env_manager or DevEnvironmentManager()
         self._ac_gen = ac_generator or ACGenerator()
         self._gate = gate_settings or GateSettingManager()
@@ -414,13 +419,14 @@ class HumanGatedWorkflow:
             return
 
         branch_name = record.branch_name
-        main_branch = self._branch.config.main_branch
+        branch_mgr = await self._branch_for_ticket(ticket_id)
+        main_branch = branch_mgr.config.main_branch
 
         merge_msg = (
             f"merge: ticket/{self._provider}/{ticket_id}"
             f" (accepted by {record.assignee})"
         )
-        merged = await self._branch.merge_to_main(
+        merged = await branch_mgr.merge_to_main(
             branch_name,
             commit_message=merge_msg,
         )
@@ -489,11 +495,12 @@ class HumanGatedWorkflow:
 
         branch_name = record.branch_name
 
-        rebased = await self._branch.rebase_on_main(branch_name)
+        branch_mgr = await self._branch_for_ticket(ticket_id)
+        rebased = await branch_mgr.rebase_on_main(branch_name)
         if not rebased:
             await self._post_error(
                 ticket_id,
-                f"Rebase of `{branch_name}` on `{self._branch.config.main_branch}` "
+                f"Rebase of `{branch_name}` on `{branch_mgr.config.main_branch}` "
                 "failed — please resolve conflicts manually.",
             )
             return
@@ -657,7 +664,8 @@ class HumanGatedWorkflow:
         if record is None:
             return False
 
-        commits = await self._branch.get_branch_commits(record.branch_name)
+        branch_mgr = await self._branch_for_ticket(ticket_id)
+        commits = await branch_mgr.get_branch_commits(record.branch_name)
         comment = CommentFormatter.progress(
             ticket_id=ticket_id,
             branch_name=record.branch_name,
@@ -720,7 +728,8 @@ class HumanGatedWorkflow:
         dev_info = self._dev_env.get_info(ticket_id, self._provider)
         dev_url = dev_info.url if dev_info else None
 
-        commits = await self._branch.get_branch_commits(record.branch_name)
+        branch_mgr = await self._branch_for_ticket(ticket_id)
+        commits = await branch_mgr.get_branch_commits(record.branch_name)
         ac_items = self._get_ac_items(record)
         comment = CommentFormatter.ready_for_review(
             ticket_id=ticket_id,
@@ -921,6 +930,73 @@ class HumanGatedWorkflow:
                         kanboard_project_id, project_name
                     )
         return cast(Optional[Dict[str, Any]], mapping)
+
+    async def _branch_for_ticket(self, ticket_id: str) -> BranchManager:
+        """Return a BranchManager bound to the ticket's project repository.
+
+        The constructor's default ``BranchManager()`` binds to
+        ``os.getcwd()`` — Marcus's own directory, never the project's
+        clone under ``data/repos/<slug>``. Running branch operations
+        there either fails outright (CWD not a git repo) or, far worse,
+        "succeeds" against the wrong repository: tickets get marked DONE
+        with a "Merged" comment while the agent's real commits in the
+        project repo are never merged, and AI-gate verification reviews
+        an empty diff. Every branch call site must therefore resolve the
+        ticket → project → ``local_repo_path`` mapping first and operate
+        on that repo.
+
+        Falls back to ``self._branch`` (the constructor-supplied manager)
+        when no project mapping is resolvable — deployments without
+        project sync, and unit tests that inject a mock manager.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+
+        Returns
+        -------
+        BranchManager
+            Manager whose ``config.repo_path`` is the project's local
+            clone; cached per repo path so all tickets of one project
+            share a single instance.
+        """
+        kanboard_project_id: Optional[int] = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                raw = (task.source_context or {}).get("kanboard_task", {})
+                project_id_raw = raw.get("project_id")
+                if project_id_raw:
+                    kanboard_project_id = int(project_id_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not resolve project for ticket %s: %s", ticket_id, exc
+            )
+
+        mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
+        repo_path = mapping.get("local_repo_path") if mapping else None
+        if not repo_path:
+            return self._branch
+
+        cached = self._branch_managers.get(repo_path)
+        if cached is None:
+            # Typed Any: statically this is always a BranchManagerConfig,
+            # but tests inject MagicMock managers whose .config is a mock —
+            # the isinstance guard below must stay reachable for them.
+            base: Any = self._branch.config
+            if isinstance(base, BranchManagerConfig):
+                # Preserve main-branch/remote/user settings from the
+                # configured manager; only the repo path differs.
+                from dataclasses import replace
+
+                cfg = replace(base, repo_path=repo_path)
+            else:
+                # Test doubles carry a mock config — build from defaults.
+                cfg = BranchManagerConfig(repo_path=repo_path)
+            cached = BranchManager(cfg)
+            self._branch_managers[repo_path] = cached
+        return cached
 
     async def start_dev_environment(self, ticket_id: str) -> Optional[str]:
         """Spin up the hot-reload dev environment for a ticket branch.
@@ -1274,7 +1350,8 @@ class HumanGatedWorkflow:
         branch_name = record.branch_name or BranchManager.make_branch_name(
             self._provider, ticket_id
         )
-        created = await self._branch.create_branch(branch_name)
+        branch_mgr = await self._branch_for_ticket(ticket_id)
+        created = await branch_mgr.create_branch(branch_name)
         if not created:
             logger.error(
                 "Failed to create branch %s for ticket %s", branch_name, ticket_id
@@ -1440,7 +1517,8 @@ class HumanGatedWorkflow:
             ``True`` on success.
         """
         branch_name = record.branch_name
-        main_branch = self._branch.config.main_branch
+        branch_mgr = await self._branch_for_ticket(ticket_id)
+        main_branch = branch_mgr.config.main_branch
 
         if not branch_name:
             await self._post_error(
@@ -1499,7 +1577,7 @@ class HumanGatedWorkflow:
         merge_msg = (
             f"merge: ticket/{self._provider}/{ticket_id} (auto-completed, AI gate)"
         )
-        merged = await self._branch.merge_to_main(branch_name, commit_message=merge_msg)
+        merged = await branch_mgr.merge_to_main(branch_name, commit_message=merge_msg)
 
         if not merged:
             # Clean up the verify-round counter so a retry starts fresh.
@@ -1631,7 +1709,8 @@ class HumanGatedWorkflow:
         )
 
         try:
-            diff_text = await self._branch.get_branch_diff(branch_name)
+            branch_mgr = await self._branch_for_ticket(ticket_id)
+            diff_text = await branch_mgr.get_branch_diff(branch_name)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "AI Verify: could not get diff for %s: %s — passing (fail-open)",

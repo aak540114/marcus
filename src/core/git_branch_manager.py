@@ -253,13 +253,30 @@ class BranchManager:
             logger.error("Cannot checkout %s: %s", main, err)
             return False
 
-        # Pull latest.
-        await self._git("pull", self.config.remote, main)
+        # Pull latest. A conflicted pull plants MERGE_HEAD exactly like a
+        # conflicted merge does — abort and fail rather than attempting the
+        # ticket merge on top of a conflicted or stale main.
+        rc, _, err = await self._git("pull", self.config.remote, main)
+        if rc != 0:
+            logger.error(
+                "Pull of %s/%s failed before merging %s: %s",
+                self.config.remote,
+                main,
+                branch_name,
+                err,
+            )
+            await self._git("merge", "--abort")
+            return False
 
-        # Merge.
+        # Merge. On failure, ALWAYS abort: a conflicted merge leaves
+        # MERGE_HEAD and a conflicted index in this shared working tree,
+        # and every subsequent git operation for every other ticket then
+        # fails with "you have not concluded your merge" until someone
+        # manually aborts. Mirrors the abort rebase_on_main already does.
         rc, _, err = await self._git("merge", "--no-ff", branch_name, "-m", msg)
         if rc != 0:
             logger.error("Merge failed for %s → %s: %s", branch_name, main, err)
+            await self._git("merge", "--abort")
             return False
 
         # Push main.
