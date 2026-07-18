@@ -3557,12 +3557,28 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
 
         ac_generator = ACGenerator(llm_generate=ai_engine.generate_text)
 
+    # How many tickets the human-gated workflow may keep in progress at once
+    # (the "how many agents work in parallel" ceiling). Read from the
+    # environment so a Dockerized Marcus can be tuned without a rebuild;
+    # defaults to 3. Invalid or non-positive values fall back to 1 inside
+    # the workflow. A future Kanboard board-header stepper can write this
+    # same value.
+    try:
+        max_parallel_agents = int(os.getenv("MARCUS_MAX_PARALLEL_AGENTS", "3"))
+    except ValueError:
+        logger.warning(
+            "MARCUS_MAX_PARALLEL_AGENTS=%r is not an integer; defaulting to 3",
+            os.getenv("MARCUS_MAX_PARALLEL_AGENTS"),
+        )
+        max_parallel_agents = 3
+
     workflow = HumanGatedWorkflow(
         kanban=server.kanban_client,
         events=server.events,
         provider_name=server.provider,
         project_sync=project_sync,
         dev_env_manager=dev_env_mgr,
+        max_parallel_agents=max_parallel_agents,
         # MUST be the same instance the /api/gate-setting routes write
         # through (see _get_gate_settings_mgr) — GateSettingManager caches
         # its file in memory at construction, so a separate instance here

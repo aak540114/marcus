@@ -107,6 +107,15 @@ class HumanGatedWorkflow:
         Dev environment manager.  Created with defaults if not provided.
     ac_generator : Optional[ACGenerator]
         AC generator (may have an injected LLM callable).
+    max_parallel_agents : int
+        How many tickets this workflow may keep *in progress* at once — the
+        human-set "how many agents work in parallel" ceiling. Each
+        concurrently in-progress ticket is held by a distinct AI *slot*;
+        the first slot's id is :attr:`_agent_id` (kept for the single-agent
+        callers). A slot frees only when its ticket naturally releases
+        (waiting-for-human / blocked / done), so a busy slot is never
+        preempted and in-flight work is never lost. Values below 1 are
+        clamped to 1. Defaults to 1 (classic one-ticket-at-a-time behavior).
     poll_interval : float
         Seconds between board polls for the ``BoardWatcher``.
     """
@@ -123,6 +132,7 @@ class HumanGatedWorkflow:
         ac_generator: Optional[ACGenerator] = None,
         gate_settings: Optional[GateSettingManager] = None,
         ai_verifier: Optional[AIVerifier] = None,
+        max_parallel_agents: int = 1,
         poll_interval: float = 30.0,
     ) -> None:
         """Initialise the workflow."""
@@ -149,8 +159,12 @@ class HumanGatedWorkflow:
             on_error=self._on_watcher_error,
         )
         self._subscribed = False
-        # Unique identifier for this Marcus workflow instance — used as the
-        # agent_id when claiming tickets to prevent duplicate AI work.
+        # How many tickets may be in progress at once (parallel-agent cap).
+        self._max_parallel_agents = max(1, int(max_parallel_agents))
+        # Unique identifier for this Marcus workflow instance. This is slot
+        # 0's claim id; additional parallel slots derive from it (see
+        # _slot_id). Kept as _agent_id for the single-agent callers/tests
+        # that reference it directly.
         self._agent_id = f"marcus-{uuid.uuid4().hex[:8]}"
         # Tracks how many verification rounds have been completed per ticket.
         # Lost on Marcus restart, which is acceptable since verify cycles are
@@ -381,12 +395,7 @@ class HumanGatedWorkflow:
                         )
                     except InvalidTransitionError:
                         pass
-                    try:
-                        self._lifecycle.claim_ticket(
-                            ticket_id, self._provider, self._agent_id
-                        )
-                    except KeyError:
-                        pass
+                    self._reclaim_for_resume(ticket_id)
                 elif (
                     record.state == TicketState.IN_PROGRESS
                     and record.ai_agent_id is not None
@@ -632,12 +641,7 @@ class HumanGatedWorkflow:
                 pass
             # Re-acquire the claim released at review-signal time — same
             # reasoning as the column-move resume in _on_status_changed.
-            try:
-                self._lifecycle.claim_ticket(
-                    ticket_id, self._provider, self._agent_id
-                )
-            except KeyError:
-                pass
+            self._reclaim_for_resume(ticket_id)
 
             # Move kanban column back to in progress.
             try:
@@ -696,12 +700,7 @@ class HumanGatedWorkflow:
                     )
                 except InvalidTransitionError:
                     pass
-                try:
-                    self._lifecycle.claim_ticket(
-                        ticket_id, self._provider, self._agent_id
-                    )
-                except KeyError:
-                    pass
+                self._reclaim_for_resume(ticket_id)
 
             comment = CommentFormatter.revision_requested(
                 ticket_id=ticket_id,
@@ -1414,6 +1413,108 @@ class HumanGatedWorkflow:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Parallel-agent slot pool
+    # ------------------------------------------------------------------
+
+    def _slot_id(self, index: int) -> str:
+        """Return the claim id for parallel slot *index*.
+
+        Slot 0 is :attr:`_agent_id` verbatim (back-compat); every other
+        slot appends its index so the ids are distinct and attributable.
+        ``get_agent_ticket`` matches ids exactly, so ``marcus-abcd1234``
+        (slot 0) and ``marcus-abcd1234-1`` (slot 1) never collide.
+
+        Parameters
+        ----------
+        index : int
+            Slot number in ``range(self._max_parallel_agents)``.
+
+        Returns
+        -------
+        str
+            The slot's claim id.
+        """
+        return self._agent_id if index == 0 else f"{self._agent_id}-{index}"
+
+    def _free_slot_id(self) -> Optional[str]:
+        """Return the id of a free agent slot, or ``None`` if all are busy.
+
+        A slot is free when it currently holds no ticket claim. Slots are
+        scanned in order so slot 0 (``_agent_id``) is preferred, which
+        keeps single-agent behavior byte-for-byte identical.
+
+        Returns
+        -------
+        Optional[str]
+            A free slot's claim id, or ``None`` when at capacity.
+        """
+        for i in range(self._max_parallel_agents):
+            if self._lifecycle.get_agent_ticket(self._slot_id(i)) is None:
+                return self._slot_id(i)
+        return None
+
+    def _slot_holding(self, ticket_id: str) -> Optional[str]:
+        """Return the slot id already holding *ticket_id*, or ``None``.
+
+        Used to make :meth:`_start_ai_work` idempotent: if one of this
+        workflow's slots already claims the ticket, there is nothing new
+        to start.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+
+        Returns
+        -------
+        Optional[str]
+            The holding slot's id, or ``None`` if no slot holds it.
+        """
+        for i in range(self._max_parallel_agents):
+            sid = self._slot_id(i)
+            if self._lifecycle.get_agent_ticket(sid) == ticket_id:
+                return sid
+        return None
+
+    def _busy_ticket_ids(self) -> List[str]:
+        """Return the ticket ids currently held across all slots (for logs)."""
+        held: List[str] = []
+        for i in range(self._max_parallel_agents):
+            tid = self._lifecycle.get_agent_ticket(self._slot_id(i))
+            if tid is not None:
+                held.append(tid)
+        return held
+
+    def _reclaim_for_resume(self, ticket_id: str) -> None:
+        """Re-acquire a claim for a ticket resuming to IN_PROGRESS.
+
+        Called from the resume paths (human moved a waiting card back to
+        in-progress, commented, or edited the AC). Uses a free agent slot;
+        if all slots are busy the ticket is left IN_PROGRESS and unclaimed,
+        so :meth:`_pickup_next_ticket` grabs it as soon as a slot frees —
+        correct backpressure rather than exceeding the parallel-agent cap.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier being resumed.
+        """
+        slot_id = self._free_slot_id()
+        if slot_id is None:
+            logger.info(
+                "No free agent slot to resume ticket %s now (cap=%d, busy=%s); "
+                "leaving it IN_PROGRESS and unclaimed for pickup when a slot frees",
+                ticket_id,
+                self._max_parallel_agents,
+                ", ".join(self._busy_ticket_ids()) or "none",
+            )
+            return
+        try:
+            self._lifecycle.claim_ticket(ticket_id, self._provider, slot_id)
+        except KeyError:
+            pass
+
     async def _start_ai_work(
         self,
         ticket_id: str,
@@ -1452,21 +1553,33 @@ class HumanGatedWorkflow:
             )
             return
 
-        # One-ticket-per-agent: refuse if this agent is already working on
-        # a different ticket.
-        current_ticket = self._lifecycle.get_agent_ticket(self._agent_id)
-        if current_ticket is not None and current_ticket != ticket_id:
+        # Idempotency: if one of this workflow's slots already holds this
+        # ticket, there is nothing new to start (a re-entrant call).
+        if self._slot_holding(ticket_id) is not None:
+            logger.debug(
+                "Ticket %s already held by this workflow; skipping restart",
+                ticket_id,
+            )
+            return
+
+        # Parallel-agent cap: take the next FREE slot. When every slot is
+        # busy the ticket simply waits — it stays available and is picked up
+        # by _pickup_next_ticket the moment a slot frees. This is the
+        # "at most N agents in parallel" ceiling, and busy slots are never
+        # preempted, so in-flight work is never interrupted.
+        slot_id = self._free_slot_id()
+        if slot_id is None:
             logger.info(
-                "Agent %s already working on ticket %s; skipping %s",
-                self._agent_id,
-                current_ticket,
+                "All %d agent slot(s) busy (%s); ticket %s waits for a free slot",
+                self._max_parallel_agents,
+                ", ".join(self._busy_ticket_ids()) or "none",
                 ticket_id,
             )
             return
 
         # Atomically claim the ticket; abort if another agent already has it.
         claimed = self._lifecycle.claim_ticket(
-            ticket_id, self._provider, self._agent_id
+            ticket_id, self._provider, slot_id
         )
         if not claimed:
             current = self._lifecycle.get(ticket_id, self._provider)
@@ -1641,11 +1754,13 @@ class HumanGatedWorkflow:
         return [item.text for item in ac.items]
 
     async def _pickup_next_ticket(self) -> None:
-        """After releasing the current ticket, start the next available one.
+        """Fill every free agent slot with the next available tickets.
 
-        Called whenever this agent's ticket moves to ``WAITING_FOR_HUMAN``,
-        ``BLOCKED``, or ``DONE`` so the agent does not sit idle while other
-        work is ready.
+        Called whenever a ticket moves to ``WAITING_FOR_HUMAN``,
+        ``BLOCKED``, or ``DONE`` (freeing a slot), and at startup, so idle
+        slots do not sit unused while assigned work is ready. Starts work on
+        as many available tickets as there are free slots — up to the
+        parallel-agent cap — and leaves the rest to wait.
 
         Selection order (dependency approximation):
 
@@ -1655,18 +1770,25 @@ class HumanGatedWorkflow:
         """
         candidates = self._lifecycle.get_available_tickets()
         if not candidates:
-            logger.debug("Agent %s has no next ticket to pick up", self._agent_id)
+            logger.debug("No next ticket to pick up (no available work)")
             return
 
         candidates.sort(key=_ticket_priority_key)
-        next_rec = candidates[0]
-        logger.info(
-            "Agent %s picking up next ticket: %s (state=%s)",
-            self._agent_id,
-            next_rec.ticket_id,
-            next_rec.state.value,
-        )
-        await self._start_ai_work(next_rec.ticket_id, next_rec)
+        for next_rec in candidates:
+            # Stop as soon as we are at capacity — remaining tickets wait.
+            if self._free_slot_id() is None:
+                logger.debug(
+                    "All %d agent slot(s) busy; %d ticket(s) still waiting",
+                    self._max_parallel_agents,
+                    len(candidates) - len(self._busy_ticket_ids()),
+                )
+                break
+            logger.info(
+                "Picking up next ticket: %s (state=%s)",
+                next_rec.ticket_id,
+                next_rec.state.value,
+            )
+            await self._start_ai_work(next_rec.ticket_id, next_rec)
 
     def _is_unassigned(self, record: TicketRecord) -> bool:
         """Return ``True`` if no human is assigned to *record*.

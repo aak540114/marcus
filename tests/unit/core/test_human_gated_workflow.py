@@ -1865,3 +1865,258 @@ class TestLifecycleAgentHelpers:
         available = lifecycle.get_available_tickets()
         ids = {r.ticket_id for r in available}
         assert ids == {"420", "421"}
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent parallelism (max_parallel_agents > 1)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiAgentParallelism:
+    """The human-gated workflow can run up to N tickets in parallel.
+
+    ``N = max_parallel_agents``.  Each concurrently in-progress ticket is
+    held by a distinct AI *slot*; the first slot's id is
+    ``workflow._agent_id`` (kept for back-compat with the single-agent
+    callers).  A slot frees ONLY when its ticket naturally releases
+    (waiting-for-human / blocked / done) — a busy slot is never preempted,
+    so in-flight work and its saved ticket context are never lost.
+
+    Every external dependency is mocked; no I/O or network occurs.
+    """
+
+    @pytest.fixture
+    def make_workflow(
+        self, lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen
+    ):
+        """Factory building a workflow with a chosen parallel-agent count."""
+
+        def _factory(n: int) -> HumanGatedWorkflow:
+            return HumanGatedWorkflow(
+                kanban=mock_kanban,
+                events=Events(),
+                provider_name="kanboard",
+                lifecycle=lifecycle,
+                branch_manager=mock_branch,
+                dev_env_manager=mock_dev_env,
+                ac_generator=mock_ac_gen,
+                max_parallel_agents=n,
+            )
+
+        return _factory
+
+    def _ready_assigned(self, lifecycle, tid: str, who: str = "alice") -> Any:
+        """Create a READY, human-assigned, unclaimed ticket and return it."""
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.set_assignee(tid, "kanboard", who)
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_two_tickets_run_in_parallel(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """With N=2, two assigned tickets are both claimed and started."""
+        wf = make_workflow(2)
+        rec_a = self._ready_assigned(lifecycle, "10")
+        rec_b = self._ready_assigned(lifecycle, "11")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await wf._start_ai_work("10", rec_a)
+            await wf._start_ai_work("11", rec_b)
+
+        a = lifecycle.get("10", "kanboard")
+        b = lifecycle.get("11", "kanboard")
+        assert a.ai_agent_id is not None
+        assert b.ai_agent_id is not None
+        # Two parallel tickets are held by two DIFFERENT slots.
+        assert a.ai_agent_id != b.ai_agent_id
+        assert a.state == TicketState.IN_PROGRESS
+        assert b.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_first_slot_is_agent_id(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """The first claimed slot equals workflow._agent_id (back-compat)."""
+        wf = make_workflow(3)
+        rec_a = self._ready_assigned(lifecycle, "10")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await wf._start_ai_work("10", rec_a)
+
+        assert lifecycle.get("10", "kanboard").ai_agent_id == wf._agent_id
+
+    @pytest.mark.asyncio
+    async def test_capacity_cap_refuses_extra_ticket(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """With N=2 and both slots busy, a third ticket is not claimed."""
+        wf = make_workflow(2)
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            for tid in ("10", "11"):
+                await wf._start_ai_work(tid, self._ready_assigned(lifecycle, tid))
+            rec_c = self._ready_assigned(lifecycle, "12")
+            await wf._start_ai_work("12", rec_c)
+
+        # Third ticket waits — no free slot.
+        assert lifecycle.get("12", "kanboard").ai_agent_id is None
+        assert lifecycle.get("12", "kanboard").state == TicketState.READY
+
+    @pytest.mark.asyncio
+    async def test_pickup_fills_all_free_slots(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """_pickup_next_ticket claims up to N available tickets at once."""
+        wf = make_workflow(3)
+        for tid in ("10", "11", "12", "13"):
+            self._ready_assigned(lifecycle, tid)
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await wf._pickup_next_ticket()
+
+        claimed = [
+            tid
+            for tid in ("10", "11", "12", "13")
+            if lifecycle.get(tid, "kanboard").ai_agent_id is not None
+        ]
+        # Exactly N=3 claimed; the 4th waits for a free slot.
+        assert len(claimed) == 3
+        assert lifecycle.get("13", "kanboard").ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_freed_slot_reused_without_preempting_the_other(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """Completing one ticket frees its slot for a waiting ticket.
+
+        The OTHER in-flight ticket must never be preempted — its claim and
+        slot stay exactly as they were.
+        """
+        wf = make_workflow(2)
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            # Two tickets running in parallel; a third waiting.
+            for tid in ("10", "11"):
+                await wf._start_ai_work(tid, self._ready_assigned(lifecycle, tid))
+            self._ready_assigned(lifecycle, "12")
+
+            slot_of_11_before = lifecycle.get("11", "kanboard").ai_agent_id
+
+            # Ticket 10 hands off for review → releases its slot, triggers pickup.
+            result = await wf.signal_ready_for_review("10")
+
+        assert result is True
+        # Ticket 10 released and waiting for human.
+        rec10 = lifecycle.get("10", "kanboard")
+        assert rec10.state == TicketState.WAITING_FOR_HUMAN
+        assert rec10.ai_agent_id is None
+        # The freed slot was reused: waiting ticket 12 is now claimed + started.
+        rec12 = lifecycle.get("12", "kanboard")
+        assert rec12.ai_agent_id is not None
+        assert rec12.state == TicketState.IN_PROGRESS
+        # Ticket 11 was NOT preempted — same claim, same slot.
+        assert lifecycle.get("11", "kanboard").ai_agent_id == slot_of_11_before
+
+    @pytest.mark.asyncio
+    async def test_default_is_single_agent(
+        self, lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen
+    ):
+        """Omitting max_parallel_agents keeps the one-ticket-at-a-time gate."""
+        wf = HumanGatedWorkflow(
+            kanban=mock_kanban,
+            events=Events(),
+            provider_name="kanboard",
+            lifecycle=lifecycle,
+            branch_manager=mock_branch,
+            dev_env_manager=mock_dev_env,
+            ac_generator=mock_ac_gen,
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await wf._start_ai_work("10", self._ready_assigned(lifecycle, "10"))
+            await wf._start_ai_work("11", self._ready_assigned(lifecycle, "11"))
+
+        # Only the first ticket is claimed; the second waits.
+        assert lifecycle.get("10", "kanboard").ai_agent_id is not None
+        assert lifecycle.get("11", "kanboard").ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_resume_waits_when_all_slots_busy(
+        self, make_workflow, lifecycle, mock_kanban
+    ):
+        """A resumed ticket waits (unclaimed) when no slot is free.
+
+        With N=1 and the single slot busy on another ticket, a human
+        comment on a waiting ticket must NOT exceed the cap: the ticket
+        transitions back to IN_PROGRESS but stays unclaimed until a slot
+        frees. This is the backpressure that keeps the parallel cap honest
+        without preempting the in-flight ticket.
+        """
+        wf = make_workflow(1)
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            # The single slot is busy on ticket 10.
+            await wf._start_ai_work("10", self._ready_assigned(lifecycle, "10"))
+
+            # Ticket 20 is waiting-for-human; a human comments to resume it.
+            lifecycle.get_or_create("20", "kanboard")
+            lifecycle.transition("20", "kanboard", TicketState.READY)
+            lifecycle.transition("20", "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition("20", "kanboard", TicketState.WAITING_FOR_HUMAN)
+            lifecycle.set_assignee("20", "kanboard", "bob")
+
+            event = _make_event(
+                {"ticket_id": "20", "comment_body": "please continue",
+                 "comment_author": "bob", "provider": "kanboard"}
+            )
+            await wf._on_comment_added(event)
+
+        rec20 = lifecycle.get("20", "kanboard")
+        # Transitioned back to IN_PROGRESS but left unclaimed (cap reached).
+        assert rec20.state == TicketState.IN_PROGRESS
+        assert rec20.ai_agent_id is None
+        # Ticket 10 keeps its claim — never preempted.
+        assert lifecycle.get("10", "kanboard").ai_agent_id == wf._agent_id
+
+    @pytest.mark.asyncio
+    async def test_invalid_count_coerced_to_one(
+        self, lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen
+    ):
+        """A non-positive max_parallel_agents is clamped up to 1 (never zero)."""
+        wf = HumanGatedWorkflow(
+            kanban=mock_kanban,
+            events=Events(),
+            provider_name="kanboard",
+            lifecycle=lifecycle,
+            branch_manager=mock_branch,
+            dev_env_manager=mock_dev_env,
+            ac_generator=mock_ac_gen,
+            max_parallel_agents=0,
+        )
+        assert wf._max_parallel_agents == 1
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await wf._start_ai_work("10", self._ready_assigned(lifecycle, "10"))
+        # Still works as a single agent.
+        assert lifecycle.get("10", "kanboard").ai_agent_id is not None
