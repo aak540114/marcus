@@ -28,7 +28,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import httpx
 
@@ -62,13 +62,28 @@ class ProjectWatcher:
         events: Events,
         poll_interval: float = 60.0,
         state_path: str = "./data/known_projects.json",
+        is_provisioned: Optional[Callable[[int], bool]] = None,
     ) -> None:
-        """Initialise the watcher."""
+        """Initialise the watcher.
+
+        Parameters
+        ----------
+        is_provisioned : Optional[Callable[[int], bool]]
+            Predicate returning ``True`` when a project already has its
+            downstream resource (a Gitea repo mapping). When supplied, it —
+            not the persisted "known" set — decides whether to emit:
+            ``project.created`` is re-emitted every poll until the project
+            is provisioned, so a FAILED creation (e.g. a bad Gitea token
+            scope returning 403) is retried instead of being skipped
+            forever after the first sighting. Without it, the legacy
+            emit-once-per-id behaviour applies.
+        """
         self._rpc_url = kanboard_url
         self._auth = httpx.BasicAuth("jsonrpc", api_token)
         self._events = events
         self._poll_interval = poll_interval
         self._state_path = state_path
+        self._is_provisioned = is_provisioned
 
         self._known_ids: Set[int] = self._load_known_ids()
         self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
@@ -122,11 +137,25 @@ class ProjectWatcher:
 
         for project in projects:
             pid = int(project.get("id", 0))
-            if pid and pid not in self._known_ids:
-                self._known_ids.add(pid)
+            if not pid:
+                continue
+            if self._needs_emit(pid):
                 await self._emit_project_created(project)
+            self._known_ids.add(pid)
 
         self._save_known_ids()
+
+    def _needs_emit(self, pid: int) -> bool:
+        """Whether ``project.created`` should be emitted for *pid* now.
+
+        With an ``is_provisioned`` predicate, emit whenever the project is
+        NOT yet provisioned — so a failed downstream creation is retried
+        each poll until it succeeds. Without one, fall back to
+        emit-once-per-id via the persisted known set.
+        """
+        if self._is_provisioned is not None:
+            return not self._is_provisioned(pid)
+        return pid not in self._known_ids
 
     # ------------------------------------------------------------------
     # Private helpers

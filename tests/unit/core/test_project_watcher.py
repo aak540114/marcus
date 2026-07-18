@@ -212,3 +212,69 @@ class TestEventSource:
 
         call_kwargs = events.publish.call_args[1]
         assert call_kwargs["source"] == "project_watcher"
+
+
+class TestIsProvisionedRetry:
+    """With an is_provisioned callback, un-provisioned projects re-emit.
+
+    Regression: the watcher marked a project 'known' the first time it saw
+    it, then never re-emitted — so if repo creation FAILED downstream (e.g.
+    a bad Gitea token scope → 403), the project was skipped forever and the
+    repo never got created even after the token was fixed. When given an
+    is_provisioned(pid) predicate (wired to the real repo mapping), the
+    watcher re-emits every poll until the repo actually exists, then stops.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reemits_until_provisioned(self, state_file, events):
+        provisioned: set = set()
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_provisioned=lambda pid: pid in provisioned,
+        )
+        projects = [{"id": 5, "name": "App", "description": ""}]
+        with patch.object(
+            ProjectWatcher, "_fetch_projects", AsyncMock(return_value=projects)
+        ):
+            await w.poll_once()          # not provisioned → emit (attempt 1)
+            await w.poll_once()          # still not provisioned → emit again
+            assert events.publish.await_count == 2
+            provisioned.add(5)           # repo now exists
+            await w.poll_once()          # provisioned → no more emits
+        assert events.publish.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_provisioned_project_never_emits(self, state_file, events):
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_provisioned=lambda pid: True,  # already has a repo
+        )
+        projects = [{"id": 7, "name": "Existing", "description": ""}]
+        with patch.object(
+            ProjectWatcher, "_fetch_projects", AsyncMock(return_value=projects)
+        ):
+            await w.poll_once()
+        events.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_without_callback_uses_known_set(self, state_file, events):
+        """No callback → legacy behaviour: emit once per project id."""
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+        )
+        projects = [{"id": 9, "name": "One", "description": ""}]
+        with patch.object(
+            ProjectWatcher, "_fetch_projects", AsyncMock(return_value=projects)
+        ):
+            await w.poll_once()
+            await w.poll_once()
+        assert events.publish.await_count == 1

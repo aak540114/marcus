@@ -3476,6 +3476,15 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
                     api_token=kb_token,
                     events=server.events,
                     state_path="./data/known_projects.json",
+                    # Re-emit until the repo actually exists (mapping is the
+                    # source of truth), so a project whose repo creation
+                    # FAILED once — e.g. a bad Gitea token scope 403'd — is
+                    # retried on later polls instead of being marked "seen"
+                    # and skipped forever.
+                    is_provisioned=lambda pid: project_sync.get_repo_for_project(
+                        pid
+                    )
+                    is not None,
                 )
                 await watcher.start()
                 server._project_watcher = watcher  # type: ignore[attr-defined]

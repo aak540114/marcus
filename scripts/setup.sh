@@ -479,26 +479,43 @@ if ! docker compose exec -T -u git gitea gitea admin user create \
 fi
 rm -f "$create_log"
 
-log "Checking for a valid Gitea access token..."
+log "Checking the Gitea access token can actually create repositories..."
 gitea_token="$(env_get GITEA_TOKEN)"
 token_valid="false"
 if [ -n "$gitea_token" ]; then
-    http_code="$(curl -s -o /dev/null -w '%{http_code}' \
+    # A read check (GET /api/v1/user) is NOT enough: creating a repo needs
+    # BOTH write:repository AND write:user scope (Gitea gates POST
+    # /user/repos on the /user route group AND the /repos route). A token
+    # with only read:user passes GET /user but 403s on repo creation — the
+    # exact failure that left projects without repos. So probe the real
+    # capability: create a throwaway private repo and delete it. A 201
+    # (created) or 409 (already exists → auth+scope passed) means the token
+    # can provision repos; 403/401 means it can't.
+    probe_repo="marcus-setup-token-probe"
+    probe_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
         -H "Authorization: token ${gitea_token}" \
-        http://localhost:3000/api/v1/user || echo 000)"
-    [ "$http_code" = "200" ] && token_valid="true"
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"${probe_repo}\",\"private\":true,\"auto_init\":false}" \
+        http://localhost:3000/api/v1/user/repos || echo 000)"
+    if [ "$probe_code" = "201" ] || [ "$probe_code" = "409" ]; then
+        token_valid="true"
+        # Best-effort cleanup of the probe repo (needs the same scopes).
+        curl -s -o /dev/null -X DELETE \
+            -H "Authorization: token ${gitea_token}" \
+            "http://localhost:3000/api/v1/repos/root/${probe_repo}" || true
+    fi
 fi
 
 if [ "$token_valid" = "false" ]; then
-    log "Generating a new Gitea access token..."
+    log "Generating a new Gitea access token (existing one missing or lacking repo-create scope)..."
     token_name="marcus-$(date +%s)"
     gitea_token="$(docker compose exec -T -u git gitea gitea admin user generate-access-token \
         --username root --token-name "$token_name" \
         --scopes write:repository,write:user --raw | tr -d '\r\n')"
     env_set GITEA_TOKEN "$gitea_token"
-    log "Gitea token generated."
+    log "Gitea token generated with write:repository,write:user scopes."
 else
-    log "Existing Gitea token is still valid — reusing it."
+    log "Existing Gitea token can create repositories — reusing it."
 fi
 
 # ---------------------------------------------------------------------
