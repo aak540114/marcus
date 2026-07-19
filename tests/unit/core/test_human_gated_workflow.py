@@ -1267,10 +1267,7 @@ class TestAgentGitUrls:
         task.name = "Build it"
         task.description = ""
         task.source_context = {"kanboard_task": {"project_id": 3}}
-        task.priority = None
         task.labels = []
-        task.due_date = None
-        task.estimated_hours = None
         mock_kanban.get_task_by_id = AsyncMock(return_value=task)
 
         gitea = MagicMock()
@@ -1356,67 +1353,49 @@ class TestRepoLinksForKanboardUI:
 
 
 # ---------------------------------------------------------------------------
-# get_work_context: enriched ticket data (priority/labels/due_date/
-# estimated_hours/links/recent_comments)
+# get_work_context: enriched ticket data (labels/links/recent_comments)
 # ---------------------------------------------------------------------------
 
 
-def _make_task_mock(
-    priority=None, labels=None, due_date=None, estimated_hours=None
-):
+def _make_task_mock(labels=None):
     """Build a minimal Task-like mock carrying only the fields
     get_work_context reads for the enrichment fields."""
     task = MagicMock()
     task.name = "Enriched ticket"
     task.description = "desc"
     task.source_context = {"kanboard_task": {"project_id": 9}}
-    task.priority = priority
     task.labels = labels or []
-    task.due_date = due_date
-    task.estimated_hours = estimated_hours
     return task
 
 
 class TestGetWorkContextEnrichedFields:
-    """get_work_context surfaces priority/labels/due_date/estimated_hours
-    (already parsed onto the Task by the provider) and links/comments
-    (fetched via optional provider methods), instead of discarding them."""
+    """get_work_context surfaces labels (parsed onto the Task by the
+    provider) and links/comments (fetched via optional provider methods).
+
+    Priority, due date, and estimated hours are deliberately NOT surfaced —
+    they don't help an agent do the work."""
 
     @pytest.mark.asyncio
-    async def test_priority_and_labels_surfaced(self, workflow, lifecycle, mock_kanban):
+    async def test_labels_surfaced(self, workflow, lifecycle, mock_kanban):
         lifecycle.get_or_create("60", "kanboard")
-        from src.core.models import Priority
-
         mock_kanban.get_task_by_id = AsyncMock(
-            return_value=_make_task_mock(
-                priority=Priority.HIGH, labels=["backend", "urgent"]
-            )
+            return_value=_make_task_mock(labels=["backend", "urgent"])
         )
         ctx = await workflow.get_work_context("60")
-        assert ctx["priority"] == "high"
         assert ctx["labels"] == ["backend", "urgent"]
 
     @pytest.mark.asyncio
-    async def test_due_date_serialized_to_iso_string(self, workflow, lifecycle, mock_kanban):
-        from datetime import datetime, timezone
-
-        lifecycle.get_or_create("61", "kanboard")
-        due = datetime(2026, 8, 1, tzinfo=timezone.utc)
-        mock_kanban.get_task_by_id = AsyncMock(
-            return_value=_make_task_mock(due_date=due)
-        )
-        ctx = await workflow.get_work_context("61")
-        assert ctx["due_date"] == due.isoformat()
-
-    @pytest.mark.asyncio
-    async def test_missing_priority_and_due_date_are_none(self, workflow, lifecycle, mock_kanban):
+    async def test_priority_due_date_estimated_hours_not_returned(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Removed context fields must not appear in the response at all."""
         lifecycle.get_or_create("62", "kanboard")
         mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
         ctx = await workflow.get_work_context("62")
-        assert ctx["priority"] is None
-        assert ctx["due_date"] is None
+        assert "priority" not in ctx
+        assert "due_date" not in ctx
+        assert "estimated_hours" not in ctx
         assert ctx["labels"] == []
-        assert ctx["estimated_hours"] is None
 
     @pytest.mark.asyncio
     async def test_links_fetched_when_kanban_supports_it(self, workflow, lifecycle, mock_kanban):

@@ -636,10 +636,10 @@ async def get_work_context(
     -------
     Dict[str, Any]
         ``{success, result: {ticket_id, provider, title, description,
-        acceptance_criteria, branch_name, local_repo_path, gitea_repo_url,
-        state, assignee, priority, labels, due_date, estimated_hours,
-        links, recent_comments, mcp_server_url, instructions}}`` or
-        ``{success: False, error}``. ``links`` is
+        acceptance_criteria, branch_name, clone_url, repo_web_url,
+        branch_web_url, local_repo_path, gitea_repo_url, state, assignee,
+        labels, links, recent_comments, mcp_server_url, gate_mode,
+        instructions}}`` or ``{success: False, error}``. ``links`` is
         ``{depends_on, blocks, relates_to}`` (each a list of
         ``{task_id, title, column}``); ``recent_comments`` is the last 10
         comments on the ticket, oldest first, each
@@ -660,17 +660,14 @@ async def get_work_context(
           "description": "Users need a checkout button ...",
           "acceptance_criteria": "- [ ] Button visible on cart page\\n- [ ] ...",
           "branch_name": "ticket/kanboard/42",
-          "local_repo_path": "./repos/my-app",
-          "gitea_repo_url": "http://localhost:3000/root/my-app.git",
+          "clone_url": "http://root:<token>@localhost:3000/root/my-app.git",
+          "branch_web_url": "http://localhost:3000/root/my-app/src/branch/ticket/kanboard/42",
           "state": "in_progress",
-          "priority": "high",
           "labels": ["frontend"],
-          "due_date": null,
-          "estimated_hours": 2.0,
           "links": {"depends_on": [], "blocks": [], "relates_to": []},
           "recent_comments": [],
-          "mcp_server_url": "http://localhost:4298/mcp",
-          "instructions": "1. cd into local_repo_path ..."
+          "gate_mode": "human",
+          "instructions": "1. git clone <clone_url> into your own dir ..."
         }
     """
     ticket_id = arguments.get("ticket_id", "")

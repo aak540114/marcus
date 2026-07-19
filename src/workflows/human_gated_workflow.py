@@ -1328,10 +1328,7 @@ class HumanGatedWorkflow:
         title = ticket_id
         description = ""
         kanboard_project_id: Optional[int] = None
-        priority: Optional[str] = None
         labels: List[str] = []
-        due_date: Optional[str] = None
-        estimated_hours: Optional[float] = None
         try:
             task = await self._kanban.get_task_by_id(ticket_id)
             if task:
@@ -1342,12 +1339,8 @@ class HumanGatedWorkflow:
                 project_id_raw = raw.get("project_id")
                 if project_id_raw:
                     kanboard_project_id = int(project_id_raw)
-                # Already parsed onto the Task object by the provider — no
-                # extra API calls needed to surface these to the agent.
-                priority = task.priority.value if task.priority else None
+                # Already parsed onto the Task object by the provider.
                 labels = task.labels or []
-                due_date = task.due_date.isoformat() if task.due_date else None
-                estimated_hours = task.estimated_hours or None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch task %s from kanban: %s", ticket_id, exc)
 
@@ -1424,10 +1417,7 @@ class HumanGatedWorkflow:
             "state": record.state.value,
             "assignee": record.assignee,
             "already_claimed_by": record.ai_agent_id,
-            "priority": priority,
             "labels": labels,
-            "due_date": due_date,
-            "estimated_hours": estimated_hours,
             "links": links,
             "recent_comments": recent_comments,
             # Informational reconnect hint. Hardcoding localhost handed a

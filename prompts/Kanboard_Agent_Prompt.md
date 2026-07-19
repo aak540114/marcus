@@ -83,10 +83,7 @@ The response contains:
 | `local_repo_path` | Marcus's OWN internal clone path — **do not use it** as your workspace (it's shared / may be on another host); always clone `clone_url` yourself |
 | `gitea_repo_url` | Marcus-internal Gitea remote (not browser-reachable; prefer `clone_url`) |
 | `state` | Should be `in_progress` — if not, do not proceed |
-| `priority` | `low` / `medium` / `high` / `urgent`, or `null` if unset |
 | `labels` | Kanboard tags on the ticket, e.g. `["backend", "urgent"]` |
-| `due_date` | ISO 8601 timestamp, or `null` |
-| `estimated_hours` | Time estimate from Kanboard, or `null` |
 | `links` | `{depends_on, blocks, relates_to}` — other tickets this one is connected to. Check `depends_on` before starting: those tickets should be done first |
 | `recent_comments` | Up to the last 10 comments on the ticket, oldest first — `{content, author, date}`. **Read this if the ticket was ever sent to `signal_waiting_for_human`** — a human's reply here is the only place their clarification text appears |
 | `mcp_server_url` | MCP endpoint (already connected) |
