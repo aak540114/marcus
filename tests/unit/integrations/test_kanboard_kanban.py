@@ -672,18 +672,78 @@ class TestGetTaskLinks:
 class TestMoveTaskToColumn:
     """Test move_task_to_column()."""
 
+    @staticmethod
+    def _rpc_methods(kanban):
+        """Return the JSON-RPC method names issued through the mocked client."""
+        return [
+            c.kwargs["json"]["method"]
+            for c in kanban._client.post.call_args_list
+        ]
+
     @pytest.mark.asyncio
     async def test_moves_to_known_column(self, kanban):
         """move_task_to_column() calls moveTaskPosition with the correct column ID."""
         kanban._client = AsyncMock()
         kanban._column_map = {"in progress": 2, "done": 3}
         kanban._column_status_map = {2: TaskStatus.IN_PROGRESS, 3: TaskStatus.DONE}
-        # moveTaskPosition → True; openTask response
+        # moveTaskPosition → True; getTask shows an already-open task.
         kanban._client.post = AsyncMock(
-            side_effect=[_rpc_response(True), _rpc_response(True)]
+            side_effect=[
+                _rpc_response(True),
+                _rpc_response(_make_raw_task(task_id=5, column_id=2, is_active=1)),
+            ]
         )
         result = await kanban.move_task_to_column("5", "In Progress")
         assert result is True
+        # Task already open + non-done target → NO openTask (a spurious
+        # openTask fires a task.open webhook on every move — the feedback
+        # loop that locked Kanboard's SQLite).
+        assert "openTask" not in self._rpc_methods(kanban)
+
+    @pytest.mark.asyncio
+    async def test_closed_task_reopened_when_moved_to_workable_column(
+        self, kanban
+    ):
+        """A board-closed task moved to a non-done column IS reopened."""
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2}
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS}
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(True),
+                _rpc_response(_make_raw_task(task_id=5, column_id=2, is_active=0)),
+                _rpc_response(True),  # openTask
+            ]
+        )
+        result = await kanban.move_task_to_column("5", "In Progress")
+        assert result is True
+        assert "openTask" in self._rpc_methods(kanban)
+
+    @pytest.mark.asyncio
+    async def test_open_task_closed_when_moved_to_done(self, kanban):
+        """An open task moved to Done gets closeTask; a closed one does not."""
+        kanban._client = AsyncMock()
+        kanban._column_map = {"done": 3}
+        kanban._column_status_map = {3: TaskStatus.DONE}
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(True),
+                _rpc_response(_make_raw_task(task_id=5, column_id=3, is_active=1)),
+                _rpc_response(True),  # closeTask
+            ]
+        )
+        assert await kanban.move_task_to_column("5", "Done") is True
+        assert "closeTask" in self._rpc_methods(kanban)
+
+        # Already-closed task → no closeTask (no spurious task.close event).
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(True),
+                _rpc_response(_make_raw_task(task_id=5, column_id=3, is_active=0)),
+            ]
+        )
+        assert await kanban.move_task_to_column("5", "Done") is True
+        assert "closeTask" not in self._rpc_methods(kanban)
 
     @pytest.mark.asyncio
     async def test_returns_false_for_unknown_column(self, kanban):
@@ -707,13 +767,12 @@ class TestMoveTaskToColumn:
         kanban._client = AsyncMock()
         kanban._column_map = {"in progress": 2, "done": 3}
         kanban._column_status_map = {2: TaskStatus.IN_PROGRESS, 3: TaskStatus.DONE}
-        # moveTaskPosition → False; getTask shows column_id already 2;
-        # openTask → True.
+        # moveTaskPosition → False; getTask shows column_id already 2 and
+        # the task already open — no openTask needed (raw is reused).
         kanban._client.post = AsyncMock(
             side_effect=[
                 _rpc_response(False),
-                _rpc_response(_make_raw_task(task_id=5, column_id=2)),
-                _rpc_response(True),
+                _rpc_response(_make_raw_task(task_id=5, column_id=2, is_active=1)),
             ]
         )
         result = await kanban.move_task_to_column("5", "In Progress")

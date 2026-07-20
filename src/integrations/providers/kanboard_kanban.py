@@ -303,7 +303,10 @@ class KanboardKanban(KanbanInterface):
         task_data : Dict[str, Any]
             Expected keys: ``name`` (required), ``description``,
             ``priority``, ``estimated_hours`` (in hours — Kanboard's
-            native ``time_estimated`` unit).
+            native ``time_estimated`` unit), and optionally ``project_id``
+            to create the task in a specific project (defaults to the
+            configured project — sub-tickets must land in their PARENT's
+            project, which may differ).
 
         Returns
         -------
@@ -321,7 +324,7 @@ class KanboardKanban(KanbanInterface):
 
         task_id = await self._rpc(
             "createTask",
-            project_id=self._project_id,
+            project_id=int(task_data.get("project_id") or self._project_id),
             title=task_data.get("name", ""),
             description=task_data.get("description", ""),
             priority=kb_priority,
@@ -480,6 +483,7 @@ class KanboardKanban(KanbanInterface):
             swimlane_id=0,
         )
 
+        raw: Optional[Dict[str, Any]] = None
         if not result:
             # Kanboard's TaskPositionModel::movePosition() returns false
             # both on genuine failures AND when the task is already in the
@@ -491,11 +495,20 @@ class KanboardKanban(KanbanInterface):
             if not raw or int(raw.get("column_id") or 0) != column_id:
                 return False
 
-        # Update closed/open flag based on target column status
+        # Sync the closed/open flag ONLY when it actually differs from the
+        # target column's status. Unconditionally calling openTask/closeTask
+        # made Kanboard fire a task.open/task.close webhook on every single
+        # column move — and openTask on a board-closed task with a stale
+        # lifecycle record fed a reopen→move→openTask→reopen feedback loop
+        # that flooded Kanboard until its SQLite locked up.
+        if raw is None:
+            raw = await self._rpc("getTask", task_id=int(task_id))
+        is_active = int((raw or {}).get("is_active", 1) or 0)
         target_status = self._column_status_map.get(column_id)
         if target_status == TaskStatus.DONE:
-            await self._rpc("closeTask", task_id=int(task_id))
-        else:
+            if is_active == 1:
+                await self._rpc("closeTask", task_id=int(task_id))
+        elif is_active == 0:
             await self._rpc("openTask", task_id=int(task_id))
         return True
 

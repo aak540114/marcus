@@ -668,6 +668,22 @@ class HumanGatedWorkflow:
         if record is None:
             return
 
+        # Only a genuinely COMPLETED ticket can be "reopened". Kanboard's
+        # task.open event also fires when openTask touches a board-closed
+        # task whose lifecycle record never reached DONE (e.g. stale records
+        # from before the drag-to-Done merge fix). Without this guard, that
+        # event triggered a catastrophic feedback loop: reopen → release
+        # claim → pickup re-claims → move column → openTask → task.open →
+        # reopen … flooding Kanboard with RPCs until its SQLite locked
+        # ("database is locked") and every real board update failed.
+        if record.state != TicketState.DONE:
+            logger.debug(
+                "Ignoring reopen for %s: record state is %s, not DONE",
+                ticket_id,
+                record.state.value,
+            )
+            return
+
         branch_name = record.branch_name
 
         branch_mgr = await self._branch_for_ticket(ticket_id)
@@ -1016,11 +1032,16 @@ class HumanGatedWorkflow:
             return []
 
         title, description = ticket_id, ""
+        parent_project_id: Optional[int] = None
         try:
             task = await self._kanban.get_task_by_id(ticket_id)
             if task:
                 title = task.name or title
                 description = task.description or ""
+                raw = (task.source_context or {}).get("kanboard_task", {})
+                pid_raw = raw.get("project_id")
+                if pid_raw:
+                    parent_project_id = int(pid_raw)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Decompose: could not fetch %s: %s", ticket_id, exc)
 
@@ -1040,10 +1061,16 @@ class HumanGatedWorkflow:
                     f"\n\n## Acceptance Criteria\n{s['acceptance_criteria']}"
                 )
             child_desc += f"\n\n_Sub-ticket of #{ticket_id}._"
+            payload: Dict[str, Any] = {
+                "name": s["title"],
+                "description": child_desc,
+            }
+            if parent_project_id is not None:
+                # Children must land on the PARENT's board — the provider
+                # defaults to the configured project, which may differ.
+                payload["project_id"] = parent_project_id
             try:
-                child = await create(
-                    {"name": s["title"], "description": child_desc}
-                )
+                child = await create(payload)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not create sub-ticket: %s", exc)
                 continue

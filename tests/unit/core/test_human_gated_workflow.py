@@ -2697,6 +2697,51 @@ class TestOrchestrateWork:
         assert workflow._classify_report_intent("wrote a test") == "progress"
 
 
+class TestReopenGuard:
+    """ticket.reopened is only honored for genuinely DONE records.
+
+    Regression for the production feedback loop: task.open events on
+    board-closed tickets with stale IN_PROGRESS records triggered
+    reopen → release claim → pickup re-claims → move column → openTask →
+    task.open → reopen … until Kanboard's SQLite locked up.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reopen_ignored_for_in_progress_record(
+        self, workflow, lifecycle, mock_branch
+    ):
+        """A reopen event on an IN_PROGRESS record is a no-op."""
+        lifecycle.get_or_create("50", "kanboard")
+        lifecycle.transition("50", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("50", "kanboard", workflow._agent_id)
+        lifecycle.transition("50", "kanboard", TicketState.IN_PROGRESS)
+
+        event = _make_event({"ticket_id": "50", "provider": "kanboard"})
+        await workflow._on_ticket_reopened(event)
+
+        # No rebase, claim intact, state unchanged — the loop is broken.
+        mock_branch.rebase_on_main.assert_not_awaited()
+        rec = lifecycle.get("50", "kanboard")
+        assert rec.ai_agent_id == workflow._agent_id
+        assert rec.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_reopen_still_works_for_done_record(
+        self, workflow, lifecycle, mock_branch, mock_kanban
+    ):
+        """A genuine reopen (record DONE) still rebases and resumes."""
+        lifecycle.get_or_create("51", "kanboard")
+        lifecycle.transition("51", "kanboard", TicketState.READY)
+        lifecycle.transition("51", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("51", "kanboard", TicketState.DONE)
+
+        event = _make_event({"ticket_id": "51", "provider": "kanboard"})
+        await workflow._on_ticket_reopened(event)
+
+        mock_branch.rebase_on_main.assert_awaited()
+        assert lifecycle.get("51", "kanboard").state == TicketState.IN_PROGRESS
+
+
 class TestDecomposition:
     """Marcus splits a large ticket into linked, status-inheriting children."""
 
@@ -2739,13 +2784,17 @@ class TestDecomposition:
 
         mock_kanban.create_task = AsyncMock(side_effect=fake_create)
         mock_kanban.create_task_link = AsyncMock(return_value=True)
-        mock_kanban.get_task_by_id = AsyncMock(
-            return_value=MagicMock(name="Big", description="do a lot")
-        )
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
 
         children = await workflow.decompose_ticket("100")
 
         assert children == ["201", "202"]
+        # Children are created on the PARENT's board, not the configured one.
+        for call in mock_kanban.create_task.await_args_list:
+            assert call.args[0]["project_id"] == 3
         # Children inherit the human owner + are Ready (workable).
         for c in children:
             rec = lifecycle.get(c, "kanboard")
