@@ -735,6 +735,17 @@ class HumanGatedWorkflow:
             await self._handle_start_dev_env_command(ticket_id, record)
             return
 
+        # @marcus decompose → split this ticket into linked sub-tickets.
+        if CommentParser.contains_command(body, "decompose"):
+            children = await self.decompose_ticket(ticket_id)
+            if not children:
+                await self._post_comment(
+                    ticket_id,
+                    "I couldn't split this into independent sub-tickets — it "
+                    "looks atomic (or no LLM is configured for decomposition).",
+                )
+            return
+
         # Approval by comment: on a ticket awaiting review, "@marcus approve"
         # (or a plain "approve" / "lgtm" / "merge to main") means the same as
         # dragging the card to Done — merge the branch to main. This must be
@@ -904,11 +915,210 @@ class HumanGatedWorkflow:
             logger.debug("Report summarization failed: %s", exc)
             return text[:280]
 
-    def _next_worker_ticket(self) -> Optional[str]:
-        """Return the next unclaimed TODO/READY ticket id, or ``None``.
+    @staticmethod
+    def _is_human_owner(assignee: Optional[str]) -> bool:
+        """True if *assignee* is a human (set, not '0', not a worker id)."""
+        return assignee not in (None, "", "0") and not str(
+            assignee
+        ).startswith("worker-")
 
-        Autonomous selection: Marcus hands out the lowest-numbered ticket
-        that is not yet started and not held by any worker.
+    @staticmethod
+    def _extract_json_obj(text: str) -> Dict[str, Any]:
+        """Best-effort extract the first JSON object from an LLM response."""
+        import json
+        import re
+
+        if not text:
+            return {}
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            obj = json.loads(match.group(0))
+            return obj if isinstance(obj, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _should_attempt_decompose(self, record: TicketRecord) -> bool:
+        """Cheap gate before spending an LLM call: only large tickets.
+
+        A ticket is a decomposition candidate when it has several acceptance
+        criteria (a proxy for multiple deliverables). Sub-tickets (already
+        created by a decomposition) are never re-decomposed.
+        """
+        if self._llm_generate is None:
+            return False
+        if "Sub-ticket of #" in (record.acceptance_criteria or ""):
+            return False
+        return len(self._get_ac_items(record)) >= 4
+
+    async def _llm_decompose(
+        self, title: str, description: str, acceptance_criteria: str
+    ) -> List[Dict[str, str]]:
+        """Ask the LLM to split a ticket into independent sub-tickets.
+
+        Returns ``[]`` when the ticket is atomic/coupled or no LLM is wired —
+        Marcus only decomposes when there are genuinely independent pieces.
+        """
+        if self._llm_generate is None:
+            return []
+        prompt = (
+            "Split this software ticket into smaller INDEPENDENT sub-tickets "
+            "that different agents can implement in parallel. If it is already "
+            "small/atomic, or its parts are tightly coupled, return an empty "
+            "list. Otherwise return 2-5 self-contained sub-tickets.\n\n"
+            f"Title: {title}\nDescription:\n{description}\n"
+            f"Acceptance criteria:\n{acceptance_criteria}\n\n"
+            'Respond with ONLY JSON: {"subtasks": [{"title": "...", '
+            '"description": "...", "acceptance_criteria": "- [ ] ..."}]}'
+        )
+        try:
+            out = await self._llm_generate(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Decomposition LLM call failed: %s", exc)
+            return []
+        data = self._extract_json_obj(out or "")
+        raw = data.get("subtasks")
+        if not isinstance(raw, list):
+            return []
+        clean: List[Dict[str, str]] = []
+        for s in raw:
+            if isinstance(s, dict) and s.get("title"):
+                clean.append(
+                    {
+                        "title": str(s["title"])[:200],
+                        "description": str(s.get("description", ""))[:2000],
+                        "acceptance_criteria": str(
+                            s.get("acceptance_criteria", "")
+                        )[:2000],
+                    }
+                )
+        return clean if len(clean) >= 2 else []
+
+    async def decompose_ticket(self, ticket_id: str) -> List[str]:
+        """Split a ticket into linked child tickets that inherit its status.
+
+        Creates each sub-ticket as a Kanboard task in the Ready column,
+        inheriting the parent's human owner (so workers can pick them up
+        independently), links it to the parent (``is a child of``), then parks
+        the parent as BLOCKED (it completes once its children are done).
+
+        Returns
+        -------
+        List[str]
+            The created child ticket ids (empty if not decomposed).
+        """
+        record = self._lifecycle.get(ticket_id, self._provider)
+        if record is None or record.state == TicketState.BLOCKED:
+            return []
+        create = getattr(self._kanban, "create_task", None)
+        if create is None:
+            return []
+
+        title, description = ticket_id, ""
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                title = task.name or title
+                description = task.description or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Decompose: could not fetch %s: %s", ticket_id, exc)
+
+        subs = await self._llm_decompose(
+            title, description, record.acceptance_criteria
+        )
+        if not subs:
+            return []
+
+        link = getattr(self._kanban, "create_task_link", None)
+        owner = record.assignee if self._is_human_owner(record.assignee) else None
+        child_ids: List[str] = []
+        for s in subs:
+            child_desc = s["description"]
+            if s.get("acceptance_criteria"):
+                child_desc += (
+                    f"\n\n## Acceptance Criteria\n{s['acceptance_criteria']}"
+                )
+            child_desc += f"\n\n_Sub-ticket of #{ticket_id}._"
+            try:
+                child = await create(
+                    {"name": s["title"], "description": child_desc}
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not create sub-ticket: %s", exc)
+                continue
+            child_id = str(getattr(child, "id", "") or "")
+            if not child_id:
+                continue
+            # Lifecycle record inheriting the parent's status: Ready + owner,
+            # and a "Sub-ticket of #" marker so it's never re-decomposed.
+            self._lifecycle.get_or_create(
+                child_id,
+                self._provider,
+                acceptance_criteria=(
+                    (s.get("acceptance_criteria", "") or "")
+                    + f"\n<!-- Sub-ticket of #{ticket_id} -->"
+                ),
+            )
+            try:
+                await self._kanban.move_task_to_column(child_id, "ready")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not move sub-ticket to ready: %s", exc)
+            if owner:
+                try:
+                    self._lifecycle.set_assignee(child_id, self._provider, owner)
+                except KeyError:
+                    pass
+            try:
+                self._lifecycle.human_transition(
+                    child_id,
+                    self._provider,
+                    TicketState.READY,
+                    reason=f"Inherited status from parent #{ticket_id}",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
+            if link is not None:
+                try:
+                    await link(child_id, ticket_id, 6)  # child "is a child of"
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Could not link sub-ticket: %s", exc)
+            child_ids.append(child_id)
+
+        if child_ids:
+            await self._post_comment(
+                ticket_id,
+                "🧩 **Decomposed into sub-tickets** so agents can work them in "
+                f"parallel: {', '.join('#' + c for c in child_ids)}. This "
+                "ticket completes once its sub-tickets are done.",
+            )
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+            except KeyError:
+                pass
+            try:
+                self._lifecycle.human_transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.BLOCKED,
+                    reason="Decomposed into sub-tickets",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
+            try:
+                await self._kanban.move_task_to_column(ticket_id, "blocked")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not move parent to blocked: %s", exc)
+        return child_ids
+
+    def _next_worker_ticket(self) -> Optional[str]:
+        """Return the next human-readied ticket to hand a worker, or ``None``.
+
+        HUMAN-TRIGGERED selection: Marcus only hands out tickets a human has
+        **assigned to themselves AND moved to Ready** (the existing gate).
+        A ticket is workable when it is READY/IN_PROGRESS, has a human owner,
+        and is not already held by a worker (an internal ``marcus-`` slot
+        claim from the human-gated auto-start is fine — the worker adopts it).
         """
         def _key(rec: TicketRecord) -> int:
             try:
@@ -916,12 +1126,20 @@ class HumanGatedWorkflow:
             except ValueError:
                 return abs(hash(rec.ticket_id))
 
+        def _held_by_worker(rec: TicketRecord) -> bool:
+            # A claim by anything other than an internal ``marcus-`` slot is
+            # a worker that already owns the ticket — don't re-hand it.
+            return rec.ai_agent_id is not None and not str(
+                rec.ai_agent_id
+            ).startswith("marcus-")
+
         candidates = [
             r
             for r in self._lifecycle.all_records()
             if r.provider == self._provider
-            and r.state in (TicketState.TODO, TicketState.READY)
-            and r.ai_agent_id is None
+            and r.state in (TicketState.READY, TicketState.IN_PROGRESS)
+            and self._is_human_owner(r.assignee)
+            and not _held_by_worker(r)
         ]
         candidates.sort(key=_key)
         return candidates[0].ticket_id if candidates else None
@@ -1040,13 +1258,36 @@ class HumanGatedWorkflow:
                 ),
             }
         rec = self._lifecycle.get(next_id, self._provider)
+        # Auto-decompose a large ticket into sub-tickets before handing it
+        # out, so agents work independent pieces in parallel. The parent is
+        # parked (BLOCKED); re-picking finds the newly-created child tickets.
+        if rec is not None and self._should_attempt_decompose(rec):
+            children = await self.decompose_ticket(next_id)
+            if children:
+                return await self.orchestrate_work(agent_id=agent_id)
+
         if rec is not None:
-            try:
-                self._lifecycle.set_assignee(next_id, self._provider, agent_id)
-            except KeyError:
-                pass
-            rec = self._lifecycle.get(next_id, self._provider) or rec
-            await self._start_ai_work(next_id, rec, claim_as=agent_id)
+            # Adopt the human-readied ticket under the WORKER's claim. The
+            # human stays the assignee (owner); the worker becomes the one
+            # doing the work. Release any internal-slot claim first.
+            if rec.ai_agent_id and str(rec.ai_agent_id).startswith("marcus-"):
+                try:
+                    self._lifecycle.release_ticket(next_id, self._provider)
+                except KeyError:
+                    pass
+                rec = self._lifecycle.get(next_id, self._provider) or rec
+            if rec.state == TicketState.READY:
+                # Not started yet → full start (branch, IN_PROGRESS, comment).
+                await self._start_ai_work(next_id, rec, claim_as=agent_id)
+            else:
+                # Already IN_PROGRESS (human-gated auto-start prepared it) →
+                # just take over the claim; the branch already exists.
+                try:
+                    self._lifecycle.claim_ticket(
+                        next_id, self._provider, agent_id
+                    )
+                except KeyError:
+                    pass
 
         if self._lifecycle.get_agent_ticket(agent_id) != next_id:
             # Start bailed (e.g. missing project description → parked). Tell

@@ -333,6 +333,39 @@ class KanboardKanban(KanbanInterface):
         raw = await self._rpc("getTask", task_id=int(task_id))
         return self._to_task(raw)
 
+    async def create_task_link(
+        self,
+        task_id: str,
+        opposite_task_id: str,
+        link_type: int = 6,
+    ) -> bool:
+        """Create a Kanboard link between two tasks.
+
+        Parameters
+        ----------
+        task_id : str
+            The task the link is created ON.
+        opposite_task_id : str
+            The task it links TO.
+        link_type : int
+            Kanboard link-type id. Default ``6`` = "is a child of" (Kanboard
+            auto-creates the opposite "is a parent of" on *opposite_task_id*).
+
+        Returns
+        -------
+        bool
+            ``True`` on success.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before create_task_link()")
+        result = await self._rpc(
+            "createTaskLink",
+            task_id=int(task_id),
+            opposite_task_id=int(opposite_task_id),
+            link_id=int(link_type),
+        )
+        return bool(result)
+
     async def update_task(
         self, task_id: str, updates: Dict[str, Any]
     ) -> Optional[Task]:

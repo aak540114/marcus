@@ -23,11 +23,19 @@ tool, `marcus_work`, and do exactly what it tells you. After connecting the
 > resolve, call with `report="BLOCKED - <reason>"`. Repeat until `marcus_work`
 > says there's no more work.
 
-Marcus assigns the next available ticket, summarizes each of your reports onto
+Marcus only hands out tickets **you (the human) have assigned to yourself and
+moved to Ready** — that's the trigger. It summarizes each of your reports onto
 the ticket as a comment, and completes the ticket through the project's gate
 (human review, or auto-merge) when you report `DONE`. You never need to know
 any other tool. The rest of this document (§1 onward) is the manual for the
 older, do-it-yourself flow where you call the individual tools directly.
+
+**Big tickets split automatically.** When Marcus hands out a ticket that has
+several acceptance criteria, it may **decompose** it into smaller sub-tickets
+(linked to the parent as "is a child of"), each inheriting the parent's Ready
+status so different agents can work them in parallel; the parent completes once
+its children do. You can also trigger this yourself by commenting
+**`@marcus decompose`** on any ticket.
 
 ---
 

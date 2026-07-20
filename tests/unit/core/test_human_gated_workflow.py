@@ -2599,11 +2599,16 @@ class TestOrchestrateWork:
     """Marcus-as-orchestrator: the marcus_work single-tool loop."""
 
     @pytest.mark.asyncio
-    async def test_first_call_assigns_next_ticket(
+    async def test_first_call_adopts_human_readied_ticket(
         self, workflow, lifecycle, mock_kanban, mock_branch
     ):
-        """No report/ticket → Marcus assigns the next TODO ticket to the worker."""
-        lifecycle.get_or_create("5", "kanboard")  # a TODO record
+        """Human-triggered: only a READY, human-assigned ticket is handed out.
+
+        The human stays the assignee (owner); the worker takes the claim.
+        """
+        lifecycle.get_or_create("5", "kanboard")
+        lifecycle.transition("5", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("5", "kanboard", "alice")  # human owner
         with patch(
             "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
             side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
@@ -2612,14 +2617,26 @@ class TestOrchestrateWork:
 
         assert res["status"] == "assigned"
         assert res["ticket_id"] == "5"
-        assert "context" in res and "message" in res
-        # The worker holds the claim under its own id, ticket is in progress.
         assert lifecycle.get_agent_ticket("w1") == "5"
         assert lifecycle.get("5", "kanboard").state == TicketState.IN_PROGRESS
+        # Human remains the owner; worker only holds the claim.
+        assert lifecycle.get("5", "kanboard").assignee == "alice"
+
+    @pytest.mark.asyncio
+    async def test_unassigned_ready_ticket_is_not_handed_out(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A READY ticket with NO human assignee is not autonomous work."""
+        lifecycle.get_or_create("6", "kanboard")
+        lifecycle.transition("6", "kanboard", TicketState.READY)
+        # no assignee
+        res = await workflow.orchestrate_work(agent_id="w2")
+        assert res["status"] == "no_work"
 
     @pytest.mark.asyncio
     async def test_no_available_work(self, workflow, lifecycle, mock_kanban):
-        """Nothing TODO/READY → status no_work."""
+        """Nothing human-readied → status no_work."""
+        lifecycle.get_or_create("9", "kanboard")  # a TODO record, no assignee
         res = await workflow.orchestrate_work(agent_id="w2")
         assert res["status"] == "no_work"
 
@@ -2661,3 +2678,96 @@ class TestOrchestrateWork:
         assert workflow._classify_report_intent("DONE - x") == "done"
         assert workflow._classify_report_intent("BLOCKED - y") == "blocked"
         assert workflow._classify_report_intent("wrote a test") == "progress"
+
+
+class TestDecomposition:
+    """Marcus splits a large ticket into linked, status-inheriting children."""
+
+    def _big_ticket(self, lifecycle, tid="100", owner="alice"):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.set_assignee(tid, "kanboard", owner)
+        # 4 AC items → passes the cheap decompose gate.
+        lifecycle.update_acceptance_criteria(
+            tid, "kanboard",
+            "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d", "hash",
+        )
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_decompose_creates_linked_children(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Two sub-tickets are created, linked to the parent, and inherit owner."""
+        self._big_ticket(lifecycle)
+
+        # LLM returns two subtasks.
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+        workflow._llm_generate = fake_llm
+
+        # create_task returns tasks with ids 201, 202; capture links.
+        created = {"n": 200}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=MagicMock(name="Big", description="do a lot")
+        )
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == ["201", "202"]
+        # Children inherit the human owner + are Ready (workable).
+        for c in children:
+            rec = lifecycle.get(c, "kanboard")
+            assert rec.assignee == "alice"
+            assert rec.state == TicketState.READY
+        # Each child linked to the parent (child "is a child of" 100, type 6).
+        link_calls = mock_kanban.create_task_link.await_args_list
+        assert all(call.args[1] == "100" and call.args[2] == 6 for call in link_calls)
+        # Parent parked so it isn't handed to a worker.
+        assert lifecycle.get("100", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_atomic_ticket_not_decomposed(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """LLM returning no subtasks → nothing created, parent untouched."""
+        self._big_ticket(lifecycle, tid="101")
+
+        async def fake_llm(prompt):
+            return '{"subtasks": []}'
+        workflow._llm_generate = fake_llm
+        mock_kanban.create_task = AsyncMock()
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=MagicMock(name="x", description="y")
+        )
+
+        children = await workflow.decompose_ticket("101")
+        assert children == []
+        mock_kanban.create_task.assert_not_awaited()
+        assert lifecycle.get("101", "kanboard").state == TicketState.READY
+
+    def test_subticket_not_re_decomposed(self, workflow, lifecycle):
+        """A ticket marked as a sub-ticket is never a decompose candidate."""
+        lifecycle.get_or_create("102", "kanboard")
+        lifecycle.update_acceptance_criteria(
+            "102", "kanboard",
+            "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d\n<!-- Sub-ticket of #100 -->",
+            "h",
+        )
+        workflow._llm_generate = AsyncMock()
+        rec = lifecycle.get("102", "kanboard")
+        assert workflow._should_attempt_decompose(rec) is False
