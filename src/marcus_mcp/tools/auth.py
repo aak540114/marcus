@@ -10,6 +10,26 @@ from mcp.types import Tool
 
 from ..audit import get_audit_logger
 
+# The Kanboard human-gated workflow tools. These are the tools a coding
+# agent actually uses in this deployment (get its work, report progress,
+# hand off / signal blocked). They live in the tool catalog via the "human"
+# role, but an *agent* client must be allowed to call them too — otherwise
+# get_work_context and friends are invisible to the very agents they're for.
+HUMAN_GATED_AGENT_TOOLS = [
+    "get_work_context",
+    "get_project_description",
+    "update_project_description",
+    "generate_acceptance_criteria",
+    "post_ticket_progress",
+    "signal_ready_for_review",
+    "signal_waiting_for_human",
+    "signal_blocked",
+    "get_ticket_lifecycle_state",
+    "get_pending_tickets",
+    "start_ticket_dev_environment",
+    "get_ticket_dev_environment_url",
+]
+
 # Define role-based tool access
 ROLE_TOOLS = {
     "observer": [
@@ -95,6 +115,8 @@ ROLE_TOOLS = {
         "start_experiment",  # Start live experiments
         "end_experiment",  # Stop and finalize experiments
         "get_experiment_status",  # Check experiment status
+        # Kanboard human-gated workflow (this deployment's primary agent path)
+        *HUMAN_GATED_AGENT_TOOLS,
     ],
     "admin": [
         # Admins get all tools

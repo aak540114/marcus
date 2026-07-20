@@ -15,8 +15,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import mcp.types as types  # noqa: E402
 
-from src.marcus_mcp.handlers import get_tool_definitions  # noqa: E402
+from src.marcus_mcp.handlers import get_all_tool_definitions  # noqa: E402
 from src.marcus_mcp.server import MarcusServer  # noqa: E402
+from src.marcus_mcp.tools.auth import HUMAN_GATED_AGENT_TOOLS  # noqa: E402
+
+# The tools a coding agent may see and call on this restricted server —
+# the classic autonomous-agent path PLUS the Kanboard human-gated workflow
+# (get_work_context et al.), which is this deployment's primary agent path.
+AGENT_SERVER_ALLOWED_TOOLS = [
+    "register_agent",
+    "get_agent_status",
+    "list_registered_agents",
+    "request_next_task",
+    "report_task_progress",
+    "report_blocker",
+    "get_project_status",
+    "get_task_context",
+    "log_decision",
+    "log_artifact",
+    "ping",
+    "check_assignment_health",
+    *HUMAN_GATED_AGENT_TOOLS,
+]
 
 
 class AgentMarcusServer(MarcusServer):
@@ -27,9 +47,18 @@ class AgentMarcusServer(MarcusServer):
 
         @self.server.list_tools()  # type: ignore[untyped-decorator,misc]
         async def handle_list_tools() -> List[types.Tool]:
-            """Return list of available tools for agents."""
-            # Force "agent" role to restrict tool access
-            return get_tool_definitions(role="agent")
+            """Return list of available tools for agents.
+
+            Lists exactly ``AGENT_SERVER_ALLOWED_TOOLS`` (the same set the
+            call handler enforces), so an agent can actually see the
+            human-gated tools it is allowed to call.
+            """
+            catalog = get_all_tool_definitions()
+            return [
+                catalog[name]
+                for name in AGENT_SERVER_ALLOWED_TOOLS
+                if name in catalog
+            ]
 
         # Use parent class tool handler
         @self.server.call_tool()  # type: ignore[untyped-decorator,misc]
@@ -37,23 +66,7 @@ class AgentMarcusServer(MarcusServer):
             name: str, arguments: Optional[Dict[str, Any]]
         ) -> List[types.TextContent | types.ImageContent | types.EmbeddedResource]:
             """Handle tool calls."""
-            # Check if this is an allowed agent tool
-            allowed_tools = [
-                "register_agent",
-                "get_agent_status",
-                "list_registered_agents",
-                "request_next_task",
-                "report_task_progress",
-                "report_blocker",
-                "get_project_status",
-                "get_task_context",
-                "log_decision",
-                "log_artifact",
-                "ping",
-                "check_assignment_health",
-            ]
-
-            if name not in allowed_tools:
+            if name not in AGENT_SERVER_ALLOWED_TOOLS:
                 return [
                     types.TextContent(
                         type="text",

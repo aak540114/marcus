@@ -78,3 +78,47 @@ class TestGetClientTools:
         """Sanity check the registry itself: developer is not read-only-only."""
         assert "create_project" in ROLE_TOOLS["developer"]
         assert "remove_project" not in ROLE_TOOLS["developer"]
+
+
+class TestAgentRoleHasHumanGatedTools:
+    """Coding agents must be able to see and call the Kanboard workflow tools.
+
+    Regression: the human-gated tools (get_work_context, signal_ready_for_review,
+    ...) were in the tool catalog but missing from ROLE_TOOLS["agent"], so an
+    agent connecting to Marcus saw only the classic request_next_task surface
+    and could never reach get_work_context.
+    """
+
+    def test_agent_role_includes_get_work_context(self):
+        """The core entry point every coding agent needs is allowed."""
+        assert "get_work_context" in ROLE_TOOLS["agent"]
+
+    def test_agent_role_includes_all_human_gated_tools(self):
+        """Every human-gated workflow tool is in the agent allowlist."""
+        from src.marcus_mcp.tools.auth import HUMAN_GATED_AGENT_TOOLS
+
+        for tool in HUMAN_GATED_AGENT_TOOLS:
+            assert tool in ROLE_TOOLS["agent"], tool
+
+    def test_registered_agent_resolves_to_human_gated_tools(self):
+        """A client registered as type 'agent' gets the tools resolved."""
+        state = SimpleNamespace(
+            _registered_clients={
+                "agent-1": {"client_type": "agent", "role": "coder"}
+            }
+        )
+        tools = get_client_tools("agent-1", state)
+        assert "get_work_context" in tools
+        assert "signal_ready_for_review" in tools
+
+    def test_get_work_context_definition_reaches_agent_client(self):
+        """The catalog filter actually returns the get_work_context Tool."""
+        from src.marcus_mcp.tools.auth import get_tool_definitions_for_client
+
+        state = SimpleNamespace(
+            _registered_clients={
+                "agent-1": {"client_type": "agent", "role": "coder"}
+            }
+        )
+        names = {t.name for t in get_tool_definitions_for_client("agent-1", state)}
+        assert "get_work_context" in names
