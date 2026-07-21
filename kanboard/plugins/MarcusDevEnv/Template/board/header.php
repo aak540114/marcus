@@ -171,6 +171,33 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     color: #6b7280;
     white-space: nowrap;
 }
+
+/* ── Actively-worked ticket highlight ─────────────────────────────────── */
+/* A golden ring marks the cards an AI agent is working RIGHT NOW (ticket
+   state == in_progress). It is removed automatically the moment the ticket
+   leaves in_progress (waiting-for-human, blocked, done, …). Rendered as a
+   box-shadow ring rather than a real `border` so it doesn't shift the card's
+   layout or fight Kanboard's own category-colored left border, and respects
+   the card's rounded corners. */
+.task-board.marcus-ai-active {
+    border-color: #f5b301 !important;
+    /* The ring itself comes from the animation below. A CSS animation
+       outranks Kanboard's own (non-important) card box-shadow in the
+       cascade, whereas an `!important` static box-shadow here would instead
+       OUTRANK the animation and freeze the pulse — so the moving ring lives
+       only in the keyframes, with a static fallback for reduced-motion. */
+    animation: marcusAiPulse 2s ease-in-out infinite;
+}
+@keyframes marcusAiPulse {
+    0%, 100% { box-shadow: 0 0 0 2px #f5b301, 0 0 6px 1px rgba(245, 179, 1, 0.35); }
+    50%      { box-shadow: 0 0 0 2px #f5b301, 0 0 13px 3px rgba(245, 179, 1, 0.65); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .task-board.marcus-ai-active {
+        animation: none;
+        box-shadow: 0 0 0 2px #f5b301, 0 0 9px 2px rgba(245, 179, 1, 0.5) !important;
+    }
+}
 </style>
 
 <div style="padding: 0 16px 2px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
@@ -317,6 +344,30 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     var label   = document.getElementById('marcus-agent-label');
     var tooltip = document.getElementById('marcus-agent-tooltip');
 
+    // Ticket ids an AI agent is working RIGHT NOW (state === in_progress).
+    // Only these get the golden ring; a ticket that has moved on to
+    // waiting-for-human / blocked / done is no longer "actively worked" even
+    // though it may still carry an agent claim, so it is intentionally
+    // excluded here and its ring is removed on the next applyAgentBorders().
+    var activeTicketIds = Object.create(null);
+
+    // (Re)paint the golden ring onto exactly the active cards and strip it
+    // from every other card. Idempotent — safe to call after each poll AND
+    // whenever Kanboard redraws the board (its own auto-refresh replaces the
+    // card DOM, which would otherwise drop our class). Marcus ticket ids are
+    // the Kanboard task ids, compared as strings.
+    function applyAgentBorders() {
+        var cards = document.querySelectorAll('.task-board[data-task-id]');
+        for (var i = 0; i < cards.length; i++) {
+            var id = String(cards[i].getAttribute('data-task-id'));
+            if (activeTicketIds[id]) {
+                cards[i].classList.add('marcus-ai-active');
+            } else {
+                cards[i].classList.remove('marcus-ai-active');
+            }
+        }
+    }
+
     function updateAgents() {
         fetch(AGENTS_URL, { cache: 'no-store', headers: marcusHeaders() })
             .then(function (r) { return r.json(); })
@@ -335,15 +386,41 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
                             + '</strong>&nbsp;&mdash;&nbsp;' + a.agent_id;
                     }).join('<br>');
                 }
+                // Rebuild the active set (only in_progress tickets) and repaint.
+                activeTicketIds = Object.create(null);
+                agents.forEach(function (a) {
+                    if (a.state === 'in_progress') {
+                        activeTicketIds[String(a.ticket_id)] = true;
+                    }
+                });
+                applyAgentBorders();
             })
             .catch(function () {
                 badge.className   = 'error';
                 label.textContent = '🤖 Marcus: unreachable';
                 tooltip.innerHTML = 'Could not reach Marcus at<br>' + AGENTS_URL;
+                // Leave whatever rings are currently shown — a transient
+                // Marcus blip shouldn't flicker every card.
             });
     }
     updateAgents();
     setInterval(updateAgents, INTERVAL);
+
+    // Kanboard periodically re-renders the board (its own AJAX auto-refresh),
+    // which rebuilds the card DOM and would drop our class. Re-apply from the
+    // cached active set whenever the board subtree changes. Debounced so a
+    // burst of mutations triggers a single repaint.
+    (function () {
+        var boardEl = document.getElementById('board') || document.body;
+        if (typeof MutationObserver === 'undefined') { return; }
+        var scheduled = false;
+        var obs = new MutationObserver(function () {
+            if (scheduled) { return; }
+            scheduled = true;
+            setTimeout(function () { scheduled = false; applyAgentBorders(); }, 100);
+        });
+        obs.observe(boardEl, { childList: true, subtree: true });
+    }());
 
     /* ── Project gate + verify counter ─────────────────────────────── */
     var saving      = document.getElementById('marcus-gate-saving');
