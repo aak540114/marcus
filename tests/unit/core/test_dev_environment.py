@@ -1089,22 +1089,30 @@ class TestEntrypointResilience:
         assert "safe.directory /app" in cmd
 
     def test_static_fallback_present_for_hm_stack(self) -> None:
-        """HMR stacks fall back to python http.server if the dev cmd fails."""
+        """HMR stacks fall back to the zero-install busybox httpd server."""
         cmd = self._mgr()._build_entrypoint(
             "b", install_cmd="npm install",
             start_cmd="npm run dev -- --port 3000", use_hm_reload=True,
         )
-        assert "python3 -m http.server 3000" in cmd
+        assert "busybox httpd" in cmd
         assert "npm run dev" in cmd
 
     def test_static_fallback_present_for_non_hm_stack(self) -> None:
-        """Non-HMR stacks also fall back to the static server on failure."""
+        """Non-HMR stacks also fall back to busybox httpd on failure."""
         cmd = self._mgr()._build_entrypoint(
             "b", install_cmd="",
             start_cmd="flask run --host 0.0.0.0 --port 3000", use_hm_reload=False,
         )
-        assert "python3 -m http.server 3000" in cmd
+        assert "busybox httpd" in cmd
         assert "flask run" in cmd
+
+    def test_fallback_needs_no_language_runtime(self) -> None:
+        """The fallback server is BusyBox (always in alpine), not python —
+        so it works even when no language runtime has been installed."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="", start_cmd="npm run dev", use_hm_reload=True,
+        )
+        assert "python3 -m http.server" not in cmd
 
     def test_install_failure_is_non_fatal(self) -> None:
         """A failed dependency install must not abort the entrypoint."""

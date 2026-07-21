@@ -142,17 +142,16 @@ class ProjectStack:
         """Alpine ``apk`` packages for the language runtime + any extras.
 
         The live dev-environment container (see
-        ``src/core/dev_environment.py``) runs on ``python:3.12-alpine``,
-        which already ships ``python3``/``pip`` — so Python stacks need no
-        extra runtime package.  Every other language installs its runtime
-        from Alpine's package repository by these names (which differ from
-        their Debian equivalents, e.g. ``go`` not ``golang``,
-        ``openjdk17`` not ``default-jdk``).
+        ``src/core/dev_environment.py``) runs on a bare ``alpine`` base that
+        ships **no** language runtime — so every stack, Python included,
+        installs its own.  These names are Alpine's, which differ from their
+        Debian equivalents (``go`` not ``golang``, ``openjdk17`` not
+        ``default-jdk``, ``py3-pip`` not ``python3-pip``).
         """
         base: List[str] = []
         lang = self.language.lower()
         if lang == "python":
-            base = []  # python3 + pip already in the base image
+            base = ["python3", "py3-pip"]
         elif lang in ("nodejs", "node", "javascript", "typescript"):
             base = ["nodejs", "npm"]
         elif lang == "go":

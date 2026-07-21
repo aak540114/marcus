@@ -83,36 +83,34 @@ _READY_POLL_MAX_ATTEMPTS = 5
 # Project-type detection
 # ---------------------------------------------------------------------------
 
-#: Single base image for all dev environments.  ``python:3.12-alpine`` is
-#: ~50 MB, starts in well under a second, and — crucially — ships a working
-#: ``python3`` interpreter out of the box.  That lets the entrypoint fall
-#: back to ``python3 -m http.server`` with **zero** package installation
-#: when a project has no build step (a plain HTML/JS game, a static site) or
-#: when the real dev command fails to start.  The previous
-#: ``debian:bookworm-slim`` base had no interpreter at all, so even serving a
-#: static file required a slow, network-dependent ``apt-get install`` that,
-#: when it failed, left the ``--rm`` container dead and invisible in
-#: ``docker ps`` while the browser got ``ERR_CONNECTION_REFUSED``.
-_BASE_IMAGE = "python:3.12-alpine"
+#: Single base image for all dev environments.  Bare ``alpine`` is ~7 MB and
+#: starts near-instantly.  It deliberately ships **no** language runtime —
+#: each stack installs exactly the languages, packages, and libraries it
+#: needs at container start via ``apk`` (see :data:`_FALLBACK_STACKS` /
+#: :meth:`ProjectStack.apk_packages`).  That keeps the image tiny and avoids
+#: baking in a runtime a given project may not use.
+_BASE_IMAGE = "alpine:3.20"
 
 #: Alpine ``apk`` packages installed before project setup.  ``git`` is
 #: required for the branch checkout; ``inotify-tools`` powers the file-watch
-#: restart loop for non-hot-reload stacks; ``curl`` is a convenience for
-#: agent-authored health checks.  Installation is best-effort (``|| true``)
-#: so a transient network hiccup never stops the container from serving.
-_BASE_APK = "git inotify-tools curl"
+#: restart loop for non-hot-reload stacks.  Installation is best-effort
+#: (``|| true``) so a transient network hiccup never stops the container from
+#: serving.  Language runtimes are NOT here — they come from the stack.
+_BASE_APK = "git inotify-tools"
 
 #: Port the application is expected to listen on **inside** the container.
 #: The host-side port (allocated by :class:`PortAllocator`) is published to
 #: this one via ``docker run -p <host>:<_APP_PORT>``.
 _APP_PORT = 3000
 
-#: Guaranteed-available fallback server.  ``python3`` is always present in
-#: :data:`_BASE_IMAGE`, so this command can never fail for lack of a runtime.
-#: It serves the checked-out branch's files (the container's ``/app`` working
-#: directory) as a static website — perfect for the common case of letting a
-#: human open a browser and *see* what an agent built.
-_STATIC_FALLBACK = f"python3 -m http.server {_APP_PORT}"
+#: Guaranteed-available fallback server.  Alpine's BusyBox ships an ``httpd``
+#: applet, so this command needs **zero** package installation and can never
+#: fail for lack of a runtime.  It serves the checked-out branch's files (the
+#: container's ``/app`` working directory) as a static website — perfect for
+#: the common case of letting a human open a browser and *see* what an agent
+#: built, and as the last-resort fallback when a project's real dev command
+#: can't start.
+_STATIC_FALLBACK = f"busybox httpd -f -p {_APP_PORT} -h /app"
 
 # ---------------------------------------------------------------------------
 # Fallback stack table — used when no ProjectStack is supplied and
@@ -134,19 +132,19 @@ _FALLBACK_STACKS: Dict[str, Dict[str, Any]] = {
     "python-fastapi": {"install": "pip install --no-cache-dir -r requirements.txt",
                        "start":   "uvicorn main:app --host 0.0.0.0 --port 3000",
                        "hm":      False,
-                       "apk":     []},
+                       "apk":     ["python3", "py3-pip"]},
     "python-flask":   {"install": "pip install --no-cache-dir -r requirements.txt",
                        "start":   "flask run --host 0.0.0.0 --port 3000",
                        "hm":      False,
-                       "apk":     []},
+                       "apk":     ["python3", "py3-pip"]},
     "python-django":  {"install": "pip install --no-cache-dir -r requirements.txt",
                        "start":   "python manage.py runserver 0.0.0.0:3000 --noreload",
                        "hm":      False,
-                       "apk":     []},
+                       "apk":     ["python3", "py3-pip"]},
     "python":         {"install": "pip install --no-cache-dir -r requirements.txt 2>/dev/null || true",
                        "start":   "python3 -m http.server 3000",
                        "hm":      False,
-                       "apk":     []},
+                       "apk":     ["python3", "py3-pip"]},
     "rust":           {"install": "cargo install cargo-watch",
                        "start":   "cargo watch -x run",
                        "hm":      True,
@@ -168,7 +166,7 @@ _FALLBACK_STACKS: Dict[str, Dict[str, Any]] = {
                        "hm":      False,
                        "apk":     ["php"]},
     "static":         {"install": "",
-                       "start":   "python3 -m http.server 3000",
+                       "start":   "busybox httpd -f -p 3000 -h /app",
                        "hm":      False,
                        "apk":     []},
 }

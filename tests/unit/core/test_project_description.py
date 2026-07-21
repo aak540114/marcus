@@ -235,10 +235,11 @@ class TestParseStackFromText:
 
     # ── apk_packages property (Alpine names for the live dev-env image) ──
 
-    def test_python_apk_packages_empty(self):
-        """python needs no extra apk package — python3/pip are in the base image."""
+    def test_python_apk_packages(self):
+        """python installs its runtime via apk (bare alpine base has none)."""
         stack = ProjectStack(language="python")
-        assert stack.apk_packages == []
+        assert "python3" in stack.apk_packages
+        assert "py3-pip" in stack.apk_packages
 
     def test_nodejs_apk_packages(self):
         """nodejs stack installs nodejs + npm via apk."""
