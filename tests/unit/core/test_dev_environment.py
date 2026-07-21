@@ -1247,18 +1247,79 @@ class TestIsServing:
         """No env registered → not serving."""
         assert docker_manager.is_serving("T-9", "kanboard") is False
 
-    def test_is_serving_true_when_port_listens(self, docker_manager) -> None:
-        """Registered env whose port answers → serving."""
+    def test_docker_is_serving_probes_inside_container(self, docker_manager) -> None:
+        """For a Docker env, is_serving probes INSIDE the container (works
+        under Docker-outside-of-Docker), NOT the host loopback."""
         self._register(docker_manager, 12345)
         with patch.object(
-            DevEnvironmentManager, "_port_is_listening", return_value=True
-        ):
+            DevEnvironmentManager, "_container_port_open", return_value=True
+        ) as probe, patch.object(
+            DevEnvironmentManager, "_port_is_listening"
+        ) as host_probe:
             assert docker_manager.is_serving("T-1", "kanboard") is True
+        probe.assert_called_once_with("c")  # container_name from _register
+        host_probe.assert_not_called()  # never falls back to host loopback
 
-    def test_is_serving_false_when_port_closed(self, docker_manager) -> None:
-        """Registered env whose port is closed (still building) → not serving."""
+    def test_docker_is_serving_false_when_container_not_listening(
+        self, docker_manager
+    ) -> None:
+        """Container up but app not bound yet (still building) → not serving."""
         self._register(docker_manager, 12345)
         with patch.object(
-            DevEnvironmentManager, "_port_is_listening", return_value=False
+            DevEnvironmentManager, "_container_port_open", return_value=False
         ):
             assert docker_manager.is_serving("T-1", "kanboard") is False
+
+    def test_local_env_is_serving_uses_host_loopback(self, tmp_path) -> None:
+        """A local (non-Docker) process is reachable on the host loopback, so
+        is_serving uses the cheaper TCP probe there — not docker exec."""
+        mgr = DevEnvironmentManager(
+            config=DevEnvironmentConfig(repo_path=str(tmp_path), use_docker=False),
+            settings_manager=DevEnvSettingsManager(data_dir=tmp_path),
+        )
+        self._register(mgr, 12345)
+        with patch.object(
+            DevEnvironmentManager, "_port_is_listening", return_value=True
+        ) as host_probe, patch.object(
+            DevEnvironmentManager, "_container_port_open"
+        ) as probe:
+            assert mgr.is_serving("T-1", "kanboard") is True
+        host_probe.assert_called_once_with(12345)
+        probe.assert_not_called()
+
+    def test_container_port_open_true_on_zero_exit(self, docker_manager) -> None:
+        """_container_port_open: docker exec probe returncode 0 → listening."""
+        with patch(
+            "src.core.dev_environment.subprocess.run",
+            return_value=MagicMock(returncode=0),
+        ) as mock_run:
+            assert DevEnvironmentManager._container_port_open("c") is True
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:3] == ["docker", "exec", "c"]
+        # Probes the LISTEN state (0A) on port 3000 (hex 0BB8) via /proc/net/tcp.
+        assert "0BB8" in cmd[-1]
+        assert "/proc/net/tcp" in cmd[-1]
+
+    def test_container_port_open_false_on_nonzero_exit(self, docker_manager) -> None:
+        """No LISTEN row (still building) → returncode 1 → not serving."""
+        with patch(
+            "src.core.dev_environment.subprocess.run",
+            return_value=MagicMock(returncode=1),
+        ):
+            assert DevEnvironmentManager._container_port_open("c") is False
+
+    def test_container_port_open_false_on_timeout(self, docker_manager) -> None:
+        """A hung docker exec must fail closed, not raise."""
+        with patch(
+            "src.core.dev_environment.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["docker", "exec"], timeout=60),
+        ):
+            assert DevEnvironmentManager._container_port_open("c") is False
+
+    def test_container_port_open_false_on_docker_error(self, docker_manager) -> None:
+        """docker binary missing / daemon down → fail closed."""
+        with patch(
+            "src.core.dev_environment.subprocess.run",
+            side_effect=OSError("docker not found"),
+        ):
+            assert DevEnvironmentManager._container_port_open("c") is False

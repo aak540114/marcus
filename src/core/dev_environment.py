@@ -713,10 +713,20 @@ class DevEnvironmentManager:
         not-yet-listening port is exactly what produced the
         ``ERR_CONNECTION_REFUSED`` symptom this method exists to prevent.
 
-        The check is a plain TCP connect to the *host-side* port the
-        container publishes to (``docker run -p <port>:3000``), so it works
-        identically whether Marcus itself runs on the host or in a sibling
-        container.
+        Readiness is checked where the server actually binds, so the answer
+        is correct regardless of network topology:
+
+        - **Docker envs** probe *inside* the container via ``docker exec``
+          (see :meth:`_container_port_open`), reading its ``/proc/net/tcp``
+          for a LISTEN socket on :data:`_APP_PORT`. A host-loopback probe
+          from Marcus's own process would give a FALSE NEGATIVE when Marcus
+          itself runs in a container (Docker-outside-of-Docker): the port is
+          published into the *host* network namespace, not Marcus's
+          container loopback, so ``127.0.0.1:<port>`` there answers nothing
+          even though the preview is up.
+        - **Local (non-Docker) envs** are a plain host process, so a TCP
+          connect to ``127.0.0.1:<port>`` in Marcus's own namespace is
+          correct and cheaper.
 
         Parameters
         ----------
@@ -729,12 +739,14 @@ class DevEnvironmentManager:
         -------
         bool
             ``True`` if an environment is registered for this ticket and its
-            port is accepting TCP connections; ``False`` otherwise.
+            app is accepting connections; ``False`` otherwise.
         """
         info = self._envs.get(f"{provider}:{ticket_id}")
         if info is None:
             return False
-        return self._port_is_listening(info.port)
+        if not self.config.use_docker:
+            return self._port_is_listening(info.port)
+        return self._container_port_open(info.container_name)
 
     @staticmethod
     def _port_is_listening(port: int) -> bool:
@@ -742,6 +754,51 @@ class DevEnvironmentManager:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.2)
             return sock.connect_ex(("127.0.0.1", port)) == 0
+
+    @staticmethod
+    def _container_port_open(container_name: str) -> bool:
+        """Return ``True`` if the app is LISTENing on :data:`_APP_PORT` inside
+        the container.
+
+        Reads ``/proc/net/tcp``/``tcp6`` via ``docker exec`` instead of a
+        host-side TCP connect, so it works whether Marcus runs on the host or
+        inside its own container (Docker-outside-of-Docker) — the check runs
+        in the SAME network namespace the server binds in. Uses only ``sh``
+        and ``awk`` (both in the base image's BusyBox), no extra packages.
+
+        The awk test matches a row whose local address (field 2) ends with
+        ``:<port-in-hex>`` and whose state (field 4) is ``0A`` (TCP_LISTEN),
+        so an outbound/established connection that merely mentions the port
+        as a *remote* endpoint never counts as "serving".
+
+        Parameters
+        ----------
+        container_name : str
+            Name of the running preview container.
+
+        Returns
+        -------
+        bool
+            ``True`` if the LISTEN socket is present; ``False`` on absence,
+            a docker error, or a timeout.
+        """
+        port_hex = format(_APP_PORT, "04X")  # 3000 -> "0BB8"
+        # Loop so a missing /proc/net/tcp6 (IPv6 disabled) can't error out the
+        # whole probe; exit 0 as soon as either file shows a LISTEN row.
+        probe = (
+            "for f in /proc/net/tcp /proc/net/tcp6; do "
+            '[ -f "$f" ] && awk -v p=":' + port_hex + '" '
+            "'$2 ~ p\"$\" && $4==\"0A\"{f=1} END{exit !f}' \"$f\" "
+            "&& exit 0; done; exit 1"
+        )
+        loop_cmd = ["docker", "exec", container_name, "sh", "-c", probe]
+        try:
+            result = subprocess.run(
+                loop_cmd, capture_output=True, timeout=_DOCKER_CMD_TIMEOUT
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0
 
     def list_running(self) -> List[DevEnvironmentInfo]:
         """Return all currently running dev environments."""
