@@ -428,7 +428,7 @@ class TestStartDockerRepoPath:
                 "T-10", "kanboard", "ticket/kanboard/t-10", repo_path=override_path
             )
         cmd = mock_run.call_args[0][0]
-        assert f"{override_path}:/app" in cmd
+        assert f"{override_path}:/src:ro" in cmd
 
     @pytest.mark.asyncio
     async def test_falls_back_to_config_repo_path(self, docker_manager, tmp_path):
@@ -438,7 +438,22 @@ class TestStartDockerRepoPath:
         ) as mock_run:
             await docker_manager.start("T-11", "kanboard", "ticket/kanboard/t-11")
         cmd = mock_run.call_args[0][0]
-        assert f"{tmp_path!s}:/app" in cmd
+        assert f"{tmp_path!s}:/src:ro" in cmd
+
+    @pytest.mark.asyncio
+    async def test_source_is_mounted_read_only(self, docker_manager, tmp_path):
+        """The source repo is mounted read-only so a preview can't mutate it."""
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await docker_manager.start("T-15", "kanboard", "ticket/kanboard/t-15")
+        cmd = mock_run.call_args[0][0]
+        # The mount value ends with ':ro' and there is no writable :/app mount.
+        v_index = cmd.index("-v")
+        assert cmd[v_index + 1].endswith(":/src:ro")
+        assert not any(
+            isinstance(p, str) and p.endswith(":/app") for p in cmd
+        )
 
     @pytest.mark.asyncio
     async def test_translates_to_host_path_when_dood_configured(
@@ -456,8 +471,8 @@ class TestStartDockerRepoPath:
                 repo_path="/app/data/repos/x",
             )
         cmd = mock_run.call_args[0][0]
-        assert "/home/user/marcus/data/repos/x:/app" in cmd
-        assert "/app/data/repos/x:/app" not in cmd
+        assert "/home/user/marcus/data/repos/x:/src:ro" in cmd
+        assert "/app/data/repos/x:/src:ro" not in cmd
 
     @pytest.mark.asyncio
     async def test_translates_relative_repo_path_when_dood_configured(
@@ -475,7 +490,7 @@ class TestStartDockerRepoPath:
                 repo_path="./data/repos/y",
             )
         cmd = mock_run.call_args[0][0]
-        assert "/srv/marcus/data/repos/y:/app" in cmd
+        assert "/srv/marcus/data/repos/y:/src:ro" in cmd
 
     @pytest.mark.asyncio
     async def test_no_translation_when_host_root_unset(
@@ -493,7 +508,7 @@ class TestStartDockerRepoPath:
                 repo_path="/app/data/repos/z",
             )
         cmd = mock_run.call_args[0][0]
-        assert "/app/data/repos/z:/app" in cmd
+        assert "/app/data/repos/z:/src:ro" in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -1081,12 +1096,43 @@ class TestEntrypointResilience:
         assert "apt-get" not in cmd
 
     def test_marks_app_dir_git_safe(self) -> None:
-        """The bind-mounted /app is marked a safe git directory before checkout."""
+        """/src and /app are both marked safe git directories before checkout."""
         cmd = self._mgr()._build_entrypoint(
-            "b", install_cmd="", start_cmd="python3 -m http.server 3000",
+            "b", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
             use_hm_reload=False,
         )
+        assert "safe.directory /src" in cmd
         assert "safe.directory /app" in cmd
+
+    def test_clones_source_into_isolated_app(self) -> None:
+        """The entrypoint clones the read-only /src into a container-local
+        /app, so the preview never mutates the shared source repo."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
+            use_hm_reload=False,
+        )
+        assert "git clone /src /app" in cmd
+        # The clone must happen before the checkout.
+        assert cmd.index("git clone /src /app") < cmd.index("git checkout")
+
+    def test_repoints_origin_to_gitea_after_clone(self) -> None:
+        """The clone's origin (initially /src) is re-pointed at the source's
+        real origin so refresh() keeps pulling from Gitea, not the local path."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
+            use_hm_reload=False,
+        )
+        assert "remote set-url origin" in cmd
+
+    def test_checkout_falls_back_to_origin_tracking_branch(self) -> None:
+        """A branch that exists only on origin is checked out as a new
+        tracking branch when a plain checkout can't find it locally."""
+        cmd = self._mgr()._build_entrypoint(
+            "feature/x", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
+            use_hm_reload=False,
+        )
+        assert "git checkout feature/x" in cmd
+        assert "git checkout -b feature/x origin/feature/x" in cmd
 
     def test_static_fallback_present_for_hm_stack(self) -> None:
         """HMR stacks fall back to the zero-install busybox httpd server."""

@@ -981,7 +981,8 @@ class DevEnvironmentManager:
             file changes.  When ``False`` an ``inotifywait`` restart loop
             is used.
         extra_apt : Optional[List[str]]
-            Additional ``apt-get install`` package names beyond the base set.
+            Additional ``apk add`` package names (language runtime) beyond the
+            base set.
 
         Returns
         -------
@@ -990,36 +991,67 @@ class DevEnvironmentManager:
         """
         apk_extras = " ".join(extra_apt) if extra_apt else ""
         # Best-effort (`|| true`): a transient package-index failure must
-        # never stop the container from serving — the static fallback below
-        # only needs `python3`, which is already baked into _BASE_IMAGE.
+        # never stop the container from serving — the static fallback
+        # (BusyBox httpd) is part of the base image regardless.
         apk_line = (
             f"apk add --no-cache {_BASE_APK}"
             f"{' ' + apk_extras if apk_extras else ''} 2>/dev/null || true"
         )
 
-        # The repo is bind-mounted from the host, so its files are owned by a
-        # different uid than the container's root — modern git refuses to
-        # operate on such a tree ("detected dubious ownership") and the
-        # checkout would abort. Marking /app safe up-front prevents that.
-        safe_dir = "git config --global --add safe.directory /app 2>/dev/null || true"
+        # Both trees are read by git: /src is the read-only bind-mount of the
+        # host repo (host-owned uid) and /app is the container-local clone —
+        # mark both safe so git's "detected dubious ownership" guard can't
+        # abort the clone/checkout.
+        safe_dir = (
+            "git config --global --add safe.directory /src 2>/dev/null || true; "
+            "git config --global --add safe.directory /app 2>/dev/null || true"
+        )
+
+        # ISOLATED CHECKOUT. The source repo is mounted READ-ONLY at /src; we
+        # clone it into the container's own writable /app so the preview gets
+        # its own working tree and .git. This is what keeps a preview from
+        # ever mutating the shared host repo (the old design bind-mounted the
+        # live repo and ran `git checkout`/`git reset --hard` directly on it,
+        # switching the host's branch and racing Marcus's own git operations;
+        # two previews of different branches of the same project also fought
+        # over one working tree). With --rm the /app clone is discarded when
+        # the container stops.
+        #
+        # After cloning, the clone's `origin` points at /src (a path); we
+        # re-point it at the source's real Gitea origin so the webhook-driven
+        # refresh() (`git fetch origin && git reset --hard origin/<branch>`)
+        # still pulls new commits straight from Gitea, exactly as before.
+        clone_line = (
+            "( git clone /src /app 2>/dev/null; "
+            "u=$(git -C /src config --get remote.origin.url 2>/dev/null); "
+            '[ -n "$u" ] && git -C /app remote set-url origin "$u" 2>/dev/null; '
+            "git -C /app fetch origin 2>/dev/null ) || true"
+        )
 
         # branch_name is interpreted as shell syntax by the `sh -c` this
-        # string is eventually passed to inside the container — quote it
-        # so shell metacharacters in an unsanitized caller's input can't
-        # break out of `git checkout` into arbitrary command execution.
-        # `|| true` keeps a checkout failure (detached HEAD, already on the
-        # branch, missing ref) from aborting the whole entrypoint — we still
-        # want to serve whatever is in /app.
-        #
-        # The `touch _READY_MARKER` immediately after checkout lets
-        # refresh() (see _wait_until_ready) confirm the initial checkout
-        # has actually happened before running its own git commands
-        # against /app — apk above can take a few seconds, and
-        # `docker run -d` returns long before this script reaches here.
+        # string is eventually passed to inside the container — quote it so
+        # shell metacharacters in an unsanitized caller's input can't break
+        # out of `git checkout` into arbitrary command execution. Try a plain
+        # checkout first (branch present from the clone), then create a local
+        # branch tracking origin's (a branch that only exists on Gitea); both
+        # `|| true` so we still serve whatever is in /app on failure.
+        q_branch = shlex.quote(branch_name)
+        q_origin = shlex.quote(f"origin/{branch_name}")
+        checkout_line = (
+            f"( git checkout {q_branch} 2>/dev/null || "
+            f"git checkout -b {q_branch} {q_origin} 2>/dev/null ) || true"
+        )
+
+        # The `touch _READY_MARKER` immediately after checkout lets refresh()
+        # (see _wait_until_ready) confirm the initial checkout has actually
+        # happened before running its own git commands against /app — the apk
+        # install and clone above can take a few seconds, and `docker run -d`
+        # returns long before this script reaches here.
         steps = [
             apk_line,
             safe_dir,
-            f"git checkout {shlex.quote(branch_name)} 2>/dev/null || true",
+            clone_line,
+            checkout_line,
             f"touch {_READY_MARKER}",
         ]
         if install_cmd:
@@ -1147,8 +1179,14 @@ class DevEnvironmentManager:
                 container_name,
                 "-p",
                 f"{port}:3000",
+                # Source repo mounted READ-ONLY at /src. The entrypoint clones
+                # it into the container-local /app (see _build_entrypoint), so
+                # the preview gets an isolated working tree and can never
+                # mutate the shared host repo. /app is deliberately NOT a bind
+                # mount — it lives in the container's writable layer and is
+                # discarded with --rm.
                 "-v",
-                f"{_resolve_host_repo_path(repo_path)}:/app",
+                f"{_resolve_host_repo_path(repo_path)}:/src:ro",
                 "-w",
                 "/app",
             ]
