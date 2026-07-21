@@ -3689,28 +3689,47 @@ def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
   var TICKET = {ticket_js}, PROVIDER = {provider_js}, URL = {url_js};
   var started = Date.now();
   var everRunning = false;
+  var done = false;
+  // Hard wall-clock cap. Without this the page could spin forever: the
+  // "container exited" branch below only fires once a poll has SEEN
+  // running:true, but a container that dies before the first poll (or one
+  // whose port Marcus can't observe, e.g. Docker-outside-of-Docker) never
+  // sets everRunning, so nothing would ever stop the spinner.
+  var MAX_WAIT_MS = 180000;
   var el = document.getElementById.bind(document);
   setInterval(function () {{
     el("elapsed").textContent = Math.round((Date.now() - started) / 1000);
   }}, 250);
-  function fail(msg) {{
+  function stop(title, msg, linkText, href) {{
+    done = true;
     el("spin").style.display = "none";
-    el("title").textContent = "Preview could not start";
+    el("title").textContent = title;
     el("title").className = "err";
     el("detail").textContent = msg;
-    var m = el("manual"); m.textContent = "Try again"; m.href = location.href;
+    var m = el("manual"); m.textContent = linkText; m.href = href;
     m.style.display = "inline-block";
   }}
   function poll() {{
+    if (done) {{ return; }}
+    if (Date.now() - started > MAX_WAIT_MS) {{
+      // Timed out. The container may still be coming up (or up but
+      // unobservable), so offer a direct link to the preview as well as retry.
+      stop("Preview is taking too long",
+           "It has not come up within 3 minutes. You can open it directly "
+           + "(it may still be starting) or try again.", "Open preview", URL);
+      return;
+    }}
     fetch("/api/dev-env/status?ticket_id=" + encodeURIComponent(TICKET) +
           "&provider=" + encodeURIComponent(PROVIDER), {{ cache: "no-store" }})
       .then(function (r) {{ return r.json(); }})
       .then(function (s) {{
-        if (s.serving) {{ window.location.replace(s.url || URL); return; }}
+        if (s.serving) {{ done = true; window.location.replace(s.url || URL); return; }}
         if (s.running) {{ everRunning = true; }}
         else if (everRunning) {{
-          fail("The container exited before the app came up. Check the "
-               + "project's Tech Stack / dev-server command, then retry.");
+          stop("Preview could not start",
+               "The container exited before the app came up. Check the "
+               + "project's Tech Stack / dev-server command, then retry.",
+               "Try again", location.href);
           return;
         }}
         setTimeout(poll, 1500);
@@ -4278,12 +4297,15 @@ if __name__ == "__main__":
                 # serve a lightweight page that polls readiness and redirects
                 # itself the instant the app is up.
                 is_serving = getattr(dev_mgr, "is_serving", None)
-                if (
-                    info
-                    and info.url
-                    and is_serving is not None
-                    and is_serving(ticket_id, provider)
-                ):
+                serving_now = False
+                if info and info.url and is_serving is not None:
+                    # is_serving() does a blocking TCP connect (up to 0.2s when
+                    # the port is not yet listening) — offload it so it can't
+                    # stall the asyncio event loop.
+                    serving_now = await asyncio.get_event_loop().run_in_executor(
+                        None, is_serving, ticket_id, provider
+                    )
+                if serving_now:
                     return RedirectResponse(info.url, status_code=302)
 
                 if info and info.url:
@@ -4674,7 +4696,11 @@ function save() {{
                 is_serving = getattr(dev_mgr, "is_serving", None)
                 if is_serving is not None:
                     try:
-                        serving = is_serving(ticket_id, provider)
+                        # Blocking TCP connect — offload off the event loop
+                        # (this endpoint is polled every ~1.5s per open page).
+                        serving = await asyncio.get_event_loop().run_in_executor(
+                            None, is_serving, ticket_id, provider
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Dev env serving check failed: %s", exc)
             response = JSONResponse(

@@ -251,23 +251,35 @@ class HumanGatedWorkflow:
 
         record = self._lifecycle.get_or_create(ticket_id, self._provider)
 
-        # If there's no Marcus AC block yet, generate one.
-        existing_ac = ACParser.extract(description)
-        if existing_ac is None:
-            await self._generate_and_post_ac(
-                ticket_id=ticket_id,
-                title=title,
-                description=description,
-                was_human_created=True,
-                record=record,
-            )
-        else:
-            # AC already present (AI-created ticket) — just store the hash.
-            if not record.ac_hash:
-                new_hash = ACChangeDetector.hash_ac(existing_ac.raw_text)
-                self._lifecycle.update_acceptance_criteria(
-                    ticket_id, self._provider, existing_ac.raw_text, new_hash
+        # Sub-tickets created by decompose_ticket already carry their own
+        # acceptance criteria AND a `<!-- Sub-ticket of #N -->` parent marker
+        # in the lifecycle record. Regenerating/overwriting that AC here would
+        # DROP the marker (the child's board description uses a `## Acceptance
+        # Criteria` heading that ACParser.extract doesn't recognise, so the
+        # generic path below would regenerate from scratch), which in turn
+        # breaks _parent_of() and leaves the parent stuck in BLOCKED forever
+        # once its children finish. Leave a sub-ticket's AC untouched — but
+        # still fall through to the first-sight recovery below so the child
+        # can be auto-started like any other ready+assigned ticket.
+        is_subticket = "Sub-ticket of #" in (record.acceptance_criteria or "")
+        if not is_subticket:
+            # If there's no Marcus AC block yet, generate one.
+            existing_ac = ACParser.extract(description)
+            if existing_ac is None:
+                await self._generate_and_post_ac(
+                    ticket_id=ticket_id,
+                    title=title,
+                    description=description,
+                    was_human_created=True,
+                    record=record,
                 )
+            else:
+                # AC already present (AI-created ticket) — just store the hash.
+                if not record.ac_hash:
+                    new_hash = ACChangeDetector.hash_ac(existing_ac.raw_text)
+                    self._lifecycle.update_acceptance_criteria(
+                        ticket_id, self._provider, existing_ac.raw_text, new_hash
+                    )
 
         # First-sight recovery: BoardWatcher emits ONLY ticket.new for a
         # ticket it has never seen — including one that was assigned and
@@ -839,6 +851,18 @@ class HumanGatedWorkflow:
         record = self._lifecycle.get(ticket_id, self._provider)
         if record is None:
             return
+
+        # A human editing a sub-ticket's AC on the board sends AC text without
+        # the invisible `<!-- Sub-ticket of #N -->` parent marker; re-append it
+        # so _parent_of() keeps working. new_hash is left as the board's hash
+        # of the VISIBLE AC, so change detection still compares like-for-like.
+        import re
+
+        marker = re.search(
+            r"<!-- Sub-ticket of #\d+ -->", record.acceptance_criteria or ""
+        )
+        if marker and marker.group(0) not in new_ac:
+            new_ac = f"{new_ac}\n{marker.group(0)}"
 
         self._lifecycle.update_acceptance_criteria(
             ticket_id, self._provider, new_ac, new_hash

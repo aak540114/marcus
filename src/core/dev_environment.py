@@ -1017,16 +1017,17 @@ class DevEnvironmentManager:
         # over one working tree). With --rm the /app clone is discarded when
         # the container stops.
         #
-        # After cloning, the clone's `origin` points at /src (a path); we
-        # re-point it at the source's real Gitea origin so the webhook-driven
-        # refresh() (`git fetch origin && git reset --hard origin/<branch>`)
-        # still pulls new commits straight from Gitea, exactly as before.
-        clone_line = (
-            "( git clone /src /app 2>/dev/null; "
-            "u=$(git -C /src config --get remote.origin.url 2>/dev/null); "
-            '[ -n "$u" ] && git -C /app remote set-url origin "$u" 2>/dev/null; '
-            "git -C /app fetch origin 2>/dev/null ) || true"
-        )
+        # The clone's `origin` is left pointing at /src ON PURPOSE. /src is a
+        # local path bind-mount, so refresh()'s `git fetch origin && git reset
+        # --hard origin/<branch>` always reaches it — with no network and no
+        # credentials. Re-pointing origin at the real Gitea URL would be
+        # unreachable from the preview container: the host repo's origin is
+        # `http://gitea:3000` (a compose service name that doesn't resolve on
+        # Docker's default bridge) or `http://localhost:3000` (the container's
+        # own loopback), so every fetch would fail. Fetching from /src instead
+        # tracks whatever branch state Marcus's own repo has (which its
+        # merge/diff flows keep updated from Gitea).
+        clone_line = "git clone /src /app 2>/dev/null || true"
 
         # branch_name is interpreted as shell syntax by the `sh -c` this
         # string is eventually passed to inside the container — quote it so
@@ -1059,14 +1060,18 @@ class DevEnvironmentManager:
             # start command (which itself falls back to the static server).
             steps.append(f"{install_cmd} || true")
 
-        # Wrap the real dev command so that if it exits non-zero or crashes
-        # (missing "dev" script, wrong port, syntax error) the container
-        # falls back to serving /app statically instead of dying. Because
-        # containers run with --rm, a dying entrypoint would vanish from
-        # `docker ps` entirely and the browser would get ERR_CONNECTION_REFUSED
-        # with no way to diagnose it — the fallback guarantees the port is
-        # always answered and the container stays alive and inspectable.
-        served = f"( {start_cmd} || {_STATIC_FALLBACK} )"
+        # Wrap the real dev command so the container ALWAYS keeps serving.
+        # `;` (not `||`) between the command and the fallback is deliberate:
+        # `||` only fires on a NON-ZERO exit, so a dev command that exits 0
+        # (self-daemonizes, or is a launcher that returns success and detaches)
+        # would skip the fallback, `served` would return 0, PID 1 would fall
+        # off the end, and the --rm container would vanish from `docker ps`.
+        # With `;`, the fallback runs whenever the dev command RETURNS at all
+        # (any exit code) — and never runs while a normal foreground server is
+        # still blocking. A long-running server therefore holds PID 1 open; a
+        # crashed or exited one hands off to BusyBox httpd, which serves /app
+        # forever. Either way the port is always answered.
+        served = f"( {start_cmd}; {_STATIC_FALLBACK} )"
 
         if use_hm_reload:
             steps.append(served)
@@ -1134,8 +1139,18 @@ class DevEnvironmentManager:
             install_cmd: str = project_stack.install_cmd
             start_cmd: str = project_stack.dev_cmd
             use_hm_reload: bool = project_stack.use_hm_reload
-            extra_apt = getattr(project_stack, "apk_packages", None) or getattr(
-                project_stack, "apt_packages", []
+            # Prefer Alpine package names (apk_packages) since _BASE_IMAGE is
+            # alpine-based; fall back to the legacy apt_packages list ONLY for
+            # older callers whose object has no apk_packages attribute. An
+            # apk_packages that is present but empty (a stack needing no extra
+            # runtime, e.g. static) is a valid answer and must NOT fall through
+            # to the Debian-named apt_packages — those names would be handed to
+            # `apk add`, which doesn't know them.
+            apk_pkgs = getattr(project_stack, "apk_packages", None)
+            extra_apt = (
+                apk_pkgs
+                if apk_pkgs is not None
+                else getattr(project_stack, "apt_packages", [])
             )
             logger.info(
                 "Using project-description stack %r for %s",

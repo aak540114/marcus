@@ -1115,14 +1115,25 @@ class TestEntrypointResilience:
         # The clone must happen before the checkout.
         assert cmd.index("git clone /src /app") < cmd.index("git checkout")
 
-    def test_repoints_origin_to_gitea_after_clone(self) -> None:
-        """The clone's origin (initially /src) is re-pointed at the source's
-        real origin so refresh() keeps pulling from Gitea, not the local path."""
+    def test_origin_left_pointing_at_local_src(self) -> None:
+        """The clone's origin is left as /src (a reachable local path) — NOT
+        re-pointed at the Gitea URL, which is unreachable from the preview
+        container's default-bridge network. refresh() fetches from /src."""
         cmd = self._mgr()._build_entrypoint(
             "b", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
             use_hm_reload=False,
         )
-        assert "remote set-url origin" in cmd
+        assert "remote set-url origin" not in cmd
+
+    def test_hm_stack_stays_alive_if_dev_cmd_exits_zero(self) -> None:
+        """The served wrapper uses ';' not '||' so the fallback runs whenever
+        the dev command RETURNS (even exit 0) — otherwise a self-daemonizing
+        dev command would let PID 1 exit and the --rm container vanish."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="npm install",
+            start_cmd="npm run dev -- --port 3000", use_hm_reload=True,
+        )
+        assert "npm run dev -- --port 3000; busybox httpd" in cmd
 
     def test_checkout_falls_back_to_origin_tracking_branch(self) -> None:
         """A branch that exists only on origin is checked out as a new

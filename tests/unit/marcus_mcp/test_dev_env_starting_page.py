@@ -48,3 +48,11 @@ class TestDevEnvStartingPage:
         page = _dev_env_starting_page("a<b", "kanboard", "http://localhost:9123")
         assert "a<b</h1>" not in page
         assert "a&lt;b" in page
+
+    def test_has_wall_clock_timeout_backstop(self) -> None:
+        """The poller gives up after a bounded wall-clock wait so it can never
+        spin forever (container died before first poll, or unobservable port)."""
+        page = _dev_env_starting_page("7", "kanboard", "http://localhost:9123")
+        assert "MAX_WAIT_MS" in page
+        # On timeout it offers a direct link to the preview URL, not only retry.
+        assert "Open preview" in page

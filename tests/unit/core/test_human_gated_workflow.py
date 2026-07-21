@@ -2981,3 +2981,65 @@ class TestParentAutoComplete:
         await workflow._maybe_complete_parent("211")
 
         assert lifecycle.get("210", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_on_ticket_new_does_not_clobber_subticket_marker(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """First-sight of a Marcus-created sub-ticket must NOT regenerate its
+        acceptance criteria: doing so drops the `<!-- Sub-ticket of #N -->`
+        marker, which strands the parent in BLOCKED forever once the children
+        finish (regression guard for that path)."""
+        lifecycle.get_or_create(
+            "301", "kanboard",
+            acceptance_criteria="- [ ] do X\n<!-- Sub-ticket of #300 -->",
+        )
+        # The child's board description uses a '## Acceptance Criteria'
+        # heading, which ACParser.extract does NOT recognise — so without the
+        # guard, _on_ticket_new would regenerate the AC and lose the marker.
+        event = _make_event({
+            "ticket_id": "301",
+            "provider": "kanboard",
+            "task": {
+                "id": "301",
+                "title": "Child",
+                "description": (
+                    "Do X\n\n## Acceptance Criteria\n- [ ] do X\n\n"
+                    "_Sub-ticket of #300._"
+                ),
+                "status": "todo",
+                "assignee": "0",
+            },
+        })
+        workflow._generate_and_post_ac = AsyncMock()
+
+        await workflow._on_ticket_new(event)
+
+        rec = lifecycle.get("301", "kanboard")
+        assert "<!-- Sub-ticket of #300 -->" in rec.acceptance_criteria
+        assert workflow._parent_of(rec) == "300"
+        workflow._generate_and_post_ac.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_ac_changed_preserves_subticket_marker(
+        self, workflow, lifecycle
+    ):
+        """A human editing a sub-ticket's AC on the board (no marker in the
+        edited text) must keep the parent marker so _parent_of still works."""
+        lifecycle.get_or_create(
+            "311", "kanboard",
+            acceptance_criteria="- [ ] old\n<!-- Sub-ticket of #310 -->",
+        )
+        event = _make_event({
+            "ticket_id": "311",
+            "provider": "kanboard",
+            "new_ac_text": "- [ ] new edited by human",
+            "new_hash": "abc123",
+        })
+
+        await workflow._on_ac_changed(event)
+
+        rec = lifecycle.get("311", "kanboard")
+        assert "new edited by human" in rec.acceptance_criteria
+        assert "<!-- Sub-ticket of #310 -->" in rec.acceptance_criteria
+        assert workflow._parent_of(rec) == "310"
