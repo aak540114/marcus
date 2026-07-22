@@ -380,6 +380,24 @@ fi
 log "Starting Kanboard and Gitea..."
 if ! docker compose up -d --wait --wait-timeout 120 kanboard gitea; then
     err "Kanboard and/or Gitea did not become healthy in time."
+    # A very common cause: another process or container is ALREADY holding
+    # one of the published host ports (Gitea 3000, Kanboard 8080), so Docker
+    # can't bind it. The usual offender is a leftover dev server an AI agent
+    # (or you) started to test an app on :3000 — Docker/compose can't stop a
+    # non-compose process. Name the culprit so it's obvious.
+    for p in 3000 8080; do
+        holder=""
+        if command -v lsof >/dev/null 2>&1; then
+            holder="$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null \
+                | awk 'NR>1 {print $1" (pid "$2")"}' | sort -u | tr '\n' ' ')"
+        fi
+        if [ -n "$holder" ]; then
+            err "Port $p is already in use by: ${holder}"
+            err "  → Stop it, then re-run setup. If it's a stray dev server: kill that PID."
+            err "  → If it's a container: docker ps  then  docker rm -f <name>"
+            err "  → Leftover Marcus preview containers: ./scripts/teardown.sh removes them."
+        fi
+    done
     docker compose logs kanboard gitea --tail=50 || true
     exit 1
 fi

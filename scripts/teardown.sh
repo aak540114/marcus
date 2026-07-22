@@ -95,6 +95,26 @@ if ! docker compose "${COMPOSE_FILES[@]}" --profile docker-marcus down; then
     warn "docker compose down reported an error — see above. Continuing to the data report regardless."
 fi
 
+# Remove ad-hoc per-ticket dev-environment preview containers. Marcus starts
+# these with `docker run` (NOT docker compose — they're one-per-ticket and
+# created on demand), so the `docker compose down` above never touches them.
+# A leftover preview container keeps running — and keeps holding its
+# published host port — across a teardown, which can block a later setup
+# (e.g. a stray app server squatting on a port Gitea needs). This runs even
+# when Marcus wasn't up to tear them down itself.
+log "Removing leftover dev-environment preview containers (marcus-dev-*)..."
+dev_containers="$(docker ps -aq --filter "name=marcus-dev-" 2>/dev/null || true)"
+if [ -n "$dev_containers" ]; then
+    # shellcheck disable=SC2086
+    if docker rm -f $dev_containers >/dev/null 2>&1; then
+        log "Removed $(echo "$dev_containers" | grep -c .) dev-environment container(s)."
+    else
+        warn "Could not remove some marcus-dev-* containers — remove by hand: docker rm -f <name>"
+    fi
+else
+    log "No dev-environment preview containers to remove."
+fi
+
 # ---------------------------------------------------------------------
 # 3. Report every location holding real data — nothing here is deleted.
 # ---------------------------------------------------------------------
