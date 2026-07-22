@@ -1198,7 +1198,16 @@ class HumanGatedWorkflow:
                 pass
             if link is not None:
                 try:
-                    await link(child_id, ticket_id, 6)  # child "is a child of"
+                    # The PARENT depends on the child: "parent is blocked by
+                    # child" (Kanboard link type 3). Kanboard auto-adds the
+                    # reciprocal "child blocks parent" on the child. This is
+                    # the correct direction — the decomposed ticket waits on
+                    # its sub-tickets, not the other way around — and makes
+                    # the board/sidebar show the parent depending on each
+                    # child. (The old `link(child, parent, 6)` "is a child
+                    # of" was classified as depends_on, so the CHILD wrongly
+                    # showed as blocked by the parent.)
+                    await link(ticket_id, child_id, 3)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Could not link sub-ticket: %s", exc)
             child_ids.append(child_id)
@@ -1223,10 +1232,27 @@ class HumanGatedWorkflow:
                 )
             except (InvalidTransitionError, KeyError):
                 pass
+            # Move the decomposed parent's card to the Blocked column. Check
+            # the result: move_task_to_column returns False (no exception)
+            # when the board has no matching column, which is exactly how a
+            # parent silently stayed in Ready. Surface that at WARNING so it's
+            # diagnosable instead of vanishing at debug level.
+            moved = False
             try:
-                await self._kanban.move_task_to_column(ticket_id, "blocked")
+                moved = await self._kanban.move_task_to_column(ticket_id, "blocked")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("Could not move parent to blocked: %s", exc)
+                logger.warning(
+                    "Could not move decomposed parent %s to blocked column: %s",
+                    ticket_id,
+                    exc,
+                )
+            if not moved:
+                logger.warning(
+                    "Decomposed parent %s did NOT move to the 'Blocked' column "
+                    "(does this project's board have a column named 'Blocked'?). "
+                    "It is BLOCKED in Marcus's lifecycle regardless.",
+                    ticket_id,
+                )
         return child_ids
 
     def _next_worker_ticket(self) -> Optional[str]:

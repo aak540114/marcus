@@ -2800,11 +2800,15 @@ class TestDecomposition:
             rec = lifecycle.get(c, "kanboard")
             assert rec.assignee == "alice"
             assert rec.state == TicketState.READY
-        # Each child linked to the parent (child "is a child of" 100, type 6).
+        # The PARENT is blocked by each child: link(parent="100", child, 3)
+        # ("is blocked by"). Parent is args[0]; type is args[2].
         link_calls = mock_kanban.create_task_link.await_args_list
-        assert all(call.args[1] == "100" and call.args[2] == 6 for call in link_calls)
-        # Parent parked so it isn't handed to a worker.
+        assert all(call.args[0] == "100" and call.args[2] == 3 for call in link_calls)
+        assert {call.args[1] for call in link_calls} == set(children)
+        # Parent parked so it isn't handed to a worker...
         assert lifecycle.get("100", "kanboard").state == TicketState.BLOCKED
+        # ...and its Kanboard card is moved to the Blocked column.
+        mock_kanban.move_task_to_column.assert_any_await("100", "blocked")
 
     @pytest.mark.asyncio
     async def test_atomic_ticket_not_decomposed(
